@@ -7,7 +7,7 @@
 //   1. against FP64, the new kernel's error is no larger than a small multiple of the old kernel's (both FP32 math);
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale;
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
-// HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
+// HIP builds (S6): the same checks for the RDNA4/RDNA3 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) on unsupported targets.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -248,8 +248,10 @@ int main(int argc, char** argv) {
         int dev = 0;
         hipDeviceProp_t prop{};
         if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return 2;
-        if (std::strncmp(prop.gcnArchName, "gfx12", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx11", 5) != 0) {
-            std::printf("SKIP: %s has no matrix-core prompt attention compiled in (gfx12/gfx11 only)\n",
+        if (std::strncmp(prop.gcnArchName, "gfx1200", 7) != 0 &&
+            std::strncmp(prop.gcnArchName, "gfx1201", 7) != 0 &&
+            std::strncmp(prop.gcnArchName, "gfx1100", 7) != 0) {
+            std::printf("SKIP: %s has no matrix-core prompt attention compiled in (gfx1200/gfx1201/gfx1100 only)\n",
                         prop.gcnArchName);
             return 77;
         }

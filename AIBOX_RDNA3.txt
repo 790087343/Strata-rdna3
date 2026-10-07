@@ -39,3 +39,10 @@ status are recorded in the private localLLM repository at
 production/docs/STRATA_COMBINED_ENGINE.txt. A source commit alone is not a
 production deployment. Do not infer model quality from kernel parity or
 throughput measurements.
+
+Local integration hardening:
+  Runtime attention dispatch matches gfx1100/gfx1200/gfx1201 exactly, since
+  other gfx11/gfx12 targets compile out this body and require fallback.
+  CMake validates an explicitly configured rocWMMA include directory.
+  The registered selection test uses 49 queries to exercise ragged query tiles
+  as well as ragged key tiles (the imported default of 48 covered whole rows).

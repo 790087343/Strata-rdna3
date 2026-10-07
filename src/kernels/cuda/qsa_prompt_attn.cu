@@ -1479,7 +1479,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 
 // RDNA4/RDNA3 matrix cores, and only on request: the output differs from the default kernel's in its last bits.
 // The arch prefixes are checked at RUNTIME on purpose: the host pass of a HIP TU sees no arch macros, and HIP only
-// loads the code object that matches the card, so a prefix match here is the same kernel the card will run.
+// loads the code object that matches the card. Match only architectures enabled above: other gfx11/gfx12
+// targets compile the kernel body out and must keep the portable fallback.
 bool hip_wmma_usable() {
     static const bool want = [] {
         const char* e = std::getenv("STRATA_HIP_WMMA");
@@ -1492,8 +1493,9 @@ bool hip_wmma_usable() {
     if (arch[dev] == 0) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
-        arch[dev] = (std::strncmp(prop.gcnArchName, "gfx12", 5) == 0 ||
-                     std::strncmp(prop.gcnArchName, "gfx11", 5) == 0) ? 1 : 2;
+        arch[dev] = (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
+                     std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0 ||
+                     std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0) ? 1 : 2;
         static bool told = false;
         if (!told) {
             told = true;
