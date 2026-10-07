@@ -1,0 +1,41 @@
+Private aibox RDNA3 integration
+==============================
+This branch starts from aibox-production 896ea43 and imports the gfx1100
+prompt-attention and QSA selection implementations from xyzzing/Strata
+c21dc056a21bd19180f65a407afcc43b632e68d9. Upstream project: Niko1221/Strata.
+Credit: xyzzing and the Strata contributors; the repository MIT license applies.
+
+Imported source files:
+  src/kernels/cuda/qsa_prompt_attn.cu
+  src/kernels/qsa_prompt_attn_parity.cpp
+  src/kernels/cuda/qsa_select.cu
+  include/strata/kernels/qsa_select.hpp
+  src/kernels/qsa_select_wmma_parity.cpp
+CMake integration is local. Existing aibox RDNA MMVQ, K-quant MMQ, metadata
+compatibility and peer diagnostics are retained. Experimental GDN WY/fused MoE
+paths are not adopted. No default runtime flags are changed by this branch.
+
+Build for gfx1100 using HIP and set STRATA_ROCWMMA_INCLUDE_DIR to
+rocWMMA/library/include (tested at ROCm rocm-7.1.1,
+1ab208f49945c38626b79e3f0c284d65ac44a781). It must apply to strata_kernels,
+not merely the parity test, or the selection implementation compiles out.
+
+Opt-in environment:
+  STRATA_HIP_WMMA=1      matrix-core prompt attention for INT8 KV
+  STRATA_SELECT_WMMA=1   matrix-core QSA block selection
+Selection uses FP16 operands / FP32 accumulation, with portable fallback for
+unsupported builds and geometry. It is not bitwise-equivalent. The source's
+PORTING.md section 18 reference refers to the xyzzing fork's derivation:
+B(q,b) = 2^-9.5 * S(q,b) + 8 * 2^-24 * abs(score), where S is the absolute
+product sum. The imported test checks this against a float64 oracle, tail
+bitwise equality, poison/canary boundaries, adversarial lane layouts and a
+negative control. Near-tie selections can differ; end-to-end checks matter.
+
+Parity executables:
+  hip_prompt_attn_wmma
+  qsa_select_wmma_parity
+Hardware, build hashes, runtime settings, end-to-end measurements and release
+status are recorded in the private localLLM repository at
+production/docs/STRATA_COMBINED_ENGINE.txt. A source commit alone is not a
+production deployment. Do not infer model quality from kernel parity or
+throughput measurements.
