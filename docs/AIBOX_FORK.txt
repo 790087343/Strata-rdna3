@@ -2,7 +2,7 @@ aibox production source snapshot
 ===============================
 Upstream: https://github.com/Niko1221/Strata
 Base: 6f32ec070f23ced9f50e704d854d775da52591ab (0.1.39)
-Fork: https://github.com/nicejunjie/Strata
+Private repository: https://github.com/nicejunjie/Strata-private
 Maintained branch: aibox-production
 
 This branch preserves the locally modified engine source as of 2026-10-06.
@@ -34,3 +34,6 @@ Snapshot validation:
 Keep upstream as the original repository and origin as this fork. Review
 upstream updates on a separate branch, then build and validate before updating
 the deployment pin. Do not automatically merge upstream into a running setup.
+
+Privacy: this is a standalone private repository retaining upstream history.
+GitHub public forks cannot be made private. Do not push this branch upstream.
