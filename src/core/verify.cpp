@@ -292,6 +292,8 @@ Verifier::~Verifier() {
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
+    if (peer_rows_) cudaFree(peer_rows_);
+    if (h_peer_kind_) cudaFreeHost(h_peer_kind_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
@@ -378,6 +380,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    const char* peer_transport = std::getenv("STRATA_PEER_TRANSPORT");
+    if (peer_transport && std::strcmp(peer_transport,"host") != 0) {
+        if ((std::getenv("STRATA_VERIFY_DEVICE_PLAN") && std::atoi(std::getenv("STRATA_VERIFY_DEVICE_PLAN"))!=0) || remote_opt_) { err="peer transport: device-plan/remote-opt not supported in this experiment"; return false; }
+        if (!mapped(T*K*4,(void**)&h_peer_kind_,(void**)&m_peer_kind_) ||
+            cudaMalloc((void**)&peer_rows_,T*K*N*4)!=cudaSuccess) { err="peer transport: verifier buffer allocation"; return false; }
+        std::memset(h_peer_kind_,0,T*K*4);
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -1067,6 +1076,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
+                else if (peer_rows_)
+                    copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t)tb*K*N, (int64_t)n*K, N,
+                                          p_dst,p_counts+1,cs,peer_rows_+(size_t)tb*K*N,m_peer_kind_+(size_t)tb*K);
                 else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                     copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                           p_dst, p_counts + 1, cs);
@@ -1597,6 +1609,10 @@ void Verifier::set_plan_slot(int grp) {
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
+    const int tb = (last_batch_ || grp==0) ? 0 : (last_t_+1)/2;
+    sink_.peer_x = peer_rows_ ? mixed_ + (size_t)tb*g_->n_embd : nullptr;
+    sink_.peer_rows = peer_rows_ ? peer_rows_ + (size_t)tb*ss_->k*g_->n_embd : nullptr;
+    sink_.peer_kind = h_peer_kind_ ? h_peer_kind_ + (size_t)tb*ss_->k : nullptr;
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.

@@ -87,8 +87,7 @@ struct Loaded {
 };
 
 // generate.cpp's order: served_names, keep_unquantized_ple_key (native packs), pool_bytes, load, NativeDense::load.
-void load(const fs::path& pack, const std::string& shard, Loaded& l) {
-    const std::vector<std::string> shards{shard};
+void load_shards(const fs::path& pack, const std::vector<std::string>& shards, Loaded& l) {
     if (!NativeDense::served_names(shards, true, l.skip, l.err)) return;
     if (!NativeDense::keep_unquantized_ple_key(pack.string(), l.skip, l.err)) return;
     uint64_t pool = 0;
@@ -96,6 +95,9 @@ void load(const fs::path& pack, const std::string& shard, Loaded& l) {
     if (cudaMalloc(&l.arena, pool ? pool : 256) != cudaSuccess) { l.err = "cudaMalloc"; return; }
     if (!l.wt.load(pack.string(), l.arena, pool ? pool : 256, l.err, &l.skip)) return;
     l.ok = l.dense.load(shards, l.wt, l.err, true);
+}
+void load(const fs::path& pack, const std::string& shard, Loaded& l) {
+    load_shards(pack, {shard}, l);
 }
 }  // namespace
 
@@ -164,6 +166,26 @@ int main() {
               "no key in the skip set: the index is not read");
     }
 
+    std::printf("4. architecture-only metadata on a later split shard\n");
+    for (int mode = 0; mode < 4; ++mode) {
+        const fs::path pack = tmp.path / ("split" + std::to_string(mode));
+        write_pack(pack, false);
+        auto first = arch_keys();
+        first.push_back(fixture::u32("split.count", 2));
+        first.push_back(fixture::u32("split.no", 0));
+        first.push_back(fixture::u32("split.tensors.count", 2));
+        std::vector<fixture::Kv> second{
+            fixture::str("general.architecture", mode == 1 ? "other" : "qwen4exp"),
+            fixture::u32("split.count", mode == 2 ? 3 : 2),
+            fixture::u32("split.no", 1), fixture::u32("split.tensors.count", 2)};
+        if (mode == 3) second.push_back(fixture::u32("qwen4exp.embedding_length", 1024));
+        const auto a = (pack / "first.gguf").string(), b = (pack / "second.gguf").string();
+        fixture::write(a, first, {{QKV, {NE0, NE1}, 8, 1}});
+        fixture::write(b, second, {{KEY, {NE0, NE1}, 8, 2}});
+        Loaded l;
+        load_shards(pack, {a, b}, l);
+        check(l.ok == (mode == 0), "partial metadata mode " + std::to_string(mode) + ": " + l.err);
+    }
     std::printf(g_fail ? "native_dense_ple_key_test: %d FAILED\n" : "native_dense_ple_key_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

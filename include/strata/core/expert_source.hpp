@@ -208,6 +208,10 @@ private:
 /// after the ring and published before the CPU starts its own share.  Groups of entries that share a blob; the
 /// blob is a VRAM slot or a pinned host blob read over PCIe.
 struct GpuPlanSink {
+    // Experimental peer decode: device activation/result destinations for this group.
+    const float* peer_x = nullptr;
+    float* peer_rows = nullptr;
+    int32_t* peer_kind = nullptr;
     int32_t* counts = nullptr;             ///< [0] groups, [1] entries
     int32_t* start = nullptr;              ///< cap + 1
     int32_t* dst = nullptr;                ///< cap: the entry's row of parts (token * k + j)
@@ -355,7 +359,8 @@ struct ExpertDispatch {
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
-    double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+    double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;
+    double ms_cpu_only = 0, ms_helper_tail = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;

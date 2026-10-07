@@ -329,6 +329,8 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
+    float* peer_rows_ = nullptr;
+    int32_t* h_peer_kind_ = nullptr; int32_t* m_peer_kind_ = nullptr;
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device

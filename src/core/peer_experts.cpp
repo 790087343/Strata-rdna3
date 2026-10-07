@@ -13,6 +13,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+#include <rccl/rccl.h>
+#include <dlfcn.h>
+#endif
 
 namespace strata::core {
 
@@ -49,7 +53,18 @@ bool ck(cudaError_t e, const char* what, std::string& err) {
 
 }  // namespace
 
+#include "peer_transport.inc"
+
 PeerExperts::~PeerExperts() { close(); }
+void PeerExperts::report_transport() {
+    if(transport_)transport_->report(ms_wait);
+    if(profile_on_ && profile_calls_) {
+        std::fprintf(stderr,"strata helper stages: calls %lld input_plan_ms %.3f quant_ms %.3f experts_ms %.3f scatter_ms %.3f; helper-stream intervals overlap primary GPU and CPU work\n",
+                     (long long)profile_calls_,profile_ms_[0],profile_ms_[1],profile_ms_[2],profile_ms_[3]);
+        for(double& v:profile_ms_)v=0;
+        profile_calls_=0;
+    }
+}
 
 void PeerExperts::close() {
     if (device_ < 0) return;
@@ -57,6 +72,7 @@ void PeerExperts::close() {
         On on(device_);
         if (stream_) cudaStreamSynchronize(stream_);
         if (refill_) cudaStreamSynchronize(refill_);
+        delete transport_; transport_ = nullptr;
         cache_.close();
         if (d_x_) cudaFree(d_x_);
         if (d_out_) cudaFree(d_out_);
@@ -66,6 +82,8 @@ void PeerExperts::close() {
         if (h_x_) cudaFreeHost(h_x_);
         if (h_out_) cudaFreeHost(h_out_);
         if (h_meta_) cudaFreeHost(h_meta_);
+        for(auto& e:profile_ev_) { if(e)cudaEventDestroy(e);e=nullptr; }
+        profile_on_=false;
         if (refill_ev_) cudaEventDestroy(refill_ev_);
         if (stream_) cudaStreamDestroy(stream_);
         if (refill_) cudaStreamDestroy(refill_);
@@ -131,6 +149,19 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
 
+    profile_on_ = std::getenv("STRATA_HELPER_PROFILE") != nullptr;
+    if(profile_on_)for(auto& e:profile_ev_)if(!ck(cudaEventCreate(&e),"profile event",err)){close();return false;}
+    const char* transport = std::getenv("STRATA_PEER_TRANSPORT");
+    if(profile_on_ && transport && std::strcmp(transport,"host")!=0) {
+        err="helper profiling currently supports the baseline host transport only";close();return false;
+    }
+    if (transport && std::strcmp(transport,"host") != 0) {
+        std::string mode(transport);
+        if (mode!="hip" && mode!="store" && mode!="rccl" && mode!="push" && mode!="pushstore" && mode!="hoststore") { err="peer transport: expected host|hip|store|rccl|push|pushstore|hoststore";close();return false; }
+        if(!p2p_) { err="peer transport: both directions must support P2P";close();return false; }
+        try {transport_=new PeerTransport(mode,device_);transport_->open();}
+        catch(const std::exception& e){err=std::string("peer transport init: ")+e.what();close();return false;}
+    }
     // the pairs the primary does not hold, in rank order, as many as fit
     size_t free_b = 0, total_b = 0;
     if (!ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
@@ -179,7 +210,11 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
 }
 
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
-                         const int32_t* kind, std::string& err, float* out) {
+                         const int32_t* kind, std::string& err, float* out, const float* device_x, float* device_out) {
+    struct LaunchTimer { PeerTransport* p; std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now();
+        ~LaunchTimer(){if(p)p->launch_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();}
+    } launch_timer{transport_};
+    if(transport_ && (!device_x || !device_out)) {err="peer transport: verifier device buffers unavailable";return false;}
     static const bool direct_env = [] { const char* v = std::getenv("STRATA_PEER_DIRECT"); return v == nullptr || std::atoi(v) != 0; }();
     const bool direct = direct_env && out != nullptr;
     launched_direct_ = false;
@@ -218,16 +253,29 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     entries_ += rows;
     launched_rows_ = rows;
     // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+    if (!direct && !transport_) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-        return false;
+    if(profile_on_ && !ck(cudaEventRecord(profile_ev_[0],s),"profile input",err))return false;
+    try {
+        if(transport_)transport_->input(d_x_,device_x,x,(size_t)n_tok*H*sizeof(float),s);
+        else if(!ck(cudaMemcpyAsync(d_x_,direct?x:h_x_,(size_t)n_tok*H*sizeof(float),cudaMemcpyHostToDevice,s),"input",err))return false;
+    }catch(const std::exception& e){err=std::string("peer transport input: ")+e.what();return false;}
+    if(transport_ && transport_->check) {
+        if(!ck(cudaMemcpyAsync(h_x_,d_x_,(size_t)n_tok*H*sizeof(float),cudaMemcpyDeviceToHost,s),"check input",err) ||
+           !ck(cudaStreamSynchronize(s),"check input sync",err))return false;
+        if(std::memcmp(h_x_,x,(size_t)n_tok*H*sizeof(float))!=0){
+            size_t i=0;while(i<(size_t)n_tok*H && std::memcmp(h_x_+i,x+i,sizeof(float))==0)++i;
+            err="peer input differs from published host input at layer "+std::to_string(layer)+" element "+std::to_string(i)+" device="+std::to_string(h_x_[i])+" host="+std::to_string(x[i]);return false;
+        }
+    }
+    if(!ck(cudaMemcpyAsync(d_meta_,h_meta_,sizeof(Meta),cudaMemcpyHostToDevice,s),"plan",err))return false;
+    if(profile_on_ && !ck(cudaEventRecord(profile_ev_[1],s),"profile plan",err))return false;
     Meta* dm = (Meta*) d_meta_;
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
         strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+        if(profile_on_ && !ck(cudaEventRecord(profile_ev_[2],s),"profile quant",err))return false;
         const auto& f = lay.fmt[(size_t) layer];
         const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
         strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
@@ -236,29 +284,65 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         err = "peer experts: only native packs are supported";
         return false;
     }
+    if(profile_on_ && !ck(cudaEventRecord(profile_ev_[3],s),"profile experts",err))return false;
+    if(transport_) {
+        transport_->result_target=device_out;transport_->result_entries=(size_t)n;
+        try {
+            if((transport_->mode=="store" || transport_->mode=="pushstore" || transport_->mode=="hoststore")) {
+                strata::kernels::scatter_rows_f32(d_out_,device_out,dm->out_row,rows,H,s);
+                transport_->output_bytes+=(size_t)rows*H*sizeof(float);
+            }else{
+                transport_->result(d_out_,(size_t)rows*H*sizeof(float),s);
+                On on0(0);
+                strata::kernels::scatter_rows_f32(transport_->receive,device_out,((Meta*)h_meta_)->out_row,rows,H,transport_->primary_stream);
+            }
+        }catch(const std::exception& e){err=std::string("peer transport output: ")+e.what();return false;}
+        launched_direct_=true;return true;
+    }
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
             strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
         } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
+        if(profile_on_ && !ck(cudaEventRecord(profile_ev_[4],s),"profile scatter",err))return false;
         launched_direct_ = true;
         return true;
     }
-    return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
-              "results", err);
+    if(!ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),"results",err))return false;
+    return !profile_on_ || ck(cudaEventRecord(profile_ev_[4],s),"profile results",err);
 }
 
 bool PeerExperts::finish(float* out, std::string& err) {
     if (launched_rows_ == 0) return true;
     const auto t0 = std::chrono::steady_clock::now();
     {
-        On on(device_);
+        const bool primary = transport_ && transport_->mode!="store" && transport_->mode!="pushstore" && transport_->mode!="hoststore";
+        On on(primary?0:device_);
+        const cudaStream_t completion = primary?transport_->primary_stream:stream_;
         // spin on the stream (a blocking sync would sleep the pool thread and wake it late)
         cudaError_t e;
-        while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
+        while ((e = cudaStreamQuery(completion)) == cudaErrorNotReady) {
         }
         if (!ck(e, "finish", err)) return false;
     }
     ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if(transport_ && transport_->check) {
+        {On on0(0);
+         if(!ck(cudaMemcpyAsync(h_out_,transport_->result_target,transport_->result_entries*H*sizeof(float),cudaMemcpyDeviceToHost,transport_->primary_stream),"check result",err) ||
+            !ck(cudaStreamSynchronize(transport_->primary_stream),"check result sync",err))return false;}
+        {On on1(device_);
+         if(!ck(cudaMemcpyAsync(h_x_,d_out_,(size_t)launched_rows_*H*sizeof(float),cudaMemcpyDeviceToHost,stream_),"check compact result",err) ||
+            !ck(cudaStreamSynchronize(stream_),"check compact sync",err))return false;}
+        for(size_t r=0;r<row_of_.size();r++)if(std::memcmp(h_x_+r*H,h_out_+(size_t)row_of_[r]*H,H*sizeof(float))!=0){err="peer result scatter mismatch, row "+std::to_string(r);return false;}
+    }
+    if(profile_on_) {
+        On on(device_);
+        for(int i=0;i<4;++i) {
+            float ms=0;
+            if(!ck(cudaEventElapsedTime(&ms,profile_ev_[i],profile_ev_[i+1]),"profile elapsed",err))return false;
+            profile_ms_[i]+=ms;
+        }
+        ++profile_calls_;
+    }
     if (launched_direct_) { launched_rows_ = 0; return true; }
     for (size_t r = 0; r < row_of_.size(); ++r)
         std::memcpy(out + (size_t) row_of_[r] * H, h_out_ + r * H, (size_t) H * sizeof(float));

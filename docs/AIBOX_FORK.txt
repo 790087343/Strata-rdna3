@@ -1,0 +1,36 @@
+aibox production source snapshot
+===============================
+Upstream: https://github.com/Niko1221/Strata
+Base: 6f32ec070f23ced9f50e704d854d775da52591ab (0.1.39)
+Fork: https://github.com/nicejunjie/Strata
+Maintained branch: aibox-production
+
+This branch preserves the locally modified engine source as of 2026-10-06.
+It is a source snapshot, not a new performance release or an upstream merge.
+
+Changes relative to the base:
+- HIP MMQ support for Q4_K/Q5_K/Q5_1 and native MMVQ wave dispatch.
+- Fused prefill SwiGLU/quantization kernels and parity tests.
+- Peer expert row transport, optional transport paths, and overlap diagnostics.
+- GGUF split-shard metadata validation for additional shards.
+- Build targets and regression tests for these paths.
+Experimental transport paths remain in the snapshot; presence is not an
+endorsement of every mode for production. Deployment selects validated modes.
+
+The vision encoder source is unchanged from upstream. The GPU vision binary
+is a HIP build of tools/vision; aibox owns CPU/GPU selection and memory policy.
+GPU allocation, Open WebUI integration, model configuration, and deployment
+scripts remain in the separate localLLM repository.
+
+Snapshot validation:
+- git diff --check: passed for the engine changes.
+- tools/test_setup_choices.py: 35 passed.
+- tools/test_setup_amd.py: 27 passed, one failed (test_prebuilt_hip_zip).
+  The same failure reproduces on a clean checkout of the base above.
+- No engine rebuild, hardware benchmark, or binary replacement was performed
+  while creating this fork. Source preservation does not establish a new
+  source-to-binary reproducibility claim for previously installed binaries.
+
+Keep upstream as the original repository and origin as this fork. Review
+upstream updates on a separate branch, then build and validate before updating
+the deployment pin. Do not automatically merge upstream into a running setup.

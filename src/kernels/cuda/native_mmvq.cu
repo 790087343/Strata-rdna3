@@ -1130,21 +1130,33 @@ void launch_check() {
 }
 
 
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_USE_HIP)
+// One wave per row: four wave64 groups on gfx906 or eight wave32 groups on RDNA.
+// The wave reduces its row without cross-wave LDS partials or a block barrier.
+// All column counts 1..8 use the same summation order, preserving multi-token
+// versus single-token consistency within this layout. Rounding can differ from
+// the generic layout. gfx906 retains its existing STRATA_MMVQ_WAVE switch;
+// RDNA uses STRATA_RDNA_MMVQ_WAVE=1 (all shapes) or 2 (measured small-format shapes).
 #if defined(STRATA_HIP_GFX906)
-// ---- AMD (wave64) layout: one wavefront per R rows, four wavefronts per block, the row's blocks strided over the
-// 64 lanes exactly as the CUDA kernels stride them over a block (kbx = lane / T, stride 64 / T), and a 64-lane
-// butterfly instead of the LDS partials and __syncthreads of the one-block-per-row layout: on gfx906 a block per
-// 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
-// column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
+constexpr int NATIVE_WAVE = 64;
 bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
+#else
+// RDNA wave32 prototype, opt-in until measured and checked on the target card.
+constexpr int NATIVE_WAVE = 32;
+const char* g_rdna_wave_env = std::getenv("STRATA_RDNA_MMVQ_WAVE");
+const bool g_wave_exact = g_rdna_wave_env && std::string(g_rdna_wave_env) == "3";
+const bool g_wave_shapes = g_wave_exact || (g_rdna_wave_env && std::string(g_rdna_wave_env) == "2");
+bool g_wave_off = !(g_wave_exact || g_wave_shapes || (g_rdna_wave_env && std::string(g_rdna_wave_env) == "1"));
+#endif
+constexpr int NATIVE_WAVES_PER_BLOCK = 256 / NATIVE_WAVE;
 template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
-    constexpr int BPIW = 64 / F::T;
-    static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
-    const int lane = int(threadIdx.x) & 63;
-    const int row0 = (int(blockIdx.x) * 4 + (int(threadIdx.x) >> 6)) * R;
+    constexpr int BPIW = NATIVE_WAVE / F::T;
+    static_assert(NATIVE_WAVE % F::T == 0, "a block's threads must tile the wavefront");
+    const int lane = int(threadIdx.x) % NATIVE_WAVE;
+    const int row0 = (int(blockIdx.x) * NATIVE_WAVES_PER_BLOCK + int(threadIdx.x) / NATIVE_WAVE) * R;
     if (row0 >= n_out) return;
     const int blocks_per_row = n_in / F::DIV;
     const int x_stride = n_in / Q8K;
@@ -1167,16 +1179,59 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
         for (int i = 0; i < R; ++i) {
             float v = tmp[j][i];
 #pragma unroll
-            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            for (int off = NATIVE_WAVE / 2; off > 0; off >>= 1) v += __shfl_xor(v, off, NATIVE_WAVE);
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
         }
 }
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+// Emulate the generic four-warp partial sums inside one wave's registers.
+// The partial and lane reduction order stays the same, without the LDS exchange
+// and block barrier. Mode 3 is experimental until bitwise and timing checks pass.
+template<typename F, int NCOLS>
+__launch_bounds__(256)
+__global__ void native_mmvq_wave_exact_kernel(const typename F::Block* __restrict__ w,
+                                             const Q81Block* __restrict__ x,
+                                             float* __restrict__ y, int n_in, int n_out) {
+    const int lane = int(threadIdx.x) & 31;
+    const int row = int(blockIdx.x) * 8 + int(threadIdx.x) / 32;
+    if (row >= n_out) return;
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    float tmp[NCOLS][WARPS] = {};
+#pragma unroll
+    for (int g = 0; g < WARPS; ++g) {
+        const int tid = lane + g * WARP;
+        const int kqs = F::kqs(tid);
+        for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+            const typename F::W wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j)
+                tmp[j][g] += F::apply(wv, x + std::size_t(j) * x_stride + kbx * F::KBY, kqs);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = tmp[j][0];
+#pragma unroll
+        for (int g = 1; g < WARPS; ++g) v += tmp[j][g];
+        v = warp_sum(v);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+#endif
+
 template<typename F, int NCOLS>
 void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     constexpr int R = 1;
-    const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
+    const unsigned blocks = unsigned((std::size_t(n_out) + NATIVE_WAVES_PER_BLOCK * R - 1) / (NATIVE_WAVES_PER_BLOCK * R));
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    if (g_wave_exact) {
+        native_mmvq_wave_exact_kernel<F, NCOLS><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
+#endif
     native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
 }
 template<typename F>
@@ -1209,7 +1264,16 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // gfx1100 screen: short output matrices lose occupancy with one wave/row;
+    // 6144-wide projections were tied. Keep their existing layout in mode 2.
+    // Selection depends only on shape, never on the number of verify tokens.
+    if (!g_wave_shapes || n_in <= 1024 || (n_in <= 2560 && n_out >= 1024)) {
+        STRATA_WAVE_MMVQ(SmallTraits<Weight, Qi>)
+    }
+#else
     STRATA_WAVE_MMVQ(SmallTraits<Weight, Qi>)
+#endif
     if (ncols > 1) {
         launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();

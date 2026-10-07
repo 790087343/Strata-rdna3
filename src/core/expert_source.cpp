@@ -2110,7 +2110,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
-        if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
+        if (d.plan && d.plan->peer_kind) std::memcpy(d.plan->peer_kind,kind,(size_t)n*sizeof(int32_t));
+        if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out,
+                            d.plan ? d.plan->peer_x : nullptr, d.plan ? d.plan->peer_rows : nullptr)) {
             std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts could not be launched";
@@ -2213,6 +2215,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     }
+    const auto c_cpu = std::chrono::steady_clock::now();
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -2237,6 +2240,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    d.ms_cpu_only += ms(c3, c_cpu);
+    d.ms_helper_tail += ms(c_cpu, c4);
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

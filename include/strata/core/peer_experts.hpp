@@ -32,6 +32,7 @@ namespace strata::core {
 void set_peer_portable(bool on);
 bool peer_portable();
 
+class PeerTransport;
 class PeerExperts {
 public:
     PeerExperts() = default;
@@ -63,7 +64,7 @@ public:
     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into
     /// out[entry] with a scatter kernel (no D2H copy + host memcpy in finish); STRATA_PEER_DIRECT=0: the old way.
     bool launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
-                std::string& err, float* out = nullptr);
+                std::string& err, float* out = nullptr, const float* device_x = nullptr, float* device_out = nullptr);
     /// Waits for the launched share and writes its rows into `out` (row i = entry i, n_embd floats).
     bool finish(float* out, std::string& err);
 
@@ -80,9 +81,16 @@ public:
     int64_t entries() const { return entries_; }      ///< routed entries the peer computed
     int64_t experts() const { return experts_; }      ///< distinct (layer, expert) the peer computed
     int64_t swaps() const { return swaps_; }
+    void report_transport();
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
 
 private:
+    // Diagnostic only: events on the helper stream, never enabled by default.
+    bool profile_on_ = false;
+    cudaEvent_t profile_ev_[5] = {};
+    double profile_ms_[4] = {};
+    int64_t profile_calls_ = 0;
+    PeerTransport* transport_ = nullptr;
     int device_ = -1;
     bool p2p_ = false;
     int64_t n_layers_ = 0, n_expert_ = 0;

@@ -99,7 +99,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const auto* count = gguf.get("split.count");
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
-            if (gguf.get("general.architecture")) {
+            const auto* arch = gguf.get("general.architecture");
+            if (!have_architecture || gguf.get("qwen4exp.block_count")) {
                 err = strata::check_architecture(gguf);
                 if (!err.empty()) return false;
                 have_architecture = true;
@@ -112,6 +113,26 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                        tensors->u != split_tensors) {
                 err = "native dense: additional shard must match the architecture-validated first shard's split metadata";
                 return false;
+            }
+            // Some publishers repeat only the architecture name on data shards.
+            // Their split identity is checked above; any repeated model keys must
+            // still agree with the fully validated first shard.
+            if (have_architecture && number && number->u != 0) {
+                if (arch && arch->s != "qwen4exp") {
+                    err = "native dense: additional shard architecture mismatch";
+                    return false;
+                }
+                strata::GgufFile first(shards.front());
+                for (const char* key : {"qwen4exp.block_count", "qwen4exp.embedding_length",
+                                       "qwen4exp.expert_count", "qwen4exp.expert_used_count",
+                                       "qwen4exp.attention.head_count", "qwen4exp.attention.head_count_kv"}) {
+                    const auto* value = gguf.get(key);
+                    const auto* expected = first.get(key);
+                    if (value && (!expected || value->u != expected->u)) {
+                        err = std::string("native dense: additional shard metadata mismatch: ") + key;
+                        return false;
+                    }
+                }
             }
             if (number && !split_numbers.insert(number->u).second) {
                 err = "native dense: duplicate split shard number"; return false;

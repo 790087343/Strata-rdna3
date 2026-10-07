@@ -7066,12 +7066,12 @@ int main(int argc, char** argv) {
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
             struct DecSnap {
-                double wait, pool, host, plan, actq, jobs, run;
+                double wait, pool, host, plan, actq, jobs, run, cpu_only, helper_tail;
                 int64_t misses, entries, hits, pcie;
             };
             auto dec_snap = [&]() {
                 return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
-                               drive.d.ms_run, drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
+                               drive.d.ms_run, drive.d.ms_cpu_only, drive.d.ms_helper_tail, drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
@@ -7208,6 +7208,8 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                std::fprintf(stderr,"strata expert overlap: CPU_jobs_ms %.3f helper_tail_ms %.3f windows %lld; helper compute overlaps CPU jobs, tail is residual wait\n",
+                             d1.cpu_only-ds0.cpu_only,d1.helper_tail-ds0.helper_tail,(long long)dec_windows);
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
             }
@@ -7449,6 +7451,7 @@ int main(int argc, char** argv) {
                              (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
                              over ? " - OVERFLOW (too few resident cells)" : "");
             }
+            if (peer.valid()) peer.report_transport();
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);

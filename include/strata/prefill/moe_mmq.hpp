@@ -82,6 +82,9 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
 
+/// Opt-in fused activation; disabled path retains the two original launches.
+void swiglu_quantize(const float* gu, float* h, void* hq, int type, int64_t rows, int64_t cols, bool interleaved, void* stream);
+
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 

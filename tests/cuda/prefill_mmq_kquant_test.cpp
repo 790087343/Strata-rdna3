@@ -8,7 +8,11 @@
 
 #include "ggml.h"
 
+#if defined(STRATA_USE_HIP)
+#include "strata/hip_compat/cuda_runtime.h"
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -147,7 +151,7 @@ int main() {
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         {
             mmq::Context ctx;
-            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}};
+            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}, {0, 33, 65}, {129}};
             int trial = 0;
             for (const auto& counts : batches) {
                 const std::string tag = "-" + std::to_string(trial);
