@@ -181,6 +181,7 @@ class Base(unittest.TestCase):
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
             mock.patch.object(setup, "free_gb", lambda p: free),
             mock.patch.object(setup, "rotational_disk", lambda p: None),   # #605: not the test PC's disk
+            mock.patch.object(setup, "is_wsl", lambda: False),            # #974: the tests are not run inside WSL
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: self.t / "llama.cpp"),
             mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
@@ -289,6 +290,8 @@ class Main(Base):
         self.assertEqual(code, 0, out)
         for f in d.iterdir():                                                         # the first run "downloaded" them
             f.unlink()
+        import shutil
+        shutil.rmtree(self.t / "data" / "mtp", ignore_errors=True)       # #897: a draft layer already there needs less room
         (d / (list(setup.UNSLOTH_SHARDS)[0] + ".part")).write_bytes(b"x" * 1_500_000)
         with mock.patch.dict(setup.MODELS[M], {"download_gb": 0.003}):              # 1.5 MB still missing: no room
             code, out, cfg = self.main(["--context", "8192"], free=8.001)
@@ -328,18 +331,22 @@ class Main(Base):
         self.assertEqual(code, 2)                                                   # argparse: N > 0
         self.assertIsNone(cfg)
 
-    def test_one_gpu_and_no_images(self):
-        code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
-                                   n_gpus=2)
+    def test_one_gpu_and_images_with_a_warning(self):
+        """#967: images are allowed with UD-Q4_K_XL, said to be untested."""
+        code, out, cfg = self.main(["--context", "8192", "--vision", "yes", "--low-ram", "on"], n_gpus=2)
         self.assertEqual(code, 0, out)
-        self.assertIn("runs on one GPU", out)
-        self.assertIn("images are not available with UD-Q4_K_XL", out)
+        self.assertIn("(NVIDIA GeForce RTX 5070, 12 GB) only (--gpus 0,1 shares it across", out)
+        self.assertNotIn("images are not available", out)
+        self.assertIn("images: on", out)
+        self.assertIn("images with UD-Q4_K_XL are untested", out)
         self.assertIn("--low-ram on does not apply", out)
         self.assertNotIn("layer_split", cfg)
-        self.assertNotIn("--vision", cfg["args"])
+        self.assertIn("--vision", cfg["args"])
+        self.assertTrue(cfg["vision"]["model"].endswith("UD-Q4_K_XL-00001-of-00004.gguf"))
         self.assertNotIn("--mmap-experts", cfg["args"])
         self.assertFalse(any("--experts-bin" in r for r in self.runs))
 
+    @mock.patch.object(setup, "MIN_ENGINE", (0, 1, 39))   # before RESIDENT_SPLIT_ENGINE: no budget on a split
     def test_split_when_the_ram_holds_it(self):
         # #498: 165 GiB and --gpus 0,1: the split without the RAM budget (the engine refuses the pair)
         code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1"], n_gpus=2, ram=165.0)
@@ -352,15 +359,24 @@ class Main(Base):
         self.assertIn("OS file cache", out)
         self.assertNotIn("RAM budget: ", out)
 
-    def test_split_refused_without_the_ram(self):
+    @mock.patch.object(setup, "MIN_ENGINE", (0, 1, 39))   # before RESIDENT_SPLIT_ENGINE: no budget on a split
+    def test_split_without_the_ram_is_a_warning_not_a_wall(self):
+        # #737: below the worst-case estimate (a 128 GB PC ran it) the split is still the user's call
         need = setup.unsloth_split_need_gb()
         self.assertAlmostEqual(need, setup.MODELS[M]["download_gb"] + setup.UNSLOTH_RAM_LEFT_GB)
-        code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1"], n_gpus=2, ram=127.8)
+        code, out, cfg = self.main(["--context", "8192"], n_gpus=2, ram=127.8)       # no --gpus: stays on one GPU
         self.assertEqual(code, 0, out)
-        self.assertIn("runs on one GPU here", out)
+        self.assertIn("uses them together anyway", out)
         self.assertNotIn("layer_split", cfg)
         self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "71")   # all of them
+        code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1"], n_gpus=2, ram=127.8)   # asked for by name
+        self.assertEqual(code, 0, out)
+        self.assertIn("worst case", out)
+        self.assertIn("as you chose (--gpus), with 128 GB of RAM", out)
+        self.assertEqual(cfg["gpu"], [0, 1])
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
 
+    @mock.patch.object(setup, "MIN_ENGINE", (0, 1, 39))   # before RESIDENT_SPLIT_ENGINE: no budget on a split
     def test_an_explicit_budget_keeps_one_gpu(self):
         code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--resident-budget-gib", "60"], n_gpus=2,
                                    ram=165.0)
@@ -368,6 +384,38 @@ class Main(Base):
         self.assertIn("--resident-budget-gib has no layer split", out)
         self.assertNotIn("layer_split", cfg)
         self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "60")
+
+    def test_split_keeps_the_budget(self):
+        """#642: with a resident-split engine the cards asked for keep the RAM budget, at any RAM."""
+        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
+            code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1"], n_gpus=2)      # 64 GB: no 135 GB asked
+            self.assertEqual(code, 0, out)
+            self.assertEqual(cfg["gpu"], [0, 1])
+            self.assertEqual(cfg["layer_split"], "auto")
+            self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "40")
+            for flag in ("--mmap-experts", "--resident-experts"):
+                self.assertNotIn(flag, cfg["args"])
+            self.assertIn("as you chose (--gpus), with its RAM budget", out)
+            self.assertIn("RAM budget: 40 GiB", out)
+            self.assertNotIn("worst case", out)
+            code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--resident-budget-gib", "30"], n_gpus=2)
+            self.assertEqual(code, 0, out)                                                  # an explicit budget too
+            self.assertEqual(cfg["gpu"], [0, 1])
+            self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "30")
+            self.assertNotIn("has no layer split", out)
+
+    def test_asked_with_the_budget_one_gpu_by_default(self):
+        """#642: asked as before (one GPU recommended); "2" takes both cards with the budget."""
+        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
+            code, out, cfg = self.main(["--context", "8192"], n_gpus=2, answers={})          # Enter: one GPU
+            self.assertEqual(code, 0, out)
+            self.assertTrue(any(f"{M}: which GPUs?" in q and "[1]" in q for q in self.asked), self.asked)
+            self.assertNotIn("layer_split", cfg)
+            self.assertIn("--resident-budget-gib", cfg["args"])
+            code, out, cfg = self.main(["--context", "8192"], n_gpus=2, answers={"which GPUs?": "2"})
+            self.assertEqual(code, 0, out)
+            self.assertEqual(cfg["gpu"], [0, 1])
+            self.assertIn("--resident-budget-gib", cfg["args"])
 
     def test_yes_alone_keeps_one_gpu(self):
         code, out, cfg = self.main(["--context", "8192"], n_gpus=2, ram=165.0)
@@ -484,6 +532,15 @@ class IQ4XS(Base):
         self.assertNotIn("EXPERIMENTAL", line)
         self.assertIn("EXPERIMENTAL", next(ln for ln in out.splitlines() if ln.strip().startswith(M)))
 
+    def test_check_below_every_floor(self):
+        # #977: 16 GB fits no size; the RAM line is not [ok] and the verdict says so
+        code, out, _ = self.main(["--check"], ram=16.0, m=X)
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("[ok] RAM", out)
+        self.assertIn("[!]  RAM: 16 GB (less than", out)
+        self.assertIn("This PC cannot run Strata yet", out)
+        self.assertNotIn("This PC can run Strata", out)
+
     def test_engine_0138(self):
         code, out, cfg = self.main(["--context", "8192"], version="0.1.37", m=X)
         self.assertEqual(code, 1)
@@ -493,17 +550,66 @@ class IQ4XS(Base):
     def test_amd_is_not_asked(self):
         r9700 = [{"index": 0, "name": "AMD Radeon AI PRO R9700", "vram_gb": 31.9, "arch": "gfx1201",
                   "driver": "amdgpu"}]
-        with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"):
+        with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"), \
+                mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):  # Linux compiles it
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip"], version="0.1.38", amd=r9700, m=X)
         self.assertNotIn("has not been run on AMD cards yet", out)
         self.assertIn("RAM budget: 40 GiB of UD-IQ4_XS's experts", out)
 
 
+class StrixHaloCache(Base):
+    """#1715: on a unified-memory APU the expert cache and the RAM budget are the same RAM: setup writes a cache size
+    that leaves the OS room, not `--expert-cache auto` (it OOM-killed a 128 GB Strix Halo with the desktop open)."""
+
+    HALO = [{"index": 0, "name": "AMD Radeon 8060S", "vram_gb": 2.0, "arch": "gfx1151", "driver": "amdgpu",
+             "uma": True, "dedicated_gb": 2.0, "shared_gb": 112.0}]
+
+    def run_halo(self, ram, argv=("--context", "8192"), amd=None):
+        with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"),                 mock.patch.object(setup, "WIN", False),                 mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):
+            return self.main([*argv, "--backend", "hip"], version="0.1.41", amd=self.HALO if amd is None else amd,
+                             ram=ram, m="UD-IQ4_XS")
+
+    def test_cache_is_a_number_that_leaves_room(self):
+        code, out, cfg = self.run_halo(124.0)
+        self.assertEqual(code, 0, out)
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "55")
+        slots = int(args[args.index("--expert-cache") + 1])
+        # 124 - 24 (left) - 55 (budget) = 45 GiB of 1.1 x the average expert (59.5 GB / 24576)
+        self.assertEqual(slots, int(45 / (59.5e9 / setup.UMA_EXPERTS * 1.1 / 2**30)))
+        self.assertTrue(0 < slots < setup.UMA_EXPERTS)
+        self.assertIn("expert cache: %d slots (not auto)" % slots, out)
+
+    def test_never_more_than_all_the_experts(self):
+        self.assertEqual(setup.uma_expert_cache("UD-IQ4_XS", 512.0, 55), setup.UMA_EXPERTS)
+
+    def test_no_room_keeps_auto_and_says_so(self):
+        self.assertIsNone(setup.uma_expert_cache("UD-IQ4_XS", 64.0, 40))
+        code, out, cfg = self.run_halo(64.0, ("--context", "8192", "--resident-budget-gib", "40"))
+        self.assertEqual(code, 0, out)
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--expert-cache") + 1], "auto")
+        self.assertIn("leaves almost none for the expert cache", out)
+
+    def test_a_discrete_card_keeps_auto(self):
+        r9700 = [{"index": 0, "name": "AMD Radeon AI PRO R9700", "vram_gb": 31.9, "arch": "gfx1201",
+                  "driver": "amdgpu"}]
+        code, out, cfg = self.run_halo(124.0, amd=r9700)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--expert-cache") + 1], "auto")
+
+
 class LayerSplit(unittest.TestCase):
     """#498: UD-Q4_K_XL across GPUs - asked at setup (one GPU by default), and a start with --gpus no longer keeps
-    the RAM budget the engine refuses with a split (it exited with code 2)."""
+    the RAM budget the engine refused with a split (it exited with code 2).  #642: from RESIDENT_SPLIT_ENGINE the
+    budget is kept on the split."""
 
     def setUp(self):
+        # the behaviour before RESIDENT_SPLIT_ENGINE (an engine from before 0.1.40); the tests of the newer engine
+        # patch MIN_ENGINE themselves
+        p = mock.patch.object(setup, "MIN_ENGINE", (0, 1, 39))
+        p.start()
+        self.addCleanup(p.stop)
         sys.path.insert(0, str(ROOT / "tools"))
         from test_setup_golden import card
         self.found = [card(i, "NVIDIA GeForce RTX 3090", 24.0, "86") for i in range(2)]
@@ -547,17 +653,24 @@ class LayerSplit(unittest.TestCase):
         self.assertIsNone(code, out)
         self.assertTrue(started)
         self.assertEqual(cfg["gpu"], [0, 1])
-        self.assertEqual(cfg["args"], ["--pack", "p", "--kv", "int8", "--remote-expert-opt"])   # 0.1.39b: #578
+        self.assertEqual(cfg["args"], ["--pack", "p", "--kv", "int8"])   # #1447: no helper cache
         self.assertIn("no RAM budget", out)
 
-    def test_start_with_gpus_refused_without_the_ram(self):
-        code, out, cfg, started = self.start(63.7)
+    def test_start_with_gpus_without_the_ram_is_asked(self):
+        # #737: a warning and a question (default no), not a wall; --gpus with --yes is the consent
+        code, out, cfg, started = self.start(63.7, offered="n")          # asked: "n" stops, nothing saved
         self.assertEqual(code, 1)
         self.assertFalse(started)
         self.assertIn("cannot share its RAM budget across GPUs", out)
         self.assertIn("--gpu N", out)
-        self.assertEqual(cfg["gpu"], 0)                                # nothing saved
+        self.assertEqual(cfg["gpu"], 0)
         self.assertIn("--resident-budget-gib", cfg["args"])
+        code, out, cfg, started = self.start(63.7)                       # --gpus + --yes: goes on, no budget
+        self.assertIsNone(code, out)
+        self.assertTrue(started)
+        self.assertIn("cannot share its RAM budget across GPUs", out)
+        self.assertEqual(cfg["gpu"], [0, 1])
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
 
     def test_offered_at_a_start(self):
         code, out, cfg, _ = self.start(165.0, gpu=None, offered="")    # Enter: one GPU (the default here)
@@ -571,6 +684,26 @@ class LayerSplit(unittest.TestCase):
         code, out, cfg, _ = self.start(63.7, gpu=None, offered="y")    # not offered: the RAM does not hold it
         self.assertEqual(cfg["gpu"], 0)
         self.assertNotIn("Use both", out)
+
+    def test_resident_split_engine_keeps_the_budget(self):
+        """#642: a start with --gpus keeps the budget at any RAM; offered both cards (Enter: one, as before)."""
+        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
+            for ram in (165.0, 63.7):
+                code, out, cfg, started = self.start(ram)
+                self.assertIsNone(code, out)
+                self.assertTrue(started)
+                self.assertEqual(cfg["gpu"], [0, 1])
+                self.assertEqual(cfg["args"], ["--pack", "p", "--resident-budget-gib", "40", "--kv", "int8"])
+                self.assertNotIn("no RAM budget", out)
+                self.assertNotIn("cannot share its RAM budget", out)
+            code, out, cfg, _ = self.start(63.7, gpu=None, offered="")    # offered at 64 GB too; Enter: one GPU
+            self.assertIsNone(code, out)
+            self.assertIn("On both it keeps the budget", out)
+            self.assertIn("staying on one GPU", out)
+            self.assertEqual(cfg["gpu"], 0)
+            code, out, cfg, _ = self.start(63.7, gpu=None, offered="y")
+            self.assertEqual(cfg["gpu"], [0, 1])
+            self.assertIn("--resident-budget-gib", cfg["args"])
 
 
 if __name__ == "__main__":

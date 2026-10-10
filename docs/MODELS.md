@@ -51,7 +51,7 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 RX 9060 XT, RX 6900 XT) are in [AMD_HIP.md](AMD_HIP.md#rdna4-gfx1201).
 
 Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
-(about 5-10 minutes; on the PC above it made the Coder 7% faster; NVIDIA cards for now). Measured Strata on your own
+(about 15-30 minutes, longer on a slow card; on the PC above it made the Coder 7% faster; NVIDIA cards for now). Measured Strata on your own
 PC? See [Community benchmark results](COMMUNITY_BENCHMARKS.md) for a report template and how to share your results
 in a pull request.
 
@@ -62,7 +62,7 @@ in a pull request.
 | **Q2_0** | 37.6 GB | fastest | good |
 | **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
 | **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests (original model only) |
+| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests |
 
 The download is 66-76 GB for the three smaller sizes ([details](DETAILS.md#which-model)); the first start also
 fetches the MTP draft layer (~6 GB, +1 GB with images).
@@ -110,7 +110,7 @@ START-HERE.bat --setup --family coder
 
 **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI that
 thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
+token, and about the same RAM as the same size of the original. Its own license applies (see its page).
 More: [details](DETAILS.md#or-swift-15-a-fine-tune-that-thinks-shorter).
 
 ```
@@ -142,6 +142,9 @@ NVIDIA GPU (no images yet). Details and measurements: [UD-Q4_K_XL](UNSLOTH_Q4.md
 START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 ```
 
+**Unsloth's 6-bit UD-Q6_K_XL** (experimental, not in setup's menu) trades more bytes per expert for less precision
+loss against the same files: 169.2 GB together, its PLE table Q8_0 (read by the engine since 0.1.38). High RAM
+machines run it without a RAM budget. Manual workflow: [UD-Q6_K_XL](UNSLOTH_Q6.md).
 ### OrcaRouter Uncensored IQ3_XXS
 
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an

@@ -213,6 +213,19 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
+#if defined(__HIPCC__)   // #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two
+__global__ void f16_to_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half2float(__ushort_as_half(x[i]));
+}
+
+__global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
+    d[0] = 0;
+    d[1] = rows;
+}
+
+#endif
+
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
@@ -230,6 +243,9 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
+#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS)
+        case GGML_TYPE_Q6_K:   // HIP: the dense GGUF projections (STRATA_DENSE_MMQ); CUDA: only the opt-in -DSTRATA_Q6K_EXPERTS=ON build
+#endif
 #endif
             return true;
         default:
@@ -291,11 +307,23 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
+    static const int tile_cap = [] {
+        const char* e = std::getenv("STRATA_PREFILL_MMQ_TILE_ROWS");
+        if (!e || !*e) return 0;
+        const int n = std::atoi(e);
+        if (n != 0 && n != 16 && n != 32 && n != 64 && n != 96 && n != 128) {
+            std::fprintf(stderr, "Invalid STRATA_PREFILL_MMQ_TILE_ROWS\n"); std::exit(1);
+        }
+        std::fprintf(stderr, "strata: experimental MMQ tile row cap %d\n", n);
+        return n;
+    }();
+    // Only changes tile selection, never the actual grid extent or expert bounds.
+    const int64_t opt_rows = tile_cap > 0 && p.max_rows > tile_cap ? tile_cap : p.max_rows;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+                        p.max_rows, opt_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
@@ -314,6 +342,9 @@ void Context::run(const Product& p, void* stream) {
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS)
+        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+#endif
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
 #endif
         default:
@@ -376,6 +407,19 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     iota_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(dst, n);
     ck(cudaGetLastError(), "iota");
 }
+
+#if defined(__HIPCC__)
+void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    f16_to_f32_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    ck(cudaGetLastError(), "f16_to_f32");
+}
+
+void set_bounds(int32_t* dst, int32_t rows, void* stream) {
+    set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, rows);
+    ck(cudaGetLastError(), "set_bounds");
+}
+#endif
 
 }  // namespace strata::prefill::mmq
 
