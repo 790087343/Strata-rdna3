@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/dp4a.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -100,9 +101,14 @@ template <bool GATED>
 __global__ void combine_cpu_k10_vec4(const volatile float4* cpu4, const float4* __restrict__ hit4,
                                      const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count,
                                      const float* __restrict__ weights, const float4* __restrict__ shared4,
-                                     const float* __restrict__ sg, float4* __restrict__ output4, int64_t n4) {
+                                     const float* __restrict__ sg, float4* __restrict__ output4, int64_t n4,
+                                     const volatile uint32_t* flag, uint32_t value) {
     const int64_t tk = blockIdx.y;
     __shared__ int hit[10];
+    if (flag != nullptr && threadIdx.x == 0) {   // STRATA_WAIT_FUSE: the CPU-share wait in every block
+        while (*flag < value) strata_spin_pause();
+        __threadfence_system();
+    }
     if (threadIdx.x < 10) {
         const int row = (int) tk * 10 + (int) threadIdx.x, c = *count;
         int h = 0;
@@ -110,6 +116,7 @@ __global__ void combine_cpu_k10_vec4(const volatile float4* cpu4, const float4* 
         hit[threadIdx.x] = h;
     }
     __syncthreads();
+    if (flag != nullptr) __threadfence_system();   // every wave's acquire: no stale line of the reused mapped rows
     const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c4 >= n4) return;
     float4 p[10];
@@ -219,7 +226,7 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
 }
 void native_moe_combine_multi_cpu(const float* cpu, const float* hit, const int32_t* hit_rows, const int32_t* count,
                                   const float* weights, const float* shared, const float* shared_gate, float* output,
-                                  int64_t n_embd, int n_tok, void* stream) {
+                                  int64_t n_embd, int n_tok, void* stream, const uint32_t* wait_flag, uint32_t wait_value) {
     if (!stream || n_embd <= 0 || (n_embd & 3) != 0 || n_tok < 1 || !shared ||
         (((uintptr_t) cpu | (uintptr_t) hit | (uintptr_t) shared | (uintptr_t) output) & 15u) != 0)
         throw std::invalid_argument("native MoE combine (cpu) requires a stream, aligned rows of a width of 4s, tokens");
@@ -228,10 +235,10 @@ void native_moe_combine_multi_cpu(const float* cpu, const float* hit, const int3
     cudaStream_t st = static_cast<cudaStream_t>(stream);
     if (shared_gate)
         combine_cpu_k10_vec4<true><<<grid, 64, 0, st>>>(reinterpret_cast<const volatile float4*>(cpu), reinterpret_cast<const float4*>(hit),
-            hit_rows, count, weights, reinterpret_cast<const float4*>(shared), shared_gate, reinterpret_cast<float4*>(output), n4);
+            hit_rows, count, weights, reinterpret_cast<const float4*>(shared), shared_gate, reinterpret_cast<float4*>(output), n4, wait_flag, wait_value);
     else
         combine_cpu_k10_vec4<false><<<grid, 64, 0, st>>>(reinterpret_cast<const volatile float4*>(cpu), reinterpret_cast<const float4*>(hit),
-            hit_rows, count, weights, reinterpret_cast<const float4*>(shared), nullptr, reinterpret_cast<float4*>(output), n4);
+            hit_rows, count, weights, reinterpret_cast<const float4*>(shared), nullptr, reinterpret_cast<float4*>(output), n4, wait_flag, wait_value);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

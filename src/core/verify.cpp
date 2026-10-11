@@ -803,6 +803,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // hit_out (no copy_rows_from_mapped / moe_hit_add launches) and applies the shared gate, which rides in the router
     // GEMV - bitwise the launches it replaces
     static const bool g_cfuse = [] { const char* v = std::getenv("STRATA_COMBINE_CPU"); return v != nullptr && v[0] == '1'; }();
+    static const bool g_wait_fuse = [] { const char* v = std::getenv("STRATA_WAIT_FUSE"); return v != nullptr && v[0] == '1'; }();
     auto cfuse_on = [&](int n) {
         return g_cfuse && !ar_on() && !device_plan_ && !remote_opt_ && peer_rows_ == nullptr && K == 10 &&
                native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 && shared_expert_native_bf16_enabled() &&
@@ -1537,6 +1538,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
+            } else if (g_wait_fuse) {   // the pool published this group's GPU plan: wait and copy in one launch
+                wait_flag_copy_i32(m_flagA_, ring, pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             } else {
                 wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
@@ -1564,7 +1567,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
             } else if (cfuse_on(n)) {
-                wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows: the combine reads them
+                // the CPU's share is in the mapped rows: the combine reads them (STRATA_WAIT_FUSE: and waits for them)
+                if (!g_wait_fuse) wait_flag_ge(m_flag_, ring, cs);
                 stamp(l, 23, grp);
             } else {
                 wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
@@ -1590,7 +1594,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (!ar_on() && cfuse_on(n)) {
             try {
                 native_moe_combine_multi_cpu(m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
-                                             shared_ + tb * N, sg_gated_[grp] ? sh_g_ + tb : nullptr, bo_ + tb * N, N, n, cs);
+                                             shared_ + tb * N, sg_gated_[grp] ? sh_g_ + tb : nullptr, bo_ + tb * N, N, n, cs,
+                                             g_wait_fuse ? m_flag_ : nullptr, ring);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
