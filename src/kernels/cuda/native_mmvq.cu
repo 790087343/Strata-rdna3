@@ -2734,4 +2734,16 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 void native_mmvq_il_tune(int) {}
 #endif  // !__HIPCC__
 
+bool rdna_mmvq_pair(int type, const void* w1, const void* w2, const void* xq, float* y1, float* y2, int n_in,
+                    int n_out1, int n_out2, int ncols, void* stream) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_RDNA_PAIR"); return v != nullptr && v[0] == '1'; }();
+    if (!on || !rdna_q6k_enabled() || !w1 || !w2 || !xq || !y1 || !y2) return false;
+    // only where each matrix's own native_mmvq call would take these same rdna kernels
+    switch (type) {
+        case 14: return rdna_q6k_mmvq2(w1, xq, y1, n_in, n_out1, ncols, stream, w2, y2, n_out2);
+        case 12: case 13: case 23: return rdna_kq_mmvq2(type, w1, xq, y1, n_in, n_out1, ncols, stream, w2, y2, n_out2);
+        default: return false;
+    }
+}
+
 } // namespace strata::kernels

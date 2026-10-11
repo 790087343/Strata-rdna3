@@ -1076,7 +1076,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
                                 df_side_[1]);
                 }
-                mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                // STRATA_RDNA_PAIR: q/k/v and z (the same input) in one launch when they share an RDNA format and mm()
+                // would take native_mmvq for both (bitwise the two calls)
+                auto il_path = [&](const WeightRef* w, int n_out) {
+                    return g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out);
+                };
+                const bool z_paired = !br && wqkv->native_type == wg->native_type && !il_path(wqkv, (int) C) &&
+                    !il_path(wg, (int) ZV) &&
+                    strata::kernels::rdna_mmvq_pair(wqkv->native_type, wqkv->native_data, wg->native_data, xq_,
+                                                    qkv + (size_t) tb * C, z_ + (size_t) tb * ZV, (int) N, (int) C,
+                                                    (int) ZV, n, cs);
+                if (!z_paired) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1101,7 +1111,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!z_paired) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's

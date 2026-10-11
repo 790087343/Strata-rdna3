@@ -131,6 +131,14 @@ bool rdna_q6k_enabled();
 bool rdna_q6k_mmvq(const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
 /// the same layout for Q4_K (12), Q5_K (13), IQ4_XS (23); false = type not handled
 bool rdna_kq_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
+bool rdna_q6k_mmvq2(const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream,
+                    const void* w2, float* y2, int n_out2);
+bool rdna_kq_mmvq2(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream,
+                   const void* w2, float* y2, int n_out2);
+/// STRATA_RDNA_PAIR=1: two matrices of one format reading the same q8_1 input in one launch (rows of the second after
+/// the first's), each row bitwise what its own native_mmvq call computes.  false: not applicable, nothing launched.
+bool rdna_mmvq_pair(int type, const void* w1, const void* w2, const void* xq, float* y1, float* y2, int n_in,
+                    int n_out1, int n_out2, int ncols, void* stream);
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
