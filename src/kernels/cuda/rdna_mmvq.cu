@@ -125,8 +125,15 @@ __global__ void __launch_bounds__(256) rdna_kq_kernel(const uint8_t* __restrict_
                 v1 |= ((ld32u(b + 16 + l0 + 4) >> j) & 0x01010101u) << 4;
             }
             w0 = (int) v0; w1 = (int) v1;
+            // the 12 scale bytes as three dwords (the same for every lane), bytes picked arithmetically, no branches
+            const uint32_t s0 = ld32u(b + 4), s1 = ld32u(b + 8), s2 = ld32u(b + 12);
+            auto sb8 = [&](int k) -> int {
+                const uint32_t w = k < 4 ? s0 : (k < 8 ? s1 : s2);
+                return (int) ((w >> (8 * (k & 3))) & 0xffu);
+            };
             int sc, m;
-            kq_scale(b + 4, j, sc, m);
+            if (j < 4) { sc = sb8(j) & 63; m = sb8(j + 4) & 63; }
+            else { sc = (sb8(j + 4) & 0xF) | ((sb8(j - 4) >> 6) << 4); m = (sb8(j + 4) >> 4) | ((sb8(j) >> 6) << 4); }
             const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b));
             f1 = dm.x * (float) sc; f2 = dm.y * (float) m;
         }
@@ -172,8 +179,10 @@ bool rdna_kq_mmvq(int type, const void* w, const void* xq, float* y, int n_in, i
     cudaStream_t s = (cudaStream_t) stream;
     switch (type) {
         // Q4_K / Q5_K: measured slower than the native wave kernels on gfx1100 - not taken (kept for the bench)
-        case 12: if (std::getenv("STRATA_RDNA_KQ_ALL") == nullptr) return false; kq_launch<12>(wb, x, y, n_in, n_out, ncols, s); return true;
-        case 13: if (std::getenv("STRATA_RDNA_KQ_ALL") == nullptr) return false; kq_launch<13>(wb, x, y, n_in, n_out, ncols, s); return true;
+        case 12: if (ncols < 4 && std::getenv("STRATA_RDNA_KQ_ALL") == nullptr) return false;   // faster than the wave kernel from 4 columns
+            kq_launch<12>(wb, x, y, n_in, n_out, ncols, s); return true;
+        case 13: if (ncols < 4 && std::getenv("STRATA_RDNA_KQ_ALL") == nullptr) return false;
+            kq_launch<13>(wb, x, y, n_in, n_out, ncols, s); return true;
         case 23: kq_launch<23>(wb, x, y, n_in, n_out, ncols, s); return true;
         default: return false;
     }
