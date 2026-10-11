@@ -1379,6 +1379,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = (lfuse_on(n) || cfuse_on(n)) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        // STRATA_ROUTE_PUBLISH=1: the top-10 and the doorbell publish in one launch (the path doorbell_publish_res takes)
+        static const bool g_rpub = [] { const char* v = std::getenv("STRATA_ROUTE_PUBLISH"); return v != nullptr && v[0] == '1'; }();
+        const bool rpub = g_rpub && dec_batch && n > 1 && n <= 8 && w_router != nullptr && native_router_enabled() &&
+                          NE == 512 && K == 10 && !ar_on() && !device_plan_ && !remote_opt_ && !always_publish_ &&
+                          std::getenv("STRATA_ROUTE_PRIOR") == nullptr && route_resident_cfg().margin <= 0.0f
+#if defined(STRATA_USE_HIP)
+                          && !g_doorbell_store
+#endif
+            ;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -1388,6 +1397,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                if (rpub)
+                    native_router_top10_publish_res(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
+                                                    hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr,
+                                                    (int) g.n_expert, (int64_t) n * N, m_x_ + tb * N, m_ids_ + tb * K,
+                                                    m_seq_, cs);
+                else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -1439,7 +1454,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
+            else if (!rpub) {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
