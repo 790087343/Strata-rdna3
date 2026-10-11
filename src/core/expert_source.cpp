@@ -3751,6 +3751,38 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        // STRATA_CPU_REUSE_STATS=1 (diagnosis): how far back the same layer last computed each of this window's CPU
+        // experts on the CPU, in windows - what an L3-resident hot set could serve
+        static const bool reuse_stats = std::getenv("STRATA_CPU_REUSE_STATS") != nullptr;
+        if (reuse_stats && d.n_expert <= 1024 && d.layers < 128) {
+            static std::vector<int64_t> last((size_t) 128 * 1024, -1000000);
+            static int64_t win = 0, hist[7] = {}, total = 0, wins = 0;
+            static double bytes = 0;
+            if (d.layers == 0) { ++win; ++wins; }
+            static FILE* tr = [] { const char* f = std::getenv("STRATA_CPU_REUSE_TRACE"); return f ? std::fopen(f, "wb") : nullptr; }();
+            if (tr) {   // records: window, layer, expert, tokens routed to it (int32 x4)
+                for (int64_t e : miss) {
+                    int32_t cnt = 0;
+                    for (int64_t i = 0; i < n_tok * k; ++i) cnt += (kind[i] == -1 && ids[i] == e) ? 1 : 0;
+                    const int32_t rec[4] = {(int32_t) win + (d.layers == 0 ? 1 : 0), (int32_t) d.layers, (int32_t) e, cnt};
+                    std::fwrite(rec, sizeof rec, 1, tr);
+                }
+                if (d.layers == 0) std::fflush(tr);
+            }
+            for (int64_t e : miss) {
+                int64_t& l = last[(size_t) d.layers * 1024 + (size_t) e];
+                const int64_t dist = win - l;
+                const int b = dist <= 1 ? 0 : dist <= 2 ? 1 : dist <= 4 ? 2 : dist <= 8 ? 3 : dist <= 16 ? 4 : dist <= 64 ? 5 : 6;
+                ++hist[b]; ++total;
+                l = win;
+                bytes += (double) lay.blob_bytes(d.layers);
+            }
+            if (d.layers == 0 && wins % 1000 == 0 && total > 0) {
+                std::fprintf(stderr, "strata cpu reuse: %lld windows, %.1f CPU experts/window (%.0f MB/window); last used 1:%.1f%% 2:%.1f%% <=4:%.1f%% <=8:%.1f%% <=16:%.1f%% <=64:%.1f%% older/new:%.1f%%\n",
+                             (long long) wins, (double) total / wins, bytes / wins / 1048576.0, 100.0 * hist[0] / total, 100.0 * hist[1] / total,
+                             100.0 * hist[2] / total, 100.0 * hist[3] / total, 100.0 * hist[4] / total, 100.0 * hist[5] / total, 100.0 * hist[6] / total);
+            }
+        }
     }
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)
