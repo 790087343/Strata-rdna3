@@ -11,6 +11,9 @@
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <thread>
+#include <chrono>
 
 #ifndef STRATA_GR_WPE
 #define STRATA_GR_WPE 8
@@ -97,7 +100,7 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
                     const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
                     r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
                 }
-                s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+                s = fmaf(r.w, r.w, fmaf(r.z, r.z, fmaf(r.y, r.y, fmaf(r.x, r.x, s))));   // explicit: the same in every instance
             }
             const float v = wsum(s);
             if (lane == 0) sq[wv][k] = v;
@@ -213,7 +216,7 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
                     const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
                     r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
                 }
-                s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+                s = fmaf(r.w, r.w, fmaf(r.z, r.z, fmaf(r.y, r.y, fmaf(r.x, r.x, s))));   // explicit: the same in every instance
             }
             const float v = wsum(s);
             if (lane == 0) sq[wv][k] = v;
@@ -279,14 +282,54 @@ __device__ __forceinline__ int dot8i(uint2 w, uint2 a) {
     return __builtin_amdgcn_sudot4(true, (int) w.y, true, (int) a.y, __builtin_amdgcn_sudot4(true, (int) w.x, true, (int) a.x, 0, false), false);
 }
 
-template <int T, int RW>
+// STRATA_GR_INJ_UP=1 (!INJ): the inject rows' slice dots in their own blocks (row group LR / 16, one per slice) with
+// no LDS - wave w takes (row, token) items w, w + 8, ...; each is the INJ kernel's lane chunks and dot8 order over
+// R'[c,h] * w_norm (the staging expressions), then wsum. The int8 blocks then need no float copy of the rows.
+template <int T>
+__device__ __forceinline__ void inject_slice(const RdnaGr& m, int slice) {
+    const int t = threadIdx.x, lane = t & 31, wv = t >> 5, c = slice >> 1, h = slice & 1, e0 = c * N + h * H;
+    for (int it = wv; it < (PR - LR) * T; it += WV) {
+        const int row = it / T, k = it - row * T;
+        const FusedGrArgs& a = m.a[k];
+        const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inject + (size_t) row * D + e0);
+        const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
+        uint4 wb[HQ];
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wb[q] = ntload(w4 + lane + 32 * q);
+        float acc = 0.0f;
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) {
+            const int i = (lane + 32 * q) * 8;
+            float4 v[2];
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i + 4 * u);
+                if (a.apply) {
+                    const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i + 4 * u);
+                    r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+                }
+                const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i + 4 * u);
+                v[u] = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+            }
+            acc = dot8(wb[q], v[0], v[1], acc);
+        }
+        const float s = wsum(acc);
+        if (lane == 0) m.part[((size_t) k * 2 * HC + slice) * PR + LR + row] = s;
+    }
+}
+
+template <int T, int RW, bool INJ = true>
 __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_down_a8(RdnaGr m) {
-    __shared__ __align__(16) float xs[T][H];              // float rows, for the BF16 inject rows
+    // !INJ (STRATA_GR_INJ_UP): the 4 BF16 inject rows are rdna_gr_up's extra blocks - no float copy of the rows here
+    __shared__ __align__(16) float xs[INJ ? T : 1][INJ ? H : 4];   // float rows, for the BF16 inject rows
     __shared__ __align__(16) uint32_t xq[T][H / 4];       // int8 rows
     __shared__ float xd[T][H / 32];
     __shared__ float sq[WV][T];
     const int t = threadIdx.x, lane = t & 31, wv = t >> 5;
     const int rg = blockIdx.x, slice = blockIdx.y, c = slice >> 1, h = slice & 1;
+    if constexpr (!INJ) {
+        if (rg == LR / (RW * WV)) { if (m.a[0].w_inject != nullptr) inject_slice<T>(m, slice); return; }
+    }
     const int8_t* qd = m.a[0].r8_down;
     const uint16_t* sd = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(qd) + r8_soff((size_t) LR * D));
     uint2 wq[RW][HQ];
@@ -297,8 +340,8 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
 #pragma unroll
     for (int r = 0; r < RW; ++r) {
         const int row = (rg * WV + wv) * RW + r;
-        inj[r] = row >= LR;
-        act[r] = row < LR || (row < PR && m.a[0].w_inject != nullptr);
+        inj[r] = INJ && row >= LR;
+        act[r] = row < LR || (INJ && row < PR && m.a[0].w_inject != nullptr);
         any_inj |= inj[r] && act[r];
         if (!act[r]) continue;
         if (!inj[r]) {
@@ -326,7 +369,7 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
         }
         const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i);
             const float4 v = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
-            *reinterpret_cast<float4*>(&xs[k][i]) = v;
+            if constexpr (INJ) *reinterpret_cast<float4*>(&xs[k][i]) = v;
             quant4(v, &xq[k][i >> 2], &xd[k][i >> 5], (i & 31) == 0);
     }
     if (rg == 0) {   // the slice's sums of squares (only row group 0 publishes them)
@@ -341,7 +384,7 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
                     const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
                     r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
                 }
-                s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+                s = fmaf(r.w, r.w, fmaf(r.z, r.z, fmaf(r.y, r.y, fmaf(r.x, r.x, s))));   // explicit: the same in every instance
             }
             const float v = wsum(s);
             if (lane == 0) sq[wv][k] = v;
@@ -366,10 +409,12 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
 #pragma unroll
             for (int r = 0; r < RW; ++r) {
                 if (!inj[r]) acc[r] = fmaf(wd[r][q] * ad, (float) dot8i(wq[r][q], av), acc[r]);
-                else if (any_inj) {
+                else if (INJ && any_inj) {
+                    if constexpr (INJ) {
                     const float4 x0 = *reinterpret_cast<const float4*>(&xs[k][ch * 8]);
                     const float4 x1 = *reinterpret_cast<const float4*>(&xs[k][ch * 8 + 4]);
                     acc[r] = dot8(wb[r][q], x0, x1, acc[r]);
+                    }
                 }
             }
         }
@@ -416,6 +461,7 @@ __device__ __forceinline__ void q8_tail(const RdnaGr& m, int d0) {
 
 template <int T, bool Q8 = false, bool A8 = false>
 __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
+
     __shared__ __align__(16) uint32_t loq[A8 ? T : 1][LR / 4];
     __shared__ float lod[A8 ? T : 1][LR / 32];
     __shared__ __align__(16) float lo[T][LR];
@@ -511,6 +557,45 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
     if (m.a[0].q8_mixed != nullptr) q8_tail<T>(m, blockIdx.x * UC);   // STRATA_QFUSE
 }
 
+__global__ void inj_check(const float* a, const float* b, const float* sa, const float* sb, int T, int apply, int inj, volatile float* rec) {
+    if (threadIdx.x == 0) atomicAdd((int*) rec + 62, 1);
+    for (int i = threadIdx.x; i < T * 2 * HC * PR; i += blockDim.x)
+        if (__float_as_uint(a[i]) != __float_as_uint(b[i])) {
+            const int n = atomicAdd((int*) rec, 1);
+            if (n < 8) { rec[1 + n * 6] = T; rec[2 + n * 6] = apply; rec[3 + n * 6] = inj; rec[4 + n * 6] = i; rec[5 + n * 6] = a[i]; rec[6 + n * 6] = b[i]; }
+        }
+    for (int i = threadIdx.x; i < T * 2 * HC; i += blockDim.x)
+        if (__float_as_uint(sa[i]) != __float_as_uint(sb[i])) atomicAdd((int*) rec + 63, 1);
+}
+static volatile float* inj_rec() {
+    static volatile float* h = nullptr;
+    if (!h) {
+        void* p = nullptr;
+        cudaHostAlloc(&p, 64 * 4, cudaHostAllocMapped);
+        std::memset(p, 0, 256);
+        h = (volatile float*) p;
+        std::thread([] {
+            int last = 0;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                const int n = *(volatile int*) h;
+                std::fprintf(stderr, "INJCHK calls %d mismatches %d ss %d\n", ((volatile int*) h)[62], n, ((volatile int*) h)[63]);
+                if (n != last) {
+                    last = n;
+                    std::fprintf(stderr, "INJCHK mismatches %d ss %d\n", n, ((volatile int*) h)[63]);
+                    for (int j = 0; j < 8 && j < n; ++j) {
+                        const int i = (int) h[4 + j * 6], T = (int) h[1 + j * 6];
+                        std::fprintf(stderr, "INJCHK T%d apply%d inj%d i%d k%d slice%d row%d new %.9g old %.9g\n", T, (int) h[2 + j * 6],
+                                     (int) h[3 + j * 6], i, i / (2 * HC * PR), (i / PR) % (2 * HC), i % PR, h[5 + j * 6], h[6 + j * 6]);
+                    }
+                }
+            }
+        }).detach();
+    }
+    static void* d = nullptr;
+    if (!d) cudaHostGetDevicePointer(&d, (void*) h, 0);
+    return (volatile float*) d;
+}
 template <int T>
 void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
     static const int only = [] { const char* v = std::getenv("STRATA_GR_RDNA_ONLY"); return v ? std::atoi(v) : 0; }();   // bench: 1 down, 2 up
@@ -519,6 +604,20 @@ void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
     if (m.a[0].r8_down != nullptr && m.a[0].r8_up != nullptr) {   // STRATA_GR_RDNA_Q8
         static const bool a8 = [] { const char* v = std::getenv("STRATA_GR_RDNA_A8"); return v && v[0] == '1'; }();
         if (a8) {
+            static const bool inj_up = [] { const char* v = std::getenv("STRATA_GR_INJ_UP"); return v && v[0] == '1'; }();
+            if (inj_up) {   // the inject rows in their own blocks: no float copy of the rows in the int8 blocks
+                static const bool chk = std::getenv("STRATA_GR_INJ_CHECK") != nullptr;
+                if (chk) {   // debug: the INJ kernel into a second part buffer, compared after the new one
+                    RdnaGr m2 = m; m2.part = m.part + 22000; m2.ss = m2.part + (size_t) T * 2 * HC * PR;
+                    rdna_gr_down_a8<T, 2><<<dim3((PR + 2 * WV - 1) / (2 * WV), 2 * HC), TH, 0, st>>>(m2);
+                    rdna_gr_down_a8<T, 2, false><<<dim3(LR / (2 * WV) + 1, 2 * HC), TH, 0, st>>>(m);
+                    inj_check<<<1, 256, 0, st>>>(m.part, m2.part, m.ss, m2.ss, T, m.a[0].apply ? 1 : 0, m.a[0].w_inject != nullptr, inj_rec());
+                } else
+                if (only != 2) rdna_gr_down_a8<T, 2, false><<<dim3(LR / (2 * WV) + 1, 2 * HC), TH, 0, st>>>(m);
+                if (sb) gpu_stamp(sb, si + 1, st);
+                if (only != 1) rdna_gr_up<T, true, true><<<UB, TH, 0, st>>>(m);
+                return;
+            }
             if (only != 2) rdna_gr_down_a8<T, 2><<<dim3((PR + 2 * WV - 1) / (2 * WV), 2 * HC), TH, 0, st>>>(m);
             if (sb) gpu_stamp(sb, si + 1, st);
             if (only != 1) rdna_gr_up<T, true, true><<<UB, TH, 0, st>>>(m);
@@ -556,6 +655,7 @@ uint16_t* g_r8_scratch[64][2] = {};
 }  // namespace
 
 bool rdna_r8_scratch_init(long long elems) {
+    if (std::getenv("STRATA_GR_INJ_CHECK")) (void) inj_rec();   // debug buffer: mapped at load, not during a capture
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
     for (int r = 0; r < 2; ++r)

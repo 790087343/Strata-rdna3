@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
                 K::rdna_gr_read_multi(a, T, xn, st);
             };
             // numeric comparison on replica 0, bo zeroed so the in-place R update is idempotent
-            ck(cudaMemset(bo, 0, 8 * N * 4), "bo0");
+            if (!std::getenv("CLAUDE_KEEP_BO")) ck(cudaMemset(bo, 0, 8 * N * 4), "bo0");
             auto grab = [&](std::vector<float>& o) {
                 ck(cudaStreamSynchronize(st), "s"); o.resize(T * (LR + HC + HC + N));
                 ck(cudaMemcpy(o.data(), lo, T * LR * 4, cudaMemcpyDeviceToHost), "c1");
@@ -125,6 +125,11 @@ int main(int argc, char** argv) {
             };
             std::snprintf(nm, 64, "rdna_gr q8 T%d", T);
             report(nm, timeit(reps, which == "grq8" ? 60 : 400, f3), (double) r8b * 2);
+            if (const char* dump = std::getenv("CLAUDE_DUMP")) {   // outputs of one read on replica 0 (bo zeroed)
+                std::vector<float> o3; f3(0); grab(o3);
+                std::string fn = std::string(dump) + "_T" + std::to_string(T) + ".bin";
+                if (FILE* fp = std::fopen(fn.c_str(), "wb")) { std::fwrite(o3.data(), 4, o3.size(), fp); std::fclose(fp); }
+            }
         }
     }
     if (which == "all" || which == "mmvf") {
