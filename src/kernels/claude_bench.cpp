@@ -156,7 +156,8 @@ int main(int argc, char** argv) {
                             {23, 2560, 10240, "IQ4_XS qkv"}, {14, 2560, 6144, "Q6_K gate 2560->6144"}, {14, 6144, 2560, "Q6_K out 6144->2560"},
                             {14, 2560, 12288, "Q6_K q 2560->12288"}, {14, 2560, 512, "Q6_K k 2560->512"}, {8, 2560, 10240, "Q8_0 qkv"},
                             {14, 2560, 640, "Q6_K shexp 2560->640"}, {20, 640, 2560, "IQ4_NL shexp down 640->2560"},
-                            {14, 2560, 248320, "Q6_K head 2560->248320"}};
+                            {14, 2560, 248320, "Q6_K head 2560->248320"},
+                            {21, 2560, 6144, "IQ3_S gate 2560->6144"}, {21, 6144, 2560, "IQ3_S out 6144->2560"}, {21, 2560, 640, "IQ3_S shexp 2560->640"}};
         void* xq; ck(cudaMalloc(&xq, 8 * 6144 / 32 * 36 + 4096), "xq");
         float* x = (float*) dalloc_rand(8 * 6144 * 4, 9, false);
         std::vector<float> hx(8 * 6144); for (auto& v : hx) v = (float) (rand() % 2001 - 1000) / 1000.0f;
@@ -173,7 +174,7 @@ int main(int argc, char** argv) {
                 char nm[96]; std::snprintf(nm, 96, "%s T%d (%.1fMB)", s.name, T, wb / 1e6);
                 report(nm, timeit(reps, 300, [&](int r) { K::native_mmvq(s.type, w[r], xq, y, s.nin, s.nout, T, st); }), (double) wb);
             }
-            if (s.type == 14 || s.type == 12 || s.type == 13 || s.type == 23) {   // the RDNA kernels: same timing loop + max relative difference vs the native kernel
+            if (s.type == 14 || s.type == 12 || s.type == 13 || s.type == 23 || s.type == 21) {   // the RDNA kernels: same timing loop + max relative difference vs the native kernel
                 float *y1, *y2; ck(cudaMalloc(&y1, 8ull * s.nout * 4), "y1"); ck(cudaMalloc(&y2, 8ull * s.nout * 4), "y2");
                 for (int T : {1, 2, 3, 4, 6}) {
                     if (TT > 0 && T != TT && which == "mmvq") continue;

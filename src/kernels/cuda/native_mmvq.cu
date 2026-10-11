@@ -2591,7 +2591,13 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         if (rdna_q6k_enabled() && rdna_kq_mmvq(23, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
         native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
+    case 21:   // IQ3_S: the RDNA multi-column kernel under STRATA_RDNA_IQ3S=1 (the Huihui IQ3 dense projections)
+        {
+            static const bool iq3s = [] { const char* v = std::getenv("STRATA_RDNA_IQ3S"); return v != nullptr && v[0] == '1'; }();
+            if (iq3s && rdna_q6k_enabled() && rdna_kq_mmvq(21, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        }
+        iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 16: case 17: case 18: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
