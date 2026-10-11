@@ -461,6 +461,11 @@ struct Stager {
                                                                       : cudaEventDisableTiming) != cudaSuccess) return false;
         }
         cudaGetDevice(&device);
+        {
+            int np = 0;
+            for (int i = 0; i < kRing; ++i) np += pinned[(size_t) i] ? 1 : 0;
+            std::fprintf(stderr, "strata prefill: stager ring %d (%d pinned, %d pageable), %d threads\n", kRing, np, kRing - np, nthreads);
+        }
         for (int t = 0; t < nthreads; ++t)
             threads.emplace_back([this] {
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
@@ -2414,19 +2419,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                    static const bool trc = std::getenv("STRATA_PF_TRACE") != nullptr;
+                    double t_w = 0, t_s = 0, t_m = 0, t_r = 0;
+                    auto lap = [&](double& acc, Clock::time_point& t) { const auto n = Clock::now(); acc = std::chrono::duration<double, std::milli>(n - t).count(); t = n; };
+                    Clock::time_point tt = Clock::now();
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                    lap(t_w, tt);
                     if (en.job < 0) {
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                        lap(t_m, tt);
                         ++iss_dma;
                     } else {
                         const uint8_t* hb = m.stager->wait(en.job);
-                        if (std::getenv("STRATA_PF_TRACE") && ms_since(th) > 2000)
-                            std::fprintf(stderr, "PFTRACE issuer: stager wait %.0f ms idx=%zu job=%d consumed=%zu\n",
-                                         ms_since(th), idx, en.job, a_consumed.load());
+                        lap(t_s, tt);
                         cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                        lap(t_m, tt);
                         m.stager->issued_one(en.job, m.copy);
                     }
                     cudaEventRecord(m.copied[sl], m.copy);
+                    lap(t_r, tt);
+                    if (trc && t_w + t_s + t_m + t_r > 500)
+                        std::fprintf(stderr, "PFTRACE issuer idx=%zu job=%d dma=%d: waitev %.0f stager %.0f memcpy %.0f record %.0f ms (consumed %zu)\n",
+                                     idx, en.job, en.job < 0, t_w, t_s, t_m, t_r, a_consumed.load());
                     m.stage_live[sl] = true;
                     iss_ms += ms_since(th);
                     ++iss_streamed;
