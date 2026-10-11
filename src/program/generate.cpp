@@ -1,3 +1,4 @@
+#include "ggml.h"
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -2935,7 +2936,10 @@ int main(int argc, char** argv) {
                     for (const auto& path : o.native_dense_gguf) {
                         strata::GgufFile gguf(path);
                         for (const auto& t : gguf.tensors()) {
-                            if (t.name.rfind("blk.", 0) != 0 || (t.type != 8 && t.type != 30) || t.shape.size() != 2 ||
+                            const auto* tt = (t.type != 8 && t.type != 30) ? ggml_get_type_traits((ggml_type) t.type) : nullptr;
+                            const bool other = tt != nullptr && tt->to_float != nullptr && tt->blck_size > 0 &&
+                                               t.shape[0] % (uint64_t) tt->blck_size == 0;   // as native_dense's int8 build
+                            if (t.name.rfind("blk.", 0) != 0 || (t.type != 8 && t.type != 30 && !other) || t.shape.size() != 2 ||
                                 t.shape[0] % 32 != 0)
                                 continue;
                             for (const char* nm : {".hc_attn_down.weight", ".hc_attn_up.weight", ".hc_ffn_down.weight", ".hc_ffn_up.weight"})

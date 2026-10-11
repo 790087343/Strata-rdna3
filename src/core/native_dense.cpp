@@ -5,6 +5,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
+#include "ggml.h"   // STRATA_GR_RDNA_Q8: other hc formats (IQ3_S / IQ4_NL ...) dequantized for their int8 copies
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -383,7 +384,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 static const bool r8 = [] { const char* v = std::getenv("STRATA_GR_RDNA_Q8"); return v && v[0] == '1'; }();
                 if (r8)
                     for (const auto& tensor : gguf.tensors()) {
-                        if ((tensor.type != 8 && tensor.type != 30) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2 ||
+                        // Q8_0 and BF16 as stored; any other format ggml can dequantize (the Huihui packs' IQ3_S / IQ4_NL
+                        // hc tensors) through to_float, then the BF16 path's per-32 quantization
+                        const auto* tt = (tensor.type != 8 && tensor.type != 30) ? ggml_get_type_traits((ggml_type) tensor.type) : nullptr;
+                        const bool other = tt != nullptr && tt->to_float != nullptr && tt->blck_size > 0;
+                        if ((tensor.type != 8 && tensor.type != 30 && !other) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2 ||
                             tensor.name.ends_with("_inject.weight"))
                             continue;
                         auto found = table.table_.find(tensor.name);
@@ -398,6 +403,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         int8_t* q = (int8_t*) host.data();
                         uint16_t* sc = (uint16_t*) (host.data() + soff);
                         const uint8_t* src = (const uint8_t*) gguf.tensor_data(tensor);
+                        std::vector<float> deq;
+                        if (other) {
+                            if (n0 % (uint64_t) tt->blck_size != 0) { err = "native dense (STRATA_GR_RDNA_Q8): block size " + tensor.name; return false; }
+                            deq.resize((size_t) n);
+                            const size_t row_bytes = (size_t) (n0 / (uint64_t) tt->blck_size) * tt->type_size;
+                            for (uint64_t r = 0; r < n1; ++r) tt->to_float(src + r * row_bytes, deq.data() + r * n0, (int64_t) n0);
+                        }
                         for (uint64_t b = 0; b < n / 32; ++b) {
                             if (tensor.type == 8) {                       // Q8_0: fp16 d + 32 int8, as stored
                                 std::memcpy(&sc[b], src + b * 34, 2);
@@ -405,8 +417,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                             } else {                                      // BF16: quantized per 32 on the stored fp16 scale
                                 float x[32], amax = 0.0f;
                                 for (int j = 0; j < 32; ++j) {
-                                    uint16_t h; std::memcpy(&h, src + (b * 32 + j) * 2, 2);
-                                    const uint32_t u = (uint32_t) h << 16; std::memcpy(&x[j], &u, 4);
+                                    if (other) x[j] = deq[(size_t) (b * 32 + j)];
+                                    else {
+                                        uint16_t h; std::memcpy(&h, src + (b * 32 + j) * 2, 2);
+                                        const uint32_t u = (uint32_t) h << 16; std::memcpy(&x[j], &u, 4);
+                                    }
                                     amax = (std::max)(amax, std::fabs(x[j]));
                                 }
                                 const uint16_t hb = half_bits(amax / 127.0f);
