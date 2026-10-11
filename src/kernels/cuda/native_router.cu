@@ -230,6 +230,33 @@ __global__ void route_publish_res(const float* __restrict__ logits, int32_t* __r
 #endif
     }
 }
+// STRATA_ROUTE_PUBLISH, the always-publish doorbell (pipelined windows): route_multi's rows, then doorbell_publish's
+// copies (x, ids and weights, whatever the residency) and the ring increment, in one launch
+__launch_bounds__(256, 1)
+__global__ void route_publish_all(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                  int n_tok, const float* __restrict__ x, int n, float* x_out, int32_t* ids_out,
+                                  float* w_out, uint32_t* seq) {
+    const int tk = (int) threadIdx.y;
+    if (tk < n_tok) route_row(logits, ids, weights, tk);
+    __syncthreads();
+    const int t = (int) (threadIdx.y * 32 + threadIdx.x), k = n_tok * 10;
+    if ((n & 3) == 0 && ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(x_out)) & 15u) == 0)
+        for (int i = t; i < n / 4; i += 256) reinterpret_cast<float4*>(x_out)[i] = reinterpret_cast<const float4*>(x)[i];
+    else
+        for (int i = t; i < n; i += 256) x_out[i] = x[i];
+    for (int i = t; i < k; i += 256) {
+        ids_out[i] = ids[i];
+        if (w_out != nullptr) w_out[i] = weights[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)
+        __threadfence_system();
+#endif
+    }
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -318,6 +345,15 @@ void native_router_top10_publish_res(const float* logits, int32_t* ids, float* w
         throw std::invalid_argument("native router + publish requires a stream and 1..8 tokens");
     route_publish_res<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok, x, d_res,
                                                                               n_expert, (int) n, x_out, ids_out, seq);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x, int64_t n,
+                                 float* x_out, int32_t* ids_out, float* w_out, uint32_t* seq, void* stream) {
+    if (!stream || n_tok < 1 || n_tok > 8)
+        throw std::invalid_argument("native router + publish requires a stream and 1..8 tokens");
+    route_publish_all<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok, x, (int) n,
+                                                                              x_out, ids_out, w_out, seq);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

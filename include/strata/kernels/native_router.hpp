@@ -17,6 +17,9 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
 /// STRATA_ROUTE_PUBLISH: native_router_top10_multi then doorbell_publish_res(x, ids, d_res, ...) in one launch (1..8 rows)
+/// the same with doorbell_publish's copies (x, ids, weights, every row) - the always-publish (pipelined) windows
+void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x, int64_t n,
+                                 float* x_out, int32_t* ids_out, float* w_out, uint32_t* seq, void* stream);
 void native_router_top10_publish_res(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
                                      const int32_t* d_res, int n_expert, int64_t n, float* x_out, int32_t* ids_out,
                                      uint32_t* seq, void* stream);

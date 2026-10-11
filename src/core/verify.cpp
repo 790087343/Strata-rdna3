@@ -1391,13 +1391,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool sg_ready = false;
         // STRATA_ROUTE_PUBLISH=1: the top-10 and the doorbell publish in one launch (the path doorbell_publish_res takes)
         static const bool g_rpub = [] { const char* v = std::getenv("STRATA_ROUTE_PUBLISH"); return v != nullptr && v[0] == '1'; }();
-        const bool rpub = g_rpub && dec_batch && n > 1 && n <= 8 && w_router != nullptr && native_router_enabled() &&
-                          NE == 512 && K == 10 && !ar_on() && !device_plan_ && !remote_opt_ && !always_publish_ &&
+        const bool rpub_base = g_rpub && dec_batch && n > 1 && n <= 8 && w_router != nullptr && native_router_enabled() &&
+                          NE == 512 && K == 10 && !ar_on() && !device_plan_ && !remote_opt_ &&
                           std::getenv("STRATA_ROUTE_PRIOR") == nullptr && route_resident_cfg().margin <= 0.0f
 #if defined(STRATA_USE_HIP)
                           && !g_doorbell_store
 #endif
             ;
+        const bool rpub = rpub_base && !always_publish_, rpub_all = rpub_base && always_publish_;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -1407,7 +1408,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
-                if (rpub)
+                if (rpub_all)
+                    native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
+                                                m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+                else if (rpub)
                     native_router_top10_publish_res(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
                                                     hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr,
                                                     (int) g.n_expert, (int64_t) n * N, m_x_ + tb * N, m_ids_ + tb * K,
@@ -1461,7 +1465,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
             // whatever the device's residency table says (pipelined windows)
-            if (remote_opt_ || always_publish_)
+            if (rpub_all) {
+                // published with the routing above
+            } else if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
             else if (!rpub) {
