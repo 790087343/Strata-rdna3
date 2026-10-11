@@ -2420,6 +2420,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         ++iss_dma;
                     } else {
                         const uint8_t* hb = m.stager->wait(en.job);
+                        if (std::getenv("STRATA_PF_TRACE") && ms_since(th) > 2000)
+                            std::fprintf(stderr, "PFTRACE issuer: stager wait %.0f ms idx=%zu job=%d consumed=%zu\n",
+                                         ms_since(th), idx, en.job, a_consumed.load());
                         cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
@@ -2434,9 +2437,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
         }
         // the consumer's side: entry k's copy is on the copy stream (the thread issued it), then k is given back
+        static const bool pf_trace = std::getenv("STRATA_PF_TRACE") != nullptr;   // debug: slow waits of the stream
         auto wait_issued = [&](size_t k) {
             if (!threaded_issue) return;
-            while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+            const auto tw = Clock::now();
+            bool said = false;
+            while (a_issued.load(std::memory_order_acquire) <= k) {
+                std::this_thread::yield();
+                if (pf_trace && !said && ms_since(tw) > 2000) {
+                    said = true;
+                    std::fprintf(stderr, "PFTRACE wait_issued k=%zu issued=%zu consumed=%zu ring=%d seq=%zu\n", k,
+                                 a_issued.load(), a_consumed.load(), m.ring, seq.size());
+                }
+            }
         };
         auto give_back = [&](size_t upto) {
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
@@ -3000,7 +3013,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // launches over the experts in id order, each at most kMaxBatch experts of which at most a
                         // third of the ring streamed: the next batch's blobs arrive while one computes.  An expert
                         // the routing did not pick has no tiles; its ring slot is given back with its batch.
-                        const size_t per = (size_t) std::max(1, m.ring / 3);
+                        // and at most the stager's pinned ring of them: a batch spanning more unpinned jobs than that
+                        // deadlocks - its last copy waits for a host buffer whose previous DMA waits for this batch
+                        size_t per = (size_t) std::max(1, m.ring / 3);
+                        if (m.stager) per = std::min(per, (size_t) std::max(1, m.stager->kRing));
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
                         for (int32_t e = 0; e < m.g->n_expert;) {
