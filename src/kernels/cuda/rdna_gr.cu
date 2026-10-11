@@ -7,6 +7,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -126,7 +127,113 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
     }
 }
 
-template <int T>
+
+// ---- STRATA_GR_RDNA_Q8: the same two kernels on int8 + fp16-scale weights (hc_r8 layout; inject rows stay BF16)
+__device__ __forceinline__ float h2f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+__device__ __forceinline__ float dot8q(const uint2 w, float d, const float4 x0, const float4 x1, float acc) {
+    float s = 0.0f;
+    s = fmaf((float) (int8_t) (w.x), x0.x, s);       s = fmaf((float) (int8_t) (w.x >> 8), x0.y, s);
+    s = fmaf((float) (int8_t) (w.x >> 16), x0.z, s); s = fmaf((float) (int8_t) (w.x >> 24), x0.w, s);
+    s = fmaf((float) (int8_t) (w.y), x1.x, s);       s = fmaf((float) (int8_t) (w.y >> 8), x1.y, s);
+    s = fmaf((float) (int8_t) (w.y >> 16), x1.z, s); s = fmaf((float) (int8_t) (w.y >> 24), x1.w, s);
+    return fmaf(d, s, acc);
+}
+typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ uint2 ntload2(const uint2* p) {
+    const u32x2 v = __builtin_nontemporal_load(reinterpret_cast<const u32x2*>(p));
+    return make_uint2(v.x, v.y);
+}
+constexpr size_t r8_soff(size_t n) { return (n + 255) / 256 * 256; }
+
+template <int T, int RW>
+__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_down_q8(RdnaGr m) {
+    __shared__ __align__(16) float xs[T][H];
+    __shared__ float sq[WV][T];
+    const int t = threadIdx.x, lane = t & 31, wv = t >> 5;
+    const int rg = blockIdx.x, slice = blockIdx.y, c = slice >> 1, h = slice & 1;
+    const int8_t* qd = m.a[0].r8_down;
+    const uint16_t* sd = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(qd) + r8_soff((size_t) LR * D));
+    uint2 wq[RW][HQ];
+    float wd[RW][HQ];
+    uint4 wb[RW][HQ];   // the BF16 inject rows
+    bool act[RW], inj[RW];
+#pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        const int row = (rg * WV + wv) * RW + r;
+        inj[r] = row >= LR;
+        act[r] = row < LR || (row < PR && m.a[0].w_inject != nullptr);
+        if (!act[r]) continue;
+        if (!inj[r]) {
+            const uint2* w2 = reinterpret_cast<const uint2*>(qd + (size_t) row * D + c * N + h * H);
+            const uint16_t* s2 = sd + (size_t) row * (D / 32) + (c * N + h * H) / 32;
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) { wq[r][q] = ntload2(w2 + lane + 32 * q); wd[r][q] = h2f(s2[(lane + 32 * q) >> 2]); }
+        } else {
+            const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_inject + (size_t) (row - LR) * D + c * N + h * H);
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wb[r][q] = ntload(w4 + lane + 32 * q);
+        }
+    }
+    const int e0 = c * N + h * H;
+#pragma unroll 1
+    for (int k = 0; k < T; ++k) {
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
+        float s = 0.0f;
+#pragma unroll 2
+        for (int i = t * 4; i < H; i += TH * 4) {
+            float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
+            if (a.apply) {
+                const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
+                r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+            }
+            s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+            const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i);
+            *reinterpret_cast<float4*>(&xs[k][i]) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+        }
+        if (rg == 0) { const float v = wsum(s); if (lane == 0) sq[wv][k] = v; }
+    }
+    __syncthreads();
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+        for (int w = 0; w < WV; ++w) s += sq[w][t];
+        m.ss[t * 2 * HC + slice] = s;
+    }
+#pragma unroll 1
+    for (int k0 = 0; k0 < T; k0 += 2) {
+        const bool two = k0 + 1 < T;
+        float acc0[RW], acc1[RW];
+#pragma unroll
+        for (int r = 0; r < RW; ++r) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) {
+            const int j = (lane + 32 * q) * 8;
+            const float4 a0 = *reinterpret_cast<const float4*>(&xs[k0][j]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&xs[k0][j + 4]);
+            float4 b0 = make_float4(0.f, 0.f, 0.f, 0.f), b1 = b0;
+            if (two) { b0 = *reinterpret_cast<const float4*>(&xs[k0 + 1][j]); b1 = *reinterpret_cast<const float4*>(&xs[k0 + 1][j + 4]); }
+#pragma unroll
+            for (int r = 0; r < RW; ++r) {
+                if (!inj[r]) {
+                    acc0[r] = dot8q(wq[r][q], wd[r][q], a0, a1, acc0[r]);
+                    acc1[r] = dot8q(wq[r][q], wd[r][q], b0, b1, acc1[r]);
+                } else {
+                    acc0[r] = dot8(wb[r][q], a0, a1, acc0[r]);
+                    acc1[r] = dot8(wb[r][q], b0, b1, acc1[r]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const int row = (rg * WV + wv) * RW + r;
+            const float v0 = wsum(acc0[r]), v1 = wsum(acc1[r]);
+            if (act[r] && lane == 0) m.part[((size_t) k0 * 2 * HC + slice) * PR + row] = v0;
+            if (act[r] && lane == 1 && two) m.part[((size_t) (k0 + 1) * 2 * HC + slice) * PR + row] = v1;
+        }
+    }
+}
+
+template <int T, bool Q8 = false>
 __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
     __shared__ __align__(16) float lo[T][LR];
     __shared__ float rs[T][HC];
@@ -136,10 +243,20 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
     // latency overlaps the partial folding below
     const int rr = t >> 2, q = t & 3;          // 64 rows: stream c = rr / UC, column dd = rr % UC
     const int c = rr / UC, dd = rr - c * UC, d = blockIdx.x * UC + dd, i = c * N + d;
-    const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
     uint4 w[10];
+    uint2 w8[10];
+    float d8[10];
+    if constexpr (Q8) {
+        const int8_t* qu = m.a[0].r8_up;
+        const uint16_t* su = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(qu) + r8_soff((size_t) D * LR));
+        const uint2* w2 = reinterpret_cast<const uint2*>(qu + (size_t) i * LR);
 #pragma unroll
-    for (int u = 0; u < 10; ++u) w[u] = ntload(w4 + q + 4 * u);
+        for (int u = 0; u < 10; ++u) { w8[u] = ntload2(w2 + q + 4 * u); d8[u] = h2f(su[(size_t) i * (LR / 32) + ((q + 4 * u) >> 2)]); }
+    } else {
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+#pragma unroll
+        for (int u = 0; u < 10; ++u) w[u] = ntload(w4 + q + 4 * u);
+    }
     float rv[T], wn = m.a[0].w_norm[i];
 #pragma unroll
     for (int k = 0; k < T; ++k) rv[k] = m.a[k].R[i];
@@ -172,7 +289,8 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
             const int j = (q + 4 * u) * 8;
-            a = dot8(w[u], *reinterpret_cast<const float4*>(&lo[k][j]), *reinterpret_cast<const float4*>(&lo[k][j + 4]), a);
+            if constexpr (Q8) a = dot8q(w8[u], d8[u], *reinterpret_cast<const float4*>(&lo[k][j]), *reinterpret_cast<const float4*>(&lo[k][j + 4]), a);
+            else a = dot8(w[u], *reinterpret_cast<const float4*>(&lo[k][j]), *reinterpret_cast<const float4*>(&lo[k][j + 4]), a);
         }
         a += __shfl_xor(a, 1);
         a += __shfl_xor(a, 2);
@@ -205,6 +323,12 @@ void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
     static const int only = [] { const char* v = std::getenv("STRATA_GR_RDNA_ONLY"); return v ? std::atoi(v) : 0; }();   // bench: 1 down, 2 up
     static const int rw = [] { const char* v = std::getenv("STRATA_GR_RDNA_RW"); return v ? std::atoi(v) : 2; }();
     if (sb) gpu_stamp(sb, si, st);
+    if (m.a[0].r8_down != nullptr && m.a[0].r8_up != nullptr) {   // STRATA_GR_RDNA_Q8
+        if (only != 2) rdna_gr_down_q8<T, 2><<<dim3((PR + 2 * WV - 1) / (2 * WV), 2 * HC), TH, 0, st>>>(m);
+        if (sb) gpu_stamp(sb, si + 1, st);
+        if (only != 1) rdna_gr_up<T, true><<<UB, TH, 0, st>>>(m);
+        return;
+    }
     if (only != 2) {
         if (rw == 1) rdna_gr_down<T, 1><<<dim3((PR + WV - 1) / WV, 2 * HC), TH, 0, st>>>(m);
         else if (rw == 4) rdna_gr_down<T, 4><<<dim3((PR + 4 * WV - 1) / (4 * WV), 2 * HC), TH, 0, st>>>(m);
@@ -214,6 +338,44 @@ void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
     if (only != 1) rdna_gr_up<T><<<UB, TH, 0, st>>>(m);
 }
 }  // namespace
+
+
+// ---- STRATA_GR_RDNA_Q8 with the canonical BF16 copies skipped: other readers (the prompt path, the single-token
+// layer) get a BF16 image dequantized from hc_r8 into a per-device scratch, one per role (down / up), right before use
+// on their own stream.  The scratch is allocated at load (never during a graph capture).
+namespace {
+__global__ void r8_to_bf16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ sc, uint16_t* __restrict__ out,
+                                  long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = (float) q[i] * h2f(sc[i >> 5]);
+    const uint32_t u = __float_as_uint(v);
+    out[i] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   // round to nearest even
+}
+uint16_t* g_r8_scratch[64][2] = {};
+}  // namespace
+
+bool rdna_r8_scratch_init(long long elems) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    for (int r = 0; r < 2; ++r)
+        if (g_r8_scratch[dev][r] == nullptr && cudaMalloc(&g_r8_scratch[dev][r], (size_t) elems * 2) != cudaSuccess) return false;
+    return true;
+}
+
+const uint16_t* rdna_r8_to_bf16(const int8_t* r8, long long rows, long long cols, int role, void* stream) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    uint16_t* out = (dev >= 0 && dev < 64) ? g_r8_scratch[dev][role & 1] : nullptr;
+    if (out == nullptr) {
+        std::fprintf(stderr, "rdna_r8_to_bf16: no scratch on device %d\n", dev);
+        std::exit(1);
+    }
+    const long long n = rows * cols;
+    const uint16_t* sc = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(r8) + r8_soff((size_t) n));
+    r8_to_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(r8, sc, out, n);
+    return out;
+}
 
 bool rdna_gr_enabled() {
     static const bool on = [] { const char* v = std::getenv("STRATA_GR_RDNA"); return v != nullptr && v[0] == '1'; }();

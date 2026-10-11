@@ -781,8 +781,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    // STRATA_VERIFY_PROFILE_SEL=i,j,...: only these stamps (a low-overhead timeline of chosen points)
+    static const uint64_t prof_sel = []() -> uint64_t {
+        const char* v = std::getenv("STRATA_VERIFY_PROFILE_SEL");
+        if (v == nullptr) return ~(uint64_t) 0;
+        uint64_t m = 0;
+        for (const char* q = v; *q;) { char* e = nullptr; const long i = std::strtol(q, &e, 10); if (e == q) break; if (i >= 0 && i < 64) m |= (uint64_t) 1 << i; q = *e ? e + 1 : e; }
+        return m;
+    }();
     auto stamp = [&](int64_t l, int i, int grp) {
-        if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
+        if (prof_on_ && grp == 0 && ((prof_sel >> i) & 1)) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -998,6 +1006,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
+                a.r8_down = (const int8_t*) wd[half]->hc_r8; a.r8_up = (const int8_t*) wu[half]->hc_r8;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
@@ -1006,7 +1015,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
             }
-            return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+            return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0 && ((prof_sel >> 27) & 1)) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)

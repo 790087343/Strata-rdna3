@@ -1390,6 +1390,16 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
 // ---- the two halves' GR tensors.  Both halves have the same four names with a different prefix, and the
 // prefix is the ONLY thing that distinguishes them - so it is built rather than written twice.
 const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
+        if (w_down[h]->data == nullptr && w_down[h]->hc_r8 != nullptr) {   // STRATA_GR_RDNA_Q8: dequantized BF16 images
+            static thread_local WeightRef dl[2];
+            dl[h] = *w_down[h]; dl[h].data = strata::kernels::rdna_r8_to_bf16((const int8_t*) w_down[h]->hc_r8, w_down[h]->ne1, w_down[h]->ne0, 0, stream);
+            w_down[h] = &dl[h];
+        }
+        if (w_up[h]->data == nullptr && w_up[h]->hc_r8 != nullptr) {
+            static thread_local WeightRef ul[2];
+            ul[h] = *w_up[h]; ul[h].data = strata::kernels::rdna_r8_to_bf16((const int8_t*) w_up[h]->hc_r8, w_up[h]->ne1, w_up[h]->ne0, 1, stream);
+            w_up[h] = &ul[h];
+        }
 // The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly
 // that; handing it f32 bytes would walk 2x the tensor inside the arena without faulting.
 if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }

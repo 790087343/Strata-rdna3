@@ -2842,6 +2842,16 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (native_pack) skip.insert("token_embd.weight");
+        // STRATA_GR_RDNA=1 + STRATA_GR_RDNA_Q8=1: the layers' hyper-connection down/up projections are served by their
+        // int8 copies (the verify read) and dequantized on demand elsewhere: the BF16 copies stay off the card
+        {
+            const char* a = std::getenv("STRATA_GR_RDNA");
+            const char* b = std::getenv("STRATA_GR_RDNA_Q8");
+            if (a && a[0] == '1' && b && b[0] == '1' && !o.native_dense_gguf.empty())
+                for (int l = 0; l < 256; ++l)
+                    for (const char* nm : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight"})
+                        skip.insert("blk." + std::to_string(l) + "." + nm);
+        }
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the

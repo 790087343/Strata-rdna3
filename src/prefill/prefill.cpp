@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
@@ -2533,6 +2534,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
+                core::WeightRef wd_l, wu_l;   // STRATA_GR_RDNA_Q8: BF16 images dequantized from the int8 copies
+                if (wd->data == nullptr && wd->hc_r8 != nullptr) {
+                    wd_l = *wd; wd_l.data = strata::kernels::rdna_r8_to_bf16((const int8_t*) wd->hc_r8, wd->ne1, wd->ne0, 0, m.cs); wd = &wd_l;
+                }
+                if (wu->data == nullptr && wu->hc_r8 != nullptr) {
+                    wu_l = *wu; wu_l.data = strata::kernels::rdna_r8_to_bf16((const int8_t*) wu->hc_r8, wu->ne1, wu->ne0, 1, m.cs); wu = &wu_l;
+                }
                 pt.mark(kPfHc, cs);
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
