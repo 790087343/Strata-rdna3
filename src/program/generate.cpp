@@ -2847,10 +2847,23 @@ int main(int argc, char** argv) {
         {
             const char* a = std::getenv("STRATA_GR_RDNA");
             const char* b = std::getenv("STRATA_GR_RDNA_Q8");
-            if (a && a[0] == '1' && b && b[0] == '1' && !o.native_dense_gguf.empty())
-                for (int l = 0; l < 256; ++l)
-                    for (const char* nm : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight"})
-                        skip.insert("blk." + std::to_string(l) + "." + nm);
+            if (a && a[0] == '1' && b && b[0] == '1' && !o.native_dense_gguf.empty()) {
+                // only the tensors the loader can turn into int8 copies (GGUF Q8_0 or BF16, 2-D, ne0 % 32 == 0)
+                try {
+                    for (const auto& path : o.native_dense_gguf) {
+                        strata::GgufFile gguf(path);
+                        for (const auto& t : gguf.tensors()) {
+                            if (t.name.rfind("blk.", 0) != 0 || (t.type != 8 && t.type != 30) || t.shape.size() != 2 ||
+                                t.shape[0] % 32 != 0)
+                                continue;
+                            for (const char* nm : {".hc_attn_down.weight", ".hc_attn_up.weight", ".hc_ffn_down.weight", ".hc_ffn_up.weight"})
+                                if (t.name.ends_with(nm)) skip.insert(t.name);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "strata generate: STRATA_GR_RDNA_Q8 skip scan: %s (BF16 copies kept)\n", e.what());
+                }
+            }
         }
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
