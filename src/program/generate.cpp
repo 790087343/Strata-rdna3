@@ -7511,9 +7511,14 @@ int main(int argc, char** argv) {
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         {   // --pcie-frac 0 on one card: the pool never plans a PCIe share, so the window graph leaves that path out
             const char* po = std::getenv("STRATA_PCIE_OFF");
-            const bool off = o.pcie_frac == 0.0 && !o.pcie_frac_auto && o.layer_split.empty() && o.peer_device < 0 &&
+            const bool off = o.pcie_frac == 0.0 && !o.pcie_frac_auto && o.peer_device < 0 &&
                              !(po != nullptr && po[0] == '0');
             ver.set_pcie_off(off);
+            // a layer split: every stage's verifiers (and the pipelined odd windows'), as the pool plans no PCIe share there
+            for (int st = 0; st < n_stages && n_stages > 1; ++st) {
+                stage_ver(st).set_pcie_off(off);
+                if (pipe) stage_ver_p(st, 1).set_pcie_off(off);
+            }
             if (off) std::fprintf(stderr, "strata generate: --pcie-frac 0: the verify windows skip the PCIe share path\n");
         }
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
