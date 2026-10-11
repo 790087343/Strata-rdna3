@@ -143,6 +143,20 @@ int main(int argc, char** argv) {
                 char nm[96]; std::snprintf(nm, 96, "%s T%d (%.1fMB)", s.name, T, wb / 1e6);
                 report(nm, timeit(reps, 300, [&](int r) { K::native_mmvq(s.type, w[r], xq, y, s.nin, s.nout, T, st); }), (double) wb);
             }
+            if (s.type == 14 || s.type == 12 || s.type == 13 || s.type == 23) {   // the RDNA kernels: same timing loop + max relative difference vs the native kernel
+                float *y1, *y2; ck(cudaMalloc(&y1, 8ull * s.nout * 4), "y1"); ck(cudaMalloc(&y2, 8ull * s.nout * 4), "y2");
+                for (int T : {1, 2, 3, 4, 6}) {
+                    if (TT > 0 && T != TT && which == "mmvq") continue;
+                    K::native_mmvq(s.type, w[0], xq, y1, s.nin, s.nout, T, st);
+                    if (s.type == 14) K::rdna_q6k_mmvq(w[0], xq, y2, s.nin, s.nout, T, st); else K::rdna_kq_mmvq(s.type, w[0], xq, y2, s.nin, s.nout, T, st);
+                    std::vector<float> a((size_t) T * s.nout), b((size_t) T * s.nout);
+                    ck(cudaMemcpy(a.data(), y1, a.size() * 4, cudaMemcpyDeviceToHost), "a"); ck(cudaMemcpy(b.data(), y2, b.size() * 4, cudaMemcpyDeviceToHost), "b");
+                    double md = 0, mr = 0; for (size_t i = 0; i < a.size(); ++i) { md = std::max(md, (double) std::fabs(a[i] - b[i])); mr = std::max(mr, (double) std::fabs(a[i])); }
+                    char nm[96]; std::snprintf(nm, 96, "  rdna %s T%d (rel %.1e)", s.name, T, md / (mr + 1e-30));
+                    report(nm, timeit(reps, 300, [&](int r) { if (s.type == 14) K::rdna_q6k_mmvq(w[r], xq, y, s.nin, s.nout, T, st); else K::rdna_kq_mmvq(s.type, w[r], xq, y, s.nin, s.nout, T, st); }), (double) wb);
+                }
+                cudaFree(y1); cudaFree(y2);
+            }
             for (void* p : w) cudaFree(p);
         }
         for (int T : {1, 3, 6}) {

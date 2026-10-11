@@ -2534,10 +2534,18 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 13: native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 12:
+        if (rdna_q6k_enabled() && rdna_kq_mmvq(12, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 13:
+        if (rdna_q6k_enabled() && rdna_kq_mmvq(13, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 14:
+        if (rdna_q6k_enabled() && rdna_q6k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 23:
+        if (rdna_q6k_enabled() && rdna_kq_mmvq(23, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 16: case 17: case 18: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
