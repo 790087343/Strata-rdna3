@@ -439,6 +439,20 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    if (const char* pc = std::getenv("STRATA_POOL_CORES")) {   // an explicit worker CPU list, e.g. "1,2,3,4,8,9,10,11"
+        std::vector<int> cores;
+        for (const char* q = pc; *q;) {
+            char* end = nullptr;
+            const long v = std::strtol(q, &end, 10);
+            if (end == q) break;
+            cores.push_back((int) v);
+            q = *end == ',' ? end + 1 : end;
+        }
+        if (!cores.empty()) {
+            topo_.worker_cores = cores;
+            if (n_workers <= 0 || n_workers > (int) cores.size()) n_workers = (int) cores.size();
+        }
+    }
     if (n_workers > 0) {
         n_ = n_workers;
     } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {

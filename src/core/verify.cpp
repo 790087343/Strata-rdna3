@@ -1526,6 +1526,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
+            if (!pcie_off_) {   // with --pcie-frac 0 there is never a PCIe share: no flag-B wait, no empty launches
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
@@ -1534,10 +1535,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
             }
+            }
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            if (!pcie_off_) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
@@ -1833,6 +1835,36 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "strata verify: %zu edges, %zu programmatic (PDL), %zu of them not kernel to kernel%s\n", ne,
                      prog, bad, ge != cudaSuccess ? " (the edge query failed)" : "");
 #endif
+    }
+#endif
+#if defined(STRATA_USE_HIP)   // a HIP debug listing (kernel names, counts)
+    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {
+        size_t nn = 0;
+        hipGraphGetNodes(graph, nullptr, &nn);
+        std::vector<hipGraphNode_t> nodes(nn);
+        hipGraphGetNodes(graph, nodes.data(), &nn);
+        std::map<std::string, int> kinds;
+        for (hipGraphNode_t nd : nodes) {
+            hipGraphNodeType ty;
+            hipGraphNodeGetType(nd, &ty);
+            std::string name = "type" + std::to_string((int) ty);
+            if (ty == hipGraphNodeTypeKernel) {
+                hipKernelNodeParams kp{};
+                if (hipGraphKernelNodeGetParams(nd, &kp) == hipSuccess) {
+                    const char* fn = hipKernelNameRefByPtr(kp.func, cs_);
+                    name = fn ? fn : "kernel?";
+                    name += " g" + std::to_string(kp.gridDim.x * kp.gridDim.y * kp.gridDim.z) + "b" + std::to_string(kp.blockDim.x * kp.blockDim.y);
+                }
+            } else if (ty == hipGraphNodeTypeMemcpy) name = "memcpy";
+            else if (ty == hipGraphNodeTypeMemset) name = "memset";
+            ++kinds[name];
+        }
+        (void) hipGetLastError();
+        std::vector<std::pair<int, std::string>> v;
+        for (auto& [k2, c] : kinds) v.push_back({c, k2});
+        std::sort(v.rbegin(), v.rend());
+        std::fprintf(stderr, "strata verify: the %d-token window graph has %zu nodes:\n", T, nn);
+        for (size_t i = 0; i < v.size(); ++i) std::fprintf(stderr, "  %5d x %.160s\n", v[i].first, v[i].second.c_str());
     }
 #endif
     const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);

@@ -265,6 +265,7 @@ public:
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    void set_pcie_off(bool off) { pcie_off_ = off; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
@@ -427,6 +428,7 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    bool pcie_off_ = false;                                       // no PCIe share ever (--pcie-frac 0)
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)

@@ -1672,6 +1672,15 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
+    if (rdna_gr_enabled() && a[0].q8_down == nullptr) {   // STRATA_GR_RDNA=1 (rdna_gr.cu)
+        rdna_gr_read_multi(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+        const cudaError_t er = cudaGetLastError();
+        if (er != cudaSuccess) {
+            std::fprintf(stderr, "rdna_gr_read_multi: %s\n", cudaGetErrorString(er));
+            std::exit(1);
+        }
+        return false;   // the caller quantizes
+    }
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
         const cudaError_t eq = cudaGetLastError();
@@ -1707,6 +1716,11 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 cudaFuncSetAttribute(gr_down_v3_kernel<1, 4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
                 cudaFuncSetAttribute(gr_down_v3_kernel<1, kFusedGrMaxT, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
                 split = 1;
+            } else if (need6 <= limit &&
+                       cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, need6) == cudaSuccess &&
+                       cudaFuncSetAttribute(gr_down_v3_kernel<1, 5, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, need5) == cudaSuccess) {
+                // a 64 KiB card (gfx1100): the single-pass split for windows of up to six tokens; 7-8 keep the default read
+                split = 6;
             } else if (need2 <= limit)
                 // #375 (kenh0u): the S = 2 split (a 64 KB opt-in card: Turing) disagrees with itself in gr_parity
                 // (graph replay vs direct call) - such a card keeps the default read until that split is fixed
@@ -1716,7 +1730,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             split3[dev3] = split;
         }
     }
-    const int split = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;
+    int split = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;
+    if (split == 6) split = n_tok <= 6 ? 1 : -1;
     if (split > 0) {   // 2 kernels; scratch = partials + sums of squares
         float* part = xn_scratch;
         float* ssg = xn_scratch + (size_t) n_tok * HC * 2 * PR;   // room for S = 2

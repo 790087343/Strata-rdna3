@@ -7486,6 +7486,13 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        {   // --pcie-frac 0 on one card: the pool never plans a PCIe share, so the window graph leaves that path out
+            const char* po = std::getenv("STRATA_PCIE_OFF");
+            const bool off = o.pcie_frac == 0.0 && !o.pcie_frac_auto && o.layer_split.empty() && o.peer_device < 0 &&
+                             !(po != nullptr && po[0] == '0');
+            ver.set_pcie_off(off);
+            if (off) std::fprintf(stderr, "strata generate: --pcie-frac 0: the verify windows skip the PCIe share path\n");
+        }
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -12492,6 +12499,13 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        {   // --pcie-frac 0 on one card: the pool never plans a PCIe share, so the window graph leaves that path out
+            const char* po = std::getenv("STRATA_PCIE_OFF");
+            const bool off = o.pcie_frac == 0.0 && !o.pcie_frac_auto && o.layer_split.empty() && o.peer_device < 0 &&
+                             !(po != nullptr && po[0] == '0');
+            ver.set_pcie_off(off);
+            if (off) std::fprintf(stderr, "strata generate: --pcie-frac 0: the verify windows skip the PCIe share path\n");
+        }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

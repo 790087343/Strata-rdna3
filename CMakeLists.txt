@@ -367,6 +367,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
                           src/kernels/cuda/fused_gr.cu
+                          src/kernels/cuda/rdna_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
                           src/kernels/cuda/qsa_prompt_attn.cu
@@ -403,6 +404,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_source_files_properties(src/kernels/qsa_select_bench.cpp PROPERTIES LANGUAGE HIP)
     target_link_libraries(qsa_select_bench PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME qsa_select_bench COMMAND qsa_select_bench 32768 256 3 262144)
+  endif()
+  if(STRATA_ENABLE_HIP)
+    add_executable(claude_bench src/kernels/claude_bench.cpp)
+    set_source_files_properties(src/kernels/claude_bench.cpp PROPERTIES LANGUAGE HIP)
+    target_link_libraries(claude_bench PRIVATE strata_kernels strata_hip_runtime)
+    add_executable(claude_cpubench src/kernels/claude_cpubench.cpp)
+    target_link_libraries(claude_cpubench PRIVATE strata_core strata_kernels_cpu)
   endif()
   # the same on CUDA: the tensor-core scorer (sm_80+) or the FP32 tiled one (below sm_80, and forced on any card by
   # STRATA_QSA_WARP=1 in the second test) against the warp kernel and FP64, at 32K and 131K

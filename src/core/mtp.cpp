@@ -40,6 +40,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <map>
 #if defined(_WIN32)
 #include <intrin.h>
 #elif defined(__x86_64__)
@@ -1016,6 +1017,31 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
+#if defined(STRATA_USE_HIP)
+    if (ce == cudaSuccess && std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // a HIP debug listing (kernel names, counts)
+        size_t nn = 0;
+        hipGraphGetNodes(graph, nullptr, &nn);
+        std::vector<hipGraphNode_t> nodes(nn);
+        hipGraphGetNodes(graph, nodes.data(), &nn);
+        std::map<std::string, int> kinds;
+        for (hipGraphNode_t nd : nodes) {
+            hipGraphNodeType ty;
+            hipGraphNodeGetType(nd, &ty);
+            std::string name = "type" + std::to_string((int) ty);
+            if (ty == hipGraphNodeTypeKernel) {
+                hipKernelNodeParams kp{};
+                if (hipGraphKernelNodeGetParams(nd, &kp) == hipSuccess) {
+                    const char* fn = hipKernelNameRefByPtr(kp.func, cs);
+                    name = std::string(fn ? fn : "kernel?") + " g" + std::to_string(kp.gridDim.x * kp.gridDim.y * kp.gridDim.z);
+                }
+            }
+            ++kinds[name];
+        }
+        (void) hipGetLastError();
+        std::fprintf(stderr, "strata mtp: the %s graph has %zu nodes:\n", what, nn);
+        for (auto& [k2, c] : kinds) std::fprintf(stderr, "  %4d x %.150s\n", c, k2.c_str());
+    }
+#endif
     if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
@@ -1355,11 +1381,19 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         };
         wait_step(0);
+        static const bool dtime = std::getenv("STRATA_DRAFT_TIMING") != nullptr;
+        static double d_round = 0, d_step = 0; static long long n_round = 0, n_step = 0;
+        Clock::time_point ts = Clock::now();
+        if (dtime) { d_round += ms_since(t0); ++n_round; }
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
         n = 1;
+        static cudaEvent_t de[2] = {nullptr, nullptr};
+        static double d_gpu = 0; static long long n_gpu = 0;
+        if (dtime && de[0] == nullptr) { cudaEventCreate(&de[0]); cudaEventCreate(&de[1]); }
         for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+            if (dtime && j == 1) cudaEventRecord(de[0], cs_);
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -1367,12 +1401,17 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             (void) cudaStreamQuery(cs_);
             prefetch_ple(drafts[j - 1]);
             wait_step(j);
+            if (dtime) { d_step += ms_since(ts); ++n_step; ts = Clock::now();
+                if (j == 1) { cudaEventRecord(de[1], cs_); cudaEventSynchronize(de[1]); float e = 0; cudaEventElapsedTime(&e, de[0], de[1]); d_gpu += e; ++n_gpu; } }
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
             ++n;
         }
         prefetch_ple(drafts[n - 1]);
+        if (dtime && n_round % 200 == 0)
+            std::fprintf(stderr, "strata draft timing: %lld rounds %.3f ms/round (incl. first draft), %lld steps %.3f ms/step, step-1 GPU %.3f ms\n",
+                         n_round, d_round / n_round, n_step, n_step ? d_step / n_step : 0.0, n_gpu ? d_gpu / n_gpu : 0.0);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;

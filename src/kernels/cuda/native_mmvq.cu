@@ -1621,6 +1621,16 @@ void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, 
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     constexpr int R = 1;
     const unsigned blocks = unsigned((std::size_t(n_out) + NATIVE_WAVES_PER_BLOCK * R - 1) / (NATIVE_WAVES_PER_BLOCK * R));
+    // STRATA_MMVQ_R=2/4 (multi-column calls only): rows per wave, the activation loads shared across them
+    static const int rr = [] { const char* v = std::getenv("STRATA_MMVQ_R"); return v ? std::atoi(v) : 1; }();
+    if (NCOLS > 1 && rr == 2) {
+        native_mmvq_wave_kernel<F, NCOLS, 2><<<unsigned((std::size_t(n_out) + NATIVE_WAVES_PER_BLOCK * 2 - 1) / (NATIVE_WAVES_PER_BLOCK * 2)), 256, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
+    if (NCOLS > 1 && rr == 4) {
+        native_mmvq_wave_kernel<F, NCOLS, 4><<<unsigned((std::size_t(n_out) + NATIVE_WAVES_PER_BLOCK * 4 - 1) / (NATIVE_WAVES_PER_BLOCK * 4)), 256, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
 #if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (g_wave_exact) {
         native_mmvq_wave_exact_kernel<F, NCOLS><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
