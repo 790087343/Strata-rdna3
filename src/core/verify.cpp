@@ -799,6 +799,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
                shared_expert_native_bf16_enabled();
     };
+    // STRATA_COMBINE_CPU=1: with CPU experts, the combine reads the CPU rows from the mapped buffer and the GPU's from
+    // hit_out (no copy_rows_from_mapped / moe_hit_add launches) and applies the shared gate, which rides in the router
+    // GEMV - bitwise the launches it replaces
+    static const bool g_cfuse = [] { const char* v = std::getenv("STRATA_COMBINE_CPU"); return v != nullptr && v[0] == '1'; }();
+    auto cfuse_on = [&](int n) {
+        return g_cfuse && !ar_on() && !device_plan_ && !remote_opt_ && peer_rows_ == nullptr && K == 10 &&
+               native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 && shared_expert_native_bf16_enabled() &&
+               strata::kernels::cpu::expert_layout().native && (N & 3) == 0;
+    };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     if (!batch_rec_) groups_[T] = G;
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
@@ -1367,7 +1376,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
-        const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+        const WeightRef* w_sgi = (lfuse_on(n) || cfuse_on(n)) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
@@ -1554,6 +1563,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
+            } else if (cfuse_on(n)) {
+                wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows: the combine reads them
+                stamp(l, 23, grp);
             } else {
                 wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
                 stamp(l, 23, grp);
@@ -1568,13 +1580,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
-            moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            if (!cfuse_on(n)) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
+        if (!ar_on() && cfuse_on(n)) {
+            try {
+                native_moe_combine_multi_cpu(m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                             shared_ + tb * N, sg_gated_[grp] ? sh_g_ + tb : nullptr, bo_ + tb * N, N, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);

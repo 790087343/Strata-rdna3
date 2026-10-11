@@ -95,6 +95,56 @@ __global__ void combine_k10_vec4(const float4* __restrict__ parts4, const float*
     sum.w += sh.w;
     output4[c4] = sum;
 }
+// STRATA_COMBINE_CPU: combine_k10_vec4 with each part read where the window left it (see native_moe_combine_multi_cpu)
+template <bool GATED>
+__global__ void combine_cpu_k10_vec4(const volatile float4* cpu4, const float4* __restrict__ hit4,
+                                     const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count,
+                                     const float* __restrict__ weights, const float4* __restrict__ shared4,
+                                     const float* __restrict__ sg, float4* __restrict__ output4, int64_t n4) {
+    const int64_t tk = blockIdx.y;
+    __shared__ int hit[10];
+    if (threadIdx.x < 10) {
+        const int row = (int) tk * 10 + (int) threadIdx.x, c = *count;
+        int h = 0;
+        for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+        hit[threadIdx.x] = h;
+    }
+    __syncthreads();
+    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c4 >= n4) return;
+    float4 p[10];
+#pragma unroll
+    for (int e = 0; e < 10; ++e) {
+        const int64_t o = (tk * 10 + e) * n4 + c4;
+        if (hit[e]) {
+            const float4 h = hit4[o];
+            p[e] = make_float4(0.0f + h.x, 0.0f + h.y, 0.0f + h.z, 0.0f + h.w);
+        } else {
+            p[e] = const_cast<const float4*>(cpu4)[o];
+        }
+    }
+    weights += tk * 10;
+    const float w0 = __ldg(weights + 0);
+    float4 sum = make_float4(p[0].x * w0, p[0].y * w0, p[0].z * w0, p[0].w * w0);
+#pragma unroll
+    for (int e = 1; e < 10; ++e) {
+        const float w = __ldg(weights + e);
+        sum.x = fmaf(p[e].x, w, sum.x);
+        sum.y = fmaf(p[e].y, w, sum.y);
+        sum.z = fmaf(p[e].z, w, sum.z);
+        sum.w = fmaf(p[e].w, w, sum.w);
+    }
+    float4 sh = shared4[tk * n4 + c4];
+    if constexpr (GATED) {
+#pragma clang fp contract(off)
+        const float g = __fdividef(1.0f, 1.0f + __expf(-sg[tk]));
+        sh.x *= g; sh.y *= g; sh.z *= g; sh.w *= g;
+        sum.x += sh.x; sum.y += sh.y; sum.z += sh.z; sum.w += sh.w;
+    } else {
+        sum.x += sh.x; sum.y += sh.y; sum.z += sh.z; sum.w += sh.w;
+    }
+    output4[tk * n4 + c4] = sum;
+}
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
@@ -164,6 +214,24 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
         throw std::invalid_argument("native MoE combine (hits) requires a stream, width, 1..15 experts, tokens");
     combine<true><<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
         hits, weights, shared, output, n_embd, int(k));
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_cpu(const float* cpu, const float* hit, const int32_t* hit_rows, const int32_t* count,
+                                  const float* weights, const float* shared, const float* shared_gate, float* output,
+                                  int64_t n_embd, int n_tok, void* stream) {
+    if (!stream || n_embd <= 0 || (n_embd & 3) != 0 || n_tok < 1 || !shared ||
+        (((uintptr_t) cpu | (uintptr_t) hit | (uintptr_t) shared | (uintptr_t) output) & 15u) != 0)
+        throw std::invalid_argument("native MoE combine (cpu) requires a stream, aligned rows of a width of 4s, tokens");
+    const int64_t n4 = n_embd >> 2;
+    const dim3 grid(unsigned((n4 + 63) / 64), (unsigned) n_tok);
+    cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (shared_gate)
+        combine_cpu_k10_vec4<true><<<grid, 64, 0, st>>>(reinterpret_cast<const volatile float4*>(cpu), reinterpret_cast<const float4*>(hit),
+            hit_rows, count, weights, reinterpret_cast<const float4*>(shared), shared_gate, reinterpret_cast<float4*>(output), n4);
+    else
+        combine_cpu_k10_vec4<false><<<grid, 64, 0, st>>>(reinterpret_cast<const volatile float4*>(cpu), reinterpret_cast<const float4*>(hit),
+            hit_rows, count, weights, reinterpret_cast<const float4*>(shared), nullptr, reinterpret_cast<float4*>(output), n4);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

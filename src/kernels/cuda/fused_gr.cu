@@ -1673,13 +1673,13 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
     if (rdna_gr_enabled() && a[0].q8_down == nullptr) {   // STRATA_GR_RDNA=1 (rdna_gr.cu)
-        rdna_gr_read_multi(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+        rdna_gr_read_multi(m.a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);   // m.a: q8_mixed set only when all are
         const cudaError_t er = cudaGetLastError();
         if (er != cudaSuccess) {
             std::fprintf(stderr, "rdna_gr_read_multi: %s\n", cudaGetErrorString(er));
             std::exit(1);
         }
-        return false;   // the caller quantizes
+        return q8;   // false: the caller quantizes
     }
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1

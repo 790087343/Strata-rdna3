@@ -6,6 +6,7 @@
 //         per w_up row, two xor steps per token.  No counters, no inter-block order: safe on any stream.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
@@ -381,6 +382,38 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
     }
 }
 
+// STRATA_QFUSE: the consumer's q8_1 image of `mixed`, as fused_gr.cu's gr_q8_tail - the two blocks of a 32-column
+// group count in, the last one quantizes the group (one wave per token, the same bytes as native_quantize_q8_1)
+struct RdnaQ81 { half2 ds; int8_t qs[32]; };
+template <int T>
+__device__ __forceinline__ void q8_tail(const RdnaGr& m, int d0) {
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned* c = m.a[0].q8_cnt + d0 / 32;
+        last = atomicAdd(c, 1u) == 1u;
+        if (last) atomicExch(c, 0u);
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (wave >= T) return;
+    const int c0 = (d0 / 32) * 32;
+    const float xi = *reinterpret_cast<const volatile float*>(m.a[wave].mixed + c0 + lane);
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    RdnaQ81* y = reinterpret_cast<RdnaQ81*>(m.a[wave].q8_mixed) + c0 / 32;
+    y->qs[lane] = q;
+    if (lane == 0) y->ds = q8_1_ds(d, sum);
+}
+
 template <int T, bool Q8 = false, bool A8 = false>
 __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
     __shared__ __align__(16) uint32_t loq[A8 ? T : 1][LR / 4];
@@ -475,6 +508,7 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
         for (int cc = 0; cc < HC; ++cc) s += g[k][cc][col];
         m.a[k].mixed[blockIdx.x * UC + col] = s / (float) HC;
     }
+    if (m.a[0].q8_mixed != nullptr) q8_tail<T>(m, blockIdx.x * UC);   // STRATA_QFUSE
 }
 
 template <int T>

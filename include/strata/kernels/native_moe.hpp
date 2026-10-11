@@ -24,6 +24,12 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
                                    int64_t n_embd, int64_t k, int n_tok, void* stream);
 /// S26 STRATA_LFUSE: the same with `shared` unscaled and shared_gate[t] the shared expert's raw gate logit: the
 /// row is scaled by sigmoid(shared_gate[t]) here, bitwise what shared_expert_multi's sigmoid + scale gave.
+/// STRATA_COMBINE_CPU (k = 10): the verify window's combine with the CPU rows read straight from the mapped `cpu`
+/// rows and the GPU's own rows (hit_rows[0, *count)) from `hit` as 0.0f + hit - bitwise copy_rows_from_mapped +
+/// moe_hit_add + native_moe_combine_multi; a nonnull shared_gate also gates `shared` as the _gated combine does.
+void native_moe_combine_multi_cpu(const float* cpu, const float* hit, const int32_t* hit_rows, const int32_t* count,
+                                  const float* weights, const float* shared, const float* shared_gate, float* output,
+                                  int64_t n_embd, int n_tok, void* stream);
 void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,
                                          const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
                                          void* stream);
