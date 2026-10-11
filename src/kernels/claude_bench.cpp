@@ -47,12 +47,23 @@ int main(int argc, char** argv) {
     const int TT = argc > 2 ? std::atoi(argv[2]) : 3;
     ck(cudaStreamCreate(&st), "stream");
     const size_t WS = 384ull << 20;   // rotating working set > 96 MiB infinity cache
-    if (which == "all" || which == "gr") {
+    if (which == "all" || which == "gr" || which == "grq8") {
         constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
         const size_t wb = D * 4 + 2 * (size_t) D * LR * 2 + (size_t) HC * D * 2;
         const int reps = (int) (WS / wb) + 1;
         std::vector<uint8_t*> w(reps);
         for (int i = 0; i < reps; ++i) w[i] = (uint8_t*) dalloc_rand(wb, 11 + i);
+        // int8 copies (rdna layout: int8 [rows][cols] then fp16 scales at a 256-aligned offset) for the Q8 read
+        const size_t nmat = (size_t) D * LR, r8b = (nmat + 255) / 256 * 256 + nmat / 32 * 2;
+        std::vector<int8_t*> r8d(reps), r8u(reps);
+        for (int i = 0; i < reps; ++i) {
+            std::vector<uint8_t> h(r8b); std::mt19937 rr(500 + i);
+            for (size_t k = 0; k < nmat; ++k) h[k] = (uint8_t) (int8_t) ((int) (rr() % 255) - 127);
+            uint16_t* sc = (uint16_t*) (h.data() + (nmat + 255) / 256 * 256);
+            for (size_t k = 0; k < nmat / 32; ++k) sc[k] = 0x1c00 + (rr() % 256);   // fp16 ~ 0.004
+            ck(cudaMalloc(&r8d[i], r8b), "r8d"); ck(cudaMemcpy(r8d[i], h.data(), r8b, cudaMemcpyHostToDevice), "r8d up");
+            ck(cudaMalloc(&r8u[i], r8b), "r8u"); ck(cudaMemcpy(r8u[i], h.data(), r8b, cudaMemcpyHostToDevice), "r8u up");
+        }
         float *R = (float*) dalloc_rand(8 * D * 4, 3), *bo = (float*) dalloc_rand(8 * N * 4, 4), *inj = (float*) dalloc_rand(8 * HC * 4, 5);
         float *xn, *lo, *rs, *io, *mix;
         ck(cudaMalloc(&xn, 8 * D * 4 * 2), "xn"); ck(cudaMalloc(&lo, 8 * LR * 4), "lo"); ck(cudaMalloc(&rs, 8 * HC * 4), "rs");
@@ -71,7 +82,7 @@ int main(int argc, char** argv) {
                 K::fused_gr_read_multi(a, T, xn, st);
             };
             char nm[64]; std::snprintf(nm, 64, "gr_read T%d (13.2MB)", T);
-            report(nm, timeit(reps, 400, f), (double) wb);
+            if (which != "grq8") report(nm, timeit(reps, 400, f), (double) wb);
             auto f2 = [&](int r) {
                 K::FusedGrArgs a[8];
                 for (int t = 0; t < T; ++t) {
@@ -93,13 +104,27 @@ int main(int argc, char** argv) {
                 ck(cudaMemcpy(o.data() + T * (LR + 2 * HC), mix, T * N * 4, cudaMemcpyDeviceToHost), "c4");
             };
             std::vector<float> o1, o2;
-            f(0); grab(o1); f2(0); grab(o2);
+            if (which != "grq8") { f(0); grab(o1); f2(0); grab(o2); } else { o1.assign(1, 0.f); o2 = o1; }
             double maxrel = 0, maxabs = 0, ref = 0;
             for (size_t i = 0; i < o1.size(); ++i) { maxabs = std::max(maxabs, (double) std::fabs(o1[i] - o2[i])); ref = std::max(ref, (double) std::fabs(o1[i])); }
             for (size_t i = 0; i < o1.size(); ++i) if (!std::isfinite(o2[i])) maxrel = 1e9;
             maxrel = std::max(maxrel, maxabs / (ref + 1e-30));
             std::snprintf(nm, 64, "rdna_gr T%d (maxabs/maxref %.2e)", T, maxrel);
-            report(nm, timeit(reps, 400, f2), (double) wb);
+            if (which != "grq8") report(nm, timeit(reps, 400, f2), (double) wb);
+            auto f3 = [&](int r) {
+                K::FusedGrArgs a[8];
+                for (int t = 0; t < T; ++t) {
+                    auto& x = a[t]; uint8_t* p = w[r];
+                    x.R = R + t * D; x.R_out = R + t * D; x.apply = true; x.bo_prev = bo + t * N; x.inj_prev = inj + t * HC;
+                    x.w_norm = (const float*) p; x.w_down = nullptr; x.w_up = nullptr;
+                    x.w_inject = (const uint16_t*) (p + D * 4 + 2 * (size_t) D * LR * 2);
+                    x.r8_down = r8d[r]; x.r8_up = r8u[r];
+                    x.lo = lo + t * LR; x.rs = rs + t * HC; x.inject_out = io + t * HC; x.mixed = mix + t * N;
+                }
+                K::rdna_gr_read_multi(a, T, xn, st);
+            };
+            std::snprintf(nm, 64, "rdna_gr q8 T%d", T);
+            report(nm, timeit(reps, which == "grq8" ? 60 : 400, f3), (double) r8b * 2);
         }
     }
     if (which == "all" || which == "mmvf") {

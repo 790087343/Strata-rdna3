@@ -2391,7 +2391,18 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
+        static const bool ctime = std::getenv("STRATA_DRAFT_TIMING") != nullptr;
+        static cudaEvent_t ce[2] = {nullptr, nullptr};
+        static double c_gpu = 0; static long long c_n = 0;
+        if (ctime && ce[0] == nullptr) { cudaEventCreate(&ce[0]); cudaEventCreate(&ce[1]); }
+        if (ctime) {
+            if (c_n > 0) { float e = 0; if (cudaEventElapsedTime(&e, ce[0], ce[1]) == cudaSuccess) c_gpu += e; }
+            if (c_n > 0 && c_n % 200 == 0) std::fprintf(stderr, "strata draft timing: commit GPU %.3f ms\n", c_gpu / c_n);
+            ++c_n;
+            cudaEventRecord(ce[0], cs_);
+        }
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+        if (ctime) cudaEventRecord(ce[1], cs_);
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's

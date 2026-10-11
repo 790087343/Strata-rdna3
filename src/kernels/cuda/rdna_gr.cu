@@ -70,27 +70,38 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
         }
     }
     const int e0 = c * N + h * H;   // this slice's first element in D
-    // stage R'[c,h] * w_norm for every token: flattened (token, float4) loop, not unrolled over tokens (registers)
-    float ssk = 0.0f;
-#pragma unroll 1
-    for (int k = 0; k < T; ++k) {
+    // stage R'[c,h] * w_norm for every token: one flattened (token, float4) loop, loads of several tokens in flight
+#pragma unroll 4
+    for (int it = t; it < T * (H / 4); it += TH) {
+        const int k = it / (H / 4), i = (it - k * (H / 4)) * 4;
         const FusedGrArgs& a = m.a[k];
-        const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
-        float s = 0.0f;
-#pragma unroll 2
-        for (int i = t * 4; i < H; i += TH * 4) {
-            float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
-            if (a.apply) {
-                const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
-                r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
-            }
-            s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
-            const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i);
-            *reinterpret_cast<float4*>(&xs[k][i]) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+        float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
+        if (a.apply) {
+            const float gw = 2.0f * sigm(a.inj_prev[c] / (float) HC);
+            const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
+            r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
         }
-        if (rg == 0) { const float v = wsum(s); if (lane == 0) sq[wv][k] = v; }
+        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i);
+            *reinterpret_cast<float4*>(&xs[k][i]) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
     }
-    (void) ssk;
+    if (rg == 0) {   // the slice's sums of squares (only row group 0 publishes them)
+#pragma unroll 1
+        for (int k = 0; k < T; ++k) {
+            const FusedGrArgs& a = m.a[k];
+            const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
+            float s = 0.0f;
+            for (int i = t * 4; i < H; i += TH * 4) {
+                float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
+                if (a.apply) {
+                    const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
+                    r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+                }
+                s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+            }
+            const float v = wsum(s);
+            if (lane == 0) sq[wv][k] = v;
+        }
+    }
     __syncthreads();
     if (rg == 0 && t < T) {
         float s = 0.0f;
@@ -174,24 +185,38 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
             for (int q = 0; q < HQ; ++q) wb[r][q] = ntload(w4 + lane + 32 * q);
         }
     }
-    const int e0 = c * N + h * H;
-#pragma unroll 1
-    for (int k = 0; k < T; ++k) {
+    const int e0 = c * N + h * H;   // this slice's first element in D
+    // stage R'[c,h] * w_norm for every token: one flattened (token, float4) loop, loads of several tokens in flight
+#pragma unroll 4
+    for (int it = t; it < T * (H / 4); it += TH) {
+        const int k = it / (H / 4), i = (it - k * (H / 4)) * 4;
         const FusedGrArgs& a = m.a[k];
-        const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
-        float s = 0.0f;
-#pragma unroll 2
-        for (int i = t * 4; i < H; i += TH * 4) {
-            float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
-            if (a.apply) {
-                const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
-                r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
-            }
-            s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
-            const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i);
-            *reinterpret_cast<float4*>(&xs[k][i]) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+        float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
+        if (a.apply) {
+            const float gw = 2.0f * sigm(a.inj_prev[c] / (float) HC);
+            const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
+            r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
         }
-        if (rg == 0) { const float v = wsum(s); if (lane == 0) sq[wv][k] = v; }
+        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i);
+            *reinterpret_cast<float4*>(&xs[k][i]) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+    }
+    if (rg == 0) {   // the slice's sums of squares (only row group 0 publishes them)
+#pragma unroll 1
+        for (int k = 0; k < T; ++k) {
+            const FusedGrArgs& a = m.a[k];
+            const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
+            float s = 0.0f;
+            for (int i = t * 4; i < H; i += TH * 4) {
+                float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
+                if (a.apply) {
+                    const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
+                    r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+                }
+                s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+            }
+            const float v = wsum(s);
+            if (lane == 0) sq[wv][k] = v;
+        }
     }
     __syncthreads();
     if (rg == 0 && t < T) {
@@ -233,8 +258,133 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
     }
 }
 
-template <int T, bool Q8 = false>
+
+// ---- STRATA_GR_RDNA_A8: the Q8 read with int8 activations (per-32 scale, q8_1-style rounding) and int8 dot4
+__device__ __forceinline__ float max8(float v) {   // max over each aligned group of 8 lanes (DPP row_xmask 1, 2, 4)
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x161, 0xf, 0xf, false)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x162, 0xf, 0xf, false)));
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x164, 0xf, 0xf, false)));
+    return v;
+}
+// 4 floats of an aligned 32-group (8 lanes x 4) -> 4 int8 + the group scale (written by the group's first lane)
+__device__ __forceinline__ void quant4(float4 x, uint32_t* q, float* d, bool first) {
+    const float amax = max8(fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w))));
+    const float dd = amax / 127.0f, id = amax > 0.0f ? 127.0f / amax : 0.0f;
+    const int a = __float2int_rn(x.x * id), b = __float2int_rn(x.y * id), c = __float2int_rn(x.z * id), e = __float2int_rn(x.w * id);
+    *q = (uint32_t) (a & 0xff) | ((uint32_t) (b & 0xff) << 8) | ((uint32_t) (c & 0xff) << 16) | ((uint32_t) (e & 0xff) << 24);
+    if (first) *d = dd;
+}
+__device__ __forceinline__ int dot8i(uint2 w, uint2 a) {
+    return __builtin_amdgcn_sudot4(true, (int) w.y, true, (int) a.y, __builtin_amdgcn_sudot4(true, (int) w.x, true, (int) a.x, 0, false), false);
+}
+
+template <int T, int RW>
+__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_down_a8(RdnaGr m) {
+    __shared__ __align__(16) float xs[T][H];              // float rows, for the BF16 inject rows
+    __shared__ __align__(16) uint32_t xq[T][H / 4];       // int8 rows
+    __shared__ float xd[T][H / 32];
+    __shared__ float sq[WV][T];
+    const int t = threadIdx.x, lane = t & 31, wv = t >> 5;
+    const int rg = blockIdx.x, slice = blockIdx.y, c = slice >> 1, h = slice & 1;
+    const int8_t* qd = m.a[0].r8_down;
+    const uint16_t* sd = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(qd) + r8_soff((size_t) LR * D));
+    uint2 wq[RW][HQ];
+    float wd[RW][HQ];
+    uint4 wb[RW][HQ];
+    bool act[RW], inj[RW];
+    bool any_inj = false;
+#pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        const int row = (rg * WV + wv) * RW + r;
+        inj[r] = row >= LR;
+        act[r] = row < LR || (row < PR && m.a[0].w_inject != nullptr);
+        any_inj |= inj[r] && act[r];
+        if (!act[r]) continue;
+        if (!inj[r]) {
+            const uint2* w2 = reinterpret_cast<const uint2*>(qd + (size_t) row * D + c * N + h * H);
+            const uint16_t* s2 = sd + (size_t) row * (D / 32) + (c * N + h * H) / 32;
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) { wq[r][q] = ntload2(w2 + lane + 32 * q); wd[r][q] = h2f(s2[(lane + 32 * q) >> 2]); }
+        } else {
+            const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_inject + (size_t) (row - LR) * D + c * N + h * H);
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wb[r][q] = ntload(w4 + lane + 32 * q);
+        }
+    }
+    const int e0 = c * N + h * H;   // this slice's first element in D
+    // stage R'[c,h] * w_norm for every token: one flattened (token, float4) loop, loads of several tokens in flight
+#pragma unroll 4
+    for (int it = t; it < T * (H / 4); it += TH) {
+        const int k = it / (H / 4), i = (it - k * (H / 4)) * 4;
+        const FusedGrArgs& a = m.a[k];
+        float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
+        if (a.apply) {
+            const float gw = 2.0f * sigm(a.inj_prev[c] / (float) HC);
+            const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
+            r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+        }
+        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + e0 + i);
+            const float4 v = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+            *reinterpret_cast<float4*>(&xs[k][i]) = v;
+            quant4(v, &xq[k][i >> 2], &xd[k][i >> 5], (i & 31) == 0);
+    }
+    if (rg == 0) {   // the slice's sums of squares (only row group 0 publishes them)
+#pragma unroll 1
+        for (int k = 0; k < T; ++k) {
+            const FusedGrArgs& a = m.a[k];
+            const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
+            float s = 0.0f;
+            for (int i = t * 4; i < H; i += TH * 4) {
+                float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
+                if (a.apply) {
+                    const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
+                    r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+                }
+                s += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+            }
+            const float v = wsum(s);
+            if (lane == 0) sq[wv][k] = v;
+        }
+    }
+    __syncthreads();
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+        for (int w = 0; w < WV; ++w) s += sq[w][t];
+        m.ss[t * 2 * HC + slice] = s;
+    }
+#pragma unroll 1
+    for (int k = 0; k < T; ++k) {
+        float acc[RW];
+#pragma unroll
+        for (int r = 0; r < RW; ++r) acc[r] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) {
+            const int ch = lane + 32 * q;                  // chunk of 8 values
+            const uint2 av = *reinterpret_cast<const uint2*>(&xq[k][ch * 2]);
+            const float ad = xd[k][ch >> 2];
+#pragma unroll
+            for (int r = 0; r < RW; ++r) {
+                if (!inj[r]) acc[r] = fmaf(wd[r][q] * ad, (float) dot8i(wq[r][q], av), acc[r]);
+                else if (any_inj) {
+                    const float4 x0 = *reinterpret_cast<const float4*>(&xs[k][ch * 8]);
+                    const float4 x1 = *reinterpret_cast<const float4*>(&xs[k][ch * 8 + 4]);
+                    acc[r] = dot8(wb[r][q], x0, x1, acc[r]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const int row = (rg * WV + wv) * RW + r;
+            const float v = wsum(acc[r]);
+            if (act[r] && lane == 0) m.part[((size_t) k * 2 * HC + slice) * PR + row] = v;
+        }
+    }
+}
+
+template <int T, bool Q8 = false, bool A8 = false>
 __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
+    __shared__ __align__(16) uint32_t loq[A8 ? T : 1][LR / 4];
+    __shared__ float lod[A8 ? T : 1][LR / 32];
     __shared__ __align__(16) float lo[T][LR];
     __shared__ float rs[T][HC];
     __shared__ float g[T][HC][UC];
@@ -282,6 +432,14 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
         }
     }
     __syncthreads();
+    if constexpr (A8) {   // lo -> int8 per 32 (aligned 8-lane groups of float4)
+        for (int i = t; i < T * (LR / 4); i += TH) {
+            const int k = i / (LR / 4), f = i - k * (LR / 4);
+            const float4 v = *reinterpret_cast<const float4*>(&lo[k][4 * f]);
+            quant4(v, &loq[k][f], &lod[k][f >> 3], (f & 7) == 0);
+        }
+        __syncthreads();
+    }
     float acc[T];
 #pragma unroll
     for (int k = 0; k < T; ++k) {
@@ -289,7 +447,8 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
             const int j = (q + 4 * u) * 8;
-            if constexpr (Q8) a = dot8q(w8[u], d8[u], *reinterpret_cast<const float4*>(&lo[k][j]), *reinterpret_cast<const float4*>(&lo[k][j + 4]), a);
+            if constexpr (A8) a = fmaf(d8[u] * lod[k][j >> 5], (float) dot8i(w8[u], *reinterpret_cast<const uint2*>(&loq[k][j >> 2])), a);
+            else if constexpr (Q8) a = dot8q(w8[u], d8[u], *reinterpret_cast<const float4*>(&lo[k][j]), *reinterpret_cast<const float4*>(&lo[k][j + 4]), a);
             else a = dot8(w[u], *reinterpret_cast<const float4*>(&lo[k][j]), *reinterpret_cast<const float4*>(&lo[k][j + 4]), a);
         }
         a += __shfl_xor(a, 1);
@@ -324,6 +483,13 @@ void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
     static const int rw = [] { const char* v = std::getenv("STRATA_GR_RDNA_RW"); return v ? std::atoi(v) : 2; }();
     if (sb) gpu_stamp(sb, si, st);
     if (m.a[0].r8_down != nullptr && m.a[0].r8_up != nullptr) {   // STRATA_GR_RDNA_Q8
+        static const bool a8 = [] { const char* v = std::getenv("STRATA_GR_RDNA_A8"); return v && v[0] == '1'; }();
+        if (a8) {
+            if (only != 2) rdna_gr_down_a8<T, 2><<<dim3((PR + 2 * WV - 1) / (2 * WV), 2 * HC), TH, 0, st>>>(m);
+            if (sb) gpu_stamp(sb, si + 1, st);
+            if (only != 1) rdna_gr_up<T, true, true><<<UB, TH, 0, st>>>(m);
+            return;
+        }
         if (only != 2) rdna_gr_down_q8<T, 2><<<dim3((PR + 2 * WV - 1) / (2 * WV), 2 * HC), TH, 0, st>>>(m);
         if (sb) gpu_stamp(sb, si + 1, st);
         if (only != 1) rdna_gr_up<T, true><<<UB, TH, 0, st>>>(m);

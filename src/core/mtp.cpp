@@ -1287,6 +1287,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
+    const Clock::time_point tz0 = Clock::now();
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
     // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
@@ -1315,7 +1316,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[1] = 0;
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    const Clock::time_point tz1 = Clock::now();
     if (!stage_source_R(T, err)) return false;
+    const Clock::time_point tz2 = Clock::now();
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
@@ -1365,6 +1368,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
+        static cudaEvent_t re[2] = {nullptr, nullptr};
+        static const bool rtime = std::getenv("STRATA_DRAFT_TIMING") != nullptr;
+        if (rtime && re[0] == nullptr) { cudaEventCreate(&re[0]); cudaEventCreate(&re[1]); }
+        if (rtime) cudaEventRecord(re[0], cs_);
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1380,8 +1387,20 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
         };
+        if (rtime) cudaEventRecord(re[1], cs_);
+        const Clock::time_point tz3 = Clock::now();
         wait_step(0);
+        static double hz[4] = {}; static long long hn = 0;
+        if (rtime) {
+            const Clock::time_point tz4 = Clock::now();
+            hz[0] += ms_since(tz0) - ms_since(tz1); hz[1] += ms_since(tz1) - ms_since(tz2); hz[2] += ms_since(tz2) - ms_since(tz3); hz[3] += ms_since(tz3) - ms_since(tz4); ++hn;
+            if (hn % 200 == 0) std::fprintf(stderr, "strata draft timing: host before-launch %.3f stageR %.3f launch %.3f wait-first %.3f ms (t0->entry %.3f)\n",
+                                            hz[0] / hn, hz[1] / hn, hz[2] / hn, hz[3] / hn, 0.0);
+        }
         static const bool dtime = std::getenv("STRATA_DRAFT_TIMING") != nullptr;
+        static double r_gpu = 0; static long long r_n = 0;
+        if (rtime) { cudaEventSynchronize(re[1]); float e = 0; cudaEventElapsedTime(&e, re[0], re[1]); r_gpu += e; ++r_n;
+                     if (r_n % 200 == 0) std::fprintf(stderr, "strata draft timing: round GPU %.3f ms (T avg in this sample)\n", r_gpu / r_n); }
         static double d_round = 0, d_step = 0; static long long n_round = 0, n_step = 0;
         Clock::time_point ts = Clock::now();
         if (dtime) { d_round += ms_since(t0); ++n_round; }
