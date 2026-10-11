@@ -724,6 +724,31 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
             if ((key[j] & hi_mask) == (prefix & hi_mask)) atomicAdd(&hist[warp][(key[j] >> shift) & 255], w);
         }
         __syncthreads();
+#if defined(__HIPCC__)
+        // gfx11: the warps' histograms folded and the digit found by a parallel suffix scan (256 threads = 8 waves)
+        // instead of thread 0's serial walk - the same digit and count: the largest d with above + sum(hist[>= d]) >= width
+        if (t < 256) {
+            const int d = 255 - t;                        // thread t holds bin 255 - t: an inclusive prefix over t is a suffix sum
+            int hv = 0;
+            for (int w2 = 0; w2 < TK_T / 32; ++w2) hv += hist[w2][d];
+            int x = hv;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up(x, o, 32);
+                if (lane >= o) x += y;
+            }
+            if (lane == 31) s_warp[warp] = x;
+            __syncthreads_count(0);
+            int off = 0;
+            for (int w2 = 0; w2 < warp; ++w2) off += s_warp[w2];
+            const int incl = above + off + x, excl = incl - hv;
+            if ((excl < width && incl >= width) || (d == 0 && incl < width)) { s_digit = d; s_above = excl; }
+            if (d == 0 && excl >= width) { /* unreachable: some higher bin crossed */ }
+        } else {
+            __syncthreads_count(0);
+        }
+        __syncthreads();
+#else
         if (t < 256) {                                // fold the warps' histograms into warp 0's
             int s = 0;
             for (int w2 = 0; w2 < TK_T / 32; ++w2) s += hist[w2][t];
@@ -740,6 +765,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
             s_above = cum;
         }
         __syncthreads();
+#endif
         prefix |= (uint32_t) s_digit << shift;
         above = s_above;
         __syncthreads();
@@ -1485,7 +1511,14 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                          (any_card || topk_active_turing_device());
 #endif
     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
+#if defined(__HIPCC__)
+    // AMD decode (no active count, capacity 262,144 cells = 65,537 blocks): the 66-key register kernel holds it - the
+    // same ids as the reference kernel the capacity rule fell back to (STRATA_TOPK_DEC_REF=1: that fallback)
+    static const bool dec_ref = std::getenv("STRATA_TOPK_DEC_REF") != nullptr;
+    const int64_t fit = (int64_t) TK_T * ((counted || !dec_ref) ? TK_PER_MAX : TK_PER);
+#else
     const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
+#endif
 #if defined(__HIPCC__)
     constexpr int64_t kRegMinBlocks = 7168;   // gfx1201: below ~28K cells the 1,024-thread kernel's fixed cost loses to the ref
     const bool too_small = counted && reach < kRegMinBlocks;
