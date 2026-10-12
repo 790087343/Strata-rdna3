@@ -1924,11 +1924,312 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
+#if defined(__HIPCC__)
+namespace {
+// [claude] gfx11 port of the chunked recurrence above (STRATA_GDN_CHUNKED=1 on HIP; the CUDA kernels stay CUDA-only):
+// the same WY-form maths (prep: T = (I + A)^-1, P, gamma per chunk of HCH tokens; scan: X = K S0, Y, D = T Y,
+// o = exp(gamma) Q S0 + P D, S = exp(gamma_last) S0 + K^T decayed D), but sized for 64 KB of LDS a workgroup: one
+// value head a scan block (k and q staged per block, single buffered, plain loads), the column tile GDVT a template
+// parameter.  FP32 throughout; another order of the sums than the token-by-token kernels (not bitwise).
+constexpr int HSB = 2048, HKP = S + 4, HVPK = HV / HK, HCHMAX = 32;   // HCH (tokens a chunk, <= 32: a lane each) is a template parameter
+template <int HCH> constexpr size_t hprep_smem() { return sizeof(float) * (2 * HCH * (S + 1) + 2 * HCH * (HCH + 1)); }
+template <int HCH, int GDVT> constexpr size_t hscan_smem() { return sizeof(float) * (2 * HCH * HKP + S * GDVT + 3 * HCH * GDVT); }
+
+template <int HCH>
+__global__ void __launch_bounds__(256) gdn_chunk_prep_hip(const float* __restrict__ h, const float* __restrict__ gate,
+                                                          const float* __restrict__ beta, float* __restrict__ tm,
+                                                          float* __restrict__ pm, float* __restrict__ gm, int64_t t0,
+                                                          int64_t T) {
+    constexpr int HTP = HCH + 1;
+    static_assert(HVPK * HCH * HTP <= 2 * HCH * (S + 1), "gdn_chunk_prep_hip: A fits where k and q were");
+    extern __shared__ __align__(16) float gsm[];
+    float* sk = gsm;                       // [HCH][S + 1]
+    float* sq = sk + HCH * (S + 1);        // [HCH][S + 1]
+    float* skk = sq + HCH * (S + 1);       // [HCH][HTP]  k_t.k_i
+    float* sqk = skk + HCH * HTP;          // [HCH][HTP]  q_t.k_i
+    float* sa = gsm;                       // [HVPK][HCH][HTP]  A, then T (over k and q, read by then)
+    const int qh = blockIdx.y, ch = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int64_t tb = t0 + (int64_t) ch * HCH;
+    const int n = (int) min((int64_t) HCH, T - tb);
+    for (int p = tid; p < HCH * (S / 4); p += 256) {
+        const int t = p / (S / 4), r = (p % (S / 4)) * 4;
+        const float4 kv = t < n ? *reinterpret_cast<const float4*>(h + (tb + t) * C + HK * S + qh * S + r) : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float4 qv = t < n ? *reinterpret_cast<const float4*>(h + (tb + t) * C + qh * S + r) : make_float4(0.f, 0.f, 0.f, 0.f);
+        float* dk = sk + t * (S + 1) + r;
+        float* dq = sq + t * (S + 1) + r;
+        dk[0] = kv.x; dk[1] = kv.y; dk[2] = kv.z; dk[3] = kv.w;
+        dq[0] = qv.x; dq[1] = qv.y; dq[2] = qv.z; dq[3] = qv.w;
+    }
+    __syncthreads();
+    {
+        constexpr int RW = HCH / 8;
+        float kk[RW], qk[RW];
+#pragma unroll
+        for (int m = 0; m < RW; ++m) { kk[m] = 0.0f; qk[m] = 0.0f; }
+        const int li = lane < HCH ? lane : HCH - 1;   // lanes past the chunk: a valid row, not stored
+        for (int r = 0; r < S; ++r) {
+            const float ki = sk[li * (S + 1) + r];
+#pragma unroll
+            for (int m = 0; m < RW; ++m) {
+                kk[m] = fmaf(sk[(warp + 8 * m) * (S + 1) + r], ki, kk[m]);
+                qk[m] = fmaf(sq[(warp + 8 * m) * (S + 1) + r], ki, qk[m]);
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < RW; ++m) {
+            const int t = warp + 8 * m;
+            if (lane < HCH) {
+                skk[t * HTP + lane] = lane <= t ? kk[m] : 0.0f;
+                sqk[t * HTP + lane] = lane <= t ? qk[m] : 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+    if (warp >= HVPK) return;
+    const int vh = qh + warp * HK, i = lane;
+    float* a = sa + warp * HCH * HTP;
+    const float b = i < n && i < HCH ? beta[(tb + i) * HV + vh] : 0.0f;
+    float gam = i < n && i < HCH ? gate[(tb + i) * HV + vh] : 0.0f;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const float u = __shfl_up_sync(0xffffffffu, gam, o);
+        if (lane >= o) gam += u;
+    }
+    for (int t = 0; t < HCH; ++t) {
+        const float gt = __shfl_sync(0xffffffffu, gam, t), bt = __shfl_sync(0xffffffffu, b, t);
+        if (i < HCH) a[t * HTP + i] = i < t ? bt * expf(gt - gam) * skk[t * HTP + i] : (i == t ? 1.0f : 0.0f);
+    }
+    __syncwarp();
+    for (int t = 1; t < HCH; ++t) {
+        float v = 0.0f;
+#pragma unroll 8
+        for (int k = 0; k < t; ++k) v = fmaf(-a[t * HTP + k], a[k * HTP + (i < HCH ? i : 0)], v);
+        __syncwarp();
+        if (i < t) a[t * HTP + i] = v;
+        __syncwarp();
+    }
+    float* T_ = tm + ((int64_t) ch * HV + vh) * HCH * HCH;
+    float* P_ = pm + ((int64_t) ch * HV + vh) * HCH * HCH;
+    for (int t = 0; t < HCH; ++t) {
+        const float gt = __shfl_sync(0xffffffffu, gam, t);
+        if (i < HCH) {
+            T_[t * HCH + i] = a[t * HTP + i];
+            P_[t * HCH + i] = i <= t ? expf(gt - gam) * sqk[t * HTP + i] : 0.0f;
+        }
+    }
+    if (i < HCH) gm[((int64_t) ch * HV + vh) * HCH + i] = gam;
+}
+
+// a block per (value head, GDVT columns), HCH * GDVT / 4 threads: thread (tt, vq) owns token tt's row of the products
+// (columns 4vq..4vq+3) and the state rows 4tt..4tt+3 of the update (HCH = S / 4 row groups)
+template <int HCH, int GDVT>
+__global__ void __launch_bounds__(HCH * (GDVT / 4)) gdn_chunk_scan_hip(float* __restrict__ state, const float* __restrict__ h,
+                                                                       const float* __restrict__ beta,
+                                                                       const float* __restrict__ tm,
+                                                                       const float* __restrict__ pm,
+                                                                       const float* __restrict__ gm,
+                                                                       float* __restrict__ oc_out, int64_t t0, int nch,
+                                                                       int64_t T) {
+    constexpr int CPT = GDVT / 4, NT = HCH * CPT, RPT = S / HCH;   // RPT: the state rows a thread updates
+    extern __shared__ __align__(16) float gsm[];
+    float* sk = gsm;                       // [HCH][HKP]
+    float* sq = sk + HCH * HKP;            // [HCH][HKP]
+    float* ss = sq + HCH * HKP;            // [S][GDVT]  the state slice at the chunk's start
+    float* sy = ss + S * GDVT;             // [HCH][GDVT]  Y
+    float* sd = sy + HCH * GDVT;           // [HCH][GDVT]  D
+    float* sdd = sd + HCH * GDVT;          // [HCH][GDVT]  exp(gamma_last - gamma_t) D
+    const int vh = blockIdx.x, qh = vh % HK, c0 = blockIdx.y * GDVT, tid = threadIdx.x;
+    const int tt = tid / CPT, vq = tid % CPT, vv = 4 * vq, rq = tt;
+    const size_t rs = (size_t) HV * S;
+    float s[RPT][4];
+#pragma unroll
+    for (int x = 0; x < RPT; ++x) {
+#pragma unroll
+        for (int y = 0; y < 4; ++y) s[x][y] = state[(size_t) (RPT * rq + x) * rs + (size_t) vh * S + c0 + vv + y];
+        float* d = &ss[(RPT * rq + x) * GDVT + vv];
+        d[0] = s[x][0]; d[1] = s[x][1]; d[2] = s[x][2]; d[3] = s[x][3];
+    }
+    const float out_scale = rsqrtf((float) S);
+    // the next chunk's operands are loaded into registers while this chunk computes (KQN float4 of k and of q a thread)
+    constexpr int KQN = (HCH * (S / 4) + NT - 1) / NT;
+    float4 rk[KQN], rq4[KQN], v4n;
+    float tn[HCH], pn[HCH], gamn, glastn, betn;
+    auto fetch = [&](int ch) {
+        const int64_t c_t0 = t0 + (int64_t) ch * HCH;
+        const int n = (int) min((int64_t) HCH, T - c_t0);
+#pragma unroll
+        for (int m = 0; m < KQN; ++m) {
+            const int p = tid + NT * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
+            const bool ok = p < HCH * (S / 4) && t < n;
+            rk[m] = ok ? *reinterpret_cast<const float4*>(h + (c_t0 + t) * C + HK * S + qh * S + r) : make_float4(0.f, 0.f, 0.f, 0.f);
+            rq4[m] = ok ? *reinterpret_cast<const float4*>(h + (c_t0 + t) * C + qh * S + r) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        v4n = tt < n ? *reinterpret_cast<const float4*>(h + (c_t0 + tt) * C + 2 * HK * S + vh * S + c0 + vv)
+                     : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float* g = gm + ((int64_t) ch * HV + vh) * HCH;
+        gamn = g[tt];
+        glastn = g[HCH - 1];
+        betn = tt < n ? beta[(c_t0 + tt) * HV + vh] : 0.0f;
+        const float4* T4 = reinterpret_cast<const float4*>(tm + (((int64_t) ch * HV + vh) * HCH + tt) * HCH);
+        const float4* P4 = reinterpret_cast<const float4*>(pm + (((int64_t) ch * HV + vh) * HCH + tt) * HCH);
+#pragma unroll
+        for (int i = 0; i < HCH / 4; ++i) {
+            const float4 a = T4[i], b = P4[i];
+            tn[4 * i] = a.x; tn[4 * i + 1] = a.y; tn[4 * i + 2] = a.z; tn[4 * i + 3] = a.w;
+            pn[4 * i] = b.x; pn[4 * i + 1] = b.y; pn[4 * i + 2] = b.z; pn[4 * i + 3] = b.w;
+        }
+    };
+    fetch(0);
+    for (int ch = 0; ch < nch; ++ch) {
+        const int64_t c_t0 = t0 + (int64_t) ch * HCH;
+        const int n = (int) min((int64_t) HCH, T - c_t0);
+#pragma unroll
+        for (int m = 0; m < KQN; ++m) {   // this chunk's k and q rows, fetched during the previous chunk
+            const int p = tid + NT * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
+            if (p < HCH * (S / 4)) {
+                *reinterpret_cast<float4*>(sk + t * HKP + r) = rk[m];
+                *reinterpret_cast<float4*>(sq + t * HKP + r) = rq4[m];
+            }
+        }
+        const float4 v4 = v4n;
+        const float gam = gamn, glast = glastn, bet = betn;
+        float tr[HCH], pr[HCH];
+#pragma unroll
+        for (int i = 0; i < HCH; ++i) { tr[i] = tn[i]; pr[i] = pn[i]; }
+        if (ch + 1 < nch) fetch(ch + 1);
+        __syncthreads();   // k, q staged; the previous chunk's ss written
+        float x0 = 0.f, x1 = 0.f, x2 = 0.f, x3 = 0.f, q0 = 0.f, q1 = 0.f, q2 = 0.f, q3 = 0.f;
+#pragma unroll 4
+        for (int r = 0; r < S; r += 4) {
+            const float4 k4 = *reinterpret_cast<const float4*>(&sk[tt * HKP + r]);
+            const float4 qq4 = *reinterpret_cast<const float4*>(&sq[tt * HKP + r]);
+            const float kk[4] = {k4.x, k4.y, k4.z, k4.w}, qq[4] = {qq4.x, qq4.y, qq4.z, qq4.w};
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                const float4 s4 = *reinterpret_cast<const float4*>(&ss[(r + jj) * GDVT + vv]);
+                x0 = fmaf(kk[jj], s4.x, x0); x1 = fmaf(kk[jj], s4.y, x1); x2 = fmaf(kk[jj], s4.z, x2); x3 = fmaf(kk[jj], s4.w, x3);
+                q0 = fmaf(qq[jj], s4.x, q0); q1 = fmaf(qq[jj], s4.y, q1); q2 = fmaf(qq[jj], s4.z, q2); q3 = fmaf(qq[jj], s4.w, q3);
+            }
+        }
+        const float e = expf(gam);
+        *reinterpret_cast<float4*>(&sy[tt * GDVT + vv]) =
+            make_float4(bet * (v4.x - e * x0), bet * (v4.y - e * x1), bet * (v4.z - e * x2), bet * (v4.w - e * x3));
+        __syncthreads();   // (A) Y complete
+        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+#pragma unroll
+        for (int i = 0; i < HCH; ++i) {
+            const float4 y4 = *reinterpret_cast<const float4*>(&sy[i * GDVT + vv]);
+            d0 = fmaf(tr[i], y4.x, d0); d1 = fmaf(tr[i], y4.y, d1); d2 = fmaf(tr[i], y4.z, d2); d3 = fmaf(tr[i], y4.w, d3);
+        }
+        const float f = expf(glast - gam);
+        *reinterpret_cast<float4*>(&sd[tt * GDVT + vv]) = make_float4(d0, d1, d2, d3);
+        *reinterpret_cast<float4*>(&sdd[tt * GDVT + vv]) = make_float4(f * d0, f * d1, f * d2, f * d3);
+        __syncthreads();   // (B) D complete
+        float o0 = e * q0, o1 = e * q1, o2 = e * q2, o3 = e * q3;
+#pragma unroll
+        for (int i = 0; i < HCH; ++i) {
+            const float4 d4 = *reinterpret_cast<const float4*>(&sd[i * GDVT + vv]);
+            o0 = fmaf(pr[i], d4.x, o0); o1 = fmaf(pr[i], d4.y, o1); o2 = fmaf(pr[i], d4.z, o2); o3 = fmaf(pr[i], d4.w, o3);
+        }
+        if (tt < n)
+            *reinterpret_cast<float4*>(oc_out + (c_t0 + tt) * HV * S + vh * S + c0 + vv) =
+                make_float4(o0 * out_scale, o1 * out_scale, o2 * out_scale, o3 * out_scale);
+        const float gL = expf(glast);
+#pragma unroll
+        for (int xx = 0; xx < RPT; ++xx)
+#pragma unroll
+            for (int y = 0; y < 4; ++y) s[xx][y] *= gL;
+#pragma unroll 4
+        for (int t = 0; t < HCH; ++t) {
+            const float4 d4 = *reinterpret_cast<const float4*>(&sdd[t * GDVT + vv]);
+            const float dy[4] = {d4.x, d4.y, d4.z, d4.w};
+#pragma unroll
+            for (int x4 = 0; x4 < RPT / 4; ++x4) {
+                const float4 k4 = *reinterpret_cast<const float4*>(&sk[t * HKP + RPT * rq + 4 * x4]);
+                const float kx[4] = {k4.x, k4.y, k4.z, k4.w};
+#pragma unroll
+                for (int xx = 0; xx < 4; ++xx)
+#pragma unroll
+                    for (int y = 0; y < 4; ++y) s[4 * x4 + xx][y] = fmaf(kx[xx], dy[y], s[4 * x4 + xx][y]);
+            }
+        }
+        __syncthreads();   // (C) every read of ss, sk, sq, sd, sdd of this chunk done
+#pragma unroll
+        for (int xx = 0; xx < RPT; ++xx) {
+            float* d = &ss[(RPT * rq + xx) * GDVT + vv];
+            d[0] = s[xx][0]; d[1] = s[xx][1]; d[2] = s[xx][2]; d[3] = s[xx][3];
+        }
+    }
+#pragma unroll
+    for (int xx = 0; xx < RPT; ++xx)
+#pragma unroll
+        for (int y = 0; y < 4; ++y) state[(size_t) (RPT * rq + xx) * rs + (size_t) vh * S + c0 + vv + y] = s[xx][y];
+}
+
+float* gdn_chunk_scratch_hip() {
+    static float* bufs[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return nullptr; }
+    if (bufs[dev] == nullptr) {
+        const size_t n = (size_t) (HSB / 16) * HV * (2 * HCHMAX * HCHMAX + HCHMAX);   // the largest of the chunk shapes
+        if (cudaMalloc((void**) &bufs[dev], n * sizeof(float)) != cudaSuccess) { cudaGetLastError(); bufs[dev] = nullptr; }
+    }
+    return bufs[dev];
+}
+
+template <int HCH, int GDVT>
+void gdn_chunk_launch_hip(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                          float* scratch, cudaStream_t s) {
+    const int nb = (int) ((std::min<int64_t>(HSB, T) + HCH - 1) / HCH);
+    const size_t tsz = (size_t) nb * HV * HCH * HCH;
+    float *tm = scratch, *pm = tm + tsz, *gm = pm + tsz;
+    for (int64_t t0 = 0; t0 < T; t0 += HSB) {
+        const int nch = (int) ((std::min<int64_t>(HSB, T - t0) + HCH - 1) / HCH);
+        static const int skip = [] { const char* v = std::getenv("STRATA_GDN_CHUNK_SKIP"); return v ? std::atoi(v) : 0; }();   // timing only
+        if (skip != 1) gdn_chunk_prep_hip<HCH><<<dim3((unsigned) nch, HK), 256, hprep_smem<HCH>(), s>>>(h, gate, beta, tm, pm, gm, t0, T);
+        if (skip != 2)
+            gdn_chunk_scan_hip<HCH, GDVT><<<dim3(HV, S / GDVT), HCH * (GDVT / 4), hscan_smem<HCH, GDVT>(), s>>>(
+                state, h, beta, tm, pm, gm, y, t0, nch, T);
+    }
+}
+
+cudaError_t gdn_rec_chunked_hip(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                                cudaStream_t s) {
+    if (T <= 0) return cudaSuccess;
+    float* scratch = gdn_chunk_scratch_hip();
+    if (scratch == nullptr) return cudaErrorMemoryAllocation;
+    // STRATA_GDN_CHUNK_GDV: 1632 (16-token chunks, 32 columns), 1664, 3216, 3232 (default 1664)
+    static const int shape = [] { const char* v = std::getenv("STRATA_GDN_CHUNK_GDV"); return v ? std::atoi(v) : 1664; }();
+    switch (shape) {
+        case 3216: gdn_chunk_launch_hip<32, 16>(state, h, gate, beta, y, T, scratch, s); break;
+        case 3232: gdn_chunk_launch_hip<32, 32>(state, h, gate, beta, y, T, scratch, s); break;
+        case 1632: gdn_chunk_launch_hip<16, 32>(state, h, gate, beta, y, T, scratch, s); break;
+        default: gdn_chunk_launch_hip<16, 64>(state, h, gate, beta, y, T, scratch, s); break;
+    }
+    return cudaSuccess;
+}
+}  // namespace
+#endif
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
 #if defined(__HIPCC__)
+    // [claude] STRATA_GDN_CHUNKED=1: the chunked recurrence (gdn_rec_chunked_hip) for chunks of 128+ tokens, then the
+    // quad path's norm
+    static const bool chunked_hip = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
+    if (chunked_hip && T >= 128 && variant != 2 &&
+        gdn_rec_chunked_hip(state, h, gate, beta, y, T, (cudaStream_t) stream) == cudaSuccess) {
+        static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
+        if (noy)
+            gdn_out_norm_loop_kernel<false><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
+                z, gamma, eps, y, y16, T * HV, ld16);
+        else
+            gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
+                z, gamma, eps, y, y16, T * HV, ld16);
+        check("gdn_recurrence (chunked)");
+        return;
+    }
     if (variant == 3) {   // diagnostics: the quad recurrence + the old norm kernel
         if (T > 0) {
             gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
