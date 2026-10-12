@@ -2613,7 +2613,9 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    // [claude] the same test as the window's own self_commit (record_window): with STRATA_QFUSE (or a batch's per-slot
+    // recurrence) the window did NOT advance the state, and skipping the commit here lost a one-token window's GDN step
+    if (last_t_ == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
