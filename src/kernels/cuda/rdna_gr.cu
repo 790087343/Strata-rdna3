@@ -27,7 +27,8 @@ constexpr int HQ = H / 8 / 32;            // uint4 per lane per row slice: 5
 constexpr int UC = 16;                    // up: columns per block (x 4 streams = 64 rows = 256 quarter-rows)
 constexpr int UB = N / UC;                // 160 blocks
 
-struct RdnaGr { FusedGrArgs a[kFusedGrMaxT]; float* part; float* ss; };   // part [T][2*HC][PR], ss [T][2*HC]
+unsigned* g_gr_bar[64] = {};   // STRATA_GR_FUSED: per device {arrived, generation}, zeroed at load (rdna_r8_scratch_init)
+struct RdnaGr { FusedGrArgs a[kFusedGrMaxT]; float* part; float* ss; unsigned* bar = nullptr; };   // bar: STRATA_GR_FUSED grid barrier   // part [T][2*HC][PR], ss [T][2*HC]
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ uint4 ntload(const uint4* p) {
@@ -319,14 +320,14 @@ __device__ __forceinline__ void inject_slice(const RdnaGr& m, int slice) {
 }
 
 template <int T, int RW, bool INJ = true>
-__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_down_a8(RdnaGr m) {
+__device__ __forceinline__ void down_a8_body(const RdnaGr& m, const int bx, const int by) {
     // !INJ (STRATA_GR_INJ_UP): the 4 BF16 inject rows are rdna_gr_up's extra blocks - no float copy of the rows here
     __shared__ __align__(16) float xs[INJ ? T : 1][INJ ? H : 4];   // float rows, for the BF16 inject rows
     __shared__ __align__(16) uint32_t xq[T][H / 4];       // int8 rows
     __shared__ float xd[T][H / 32];
     __shared__ float sq[WV][T];
     const int t = threadIdx.x, lane = t & 31, wv = t >> 5;
-    const int rg = blockIdx.x, slice = blockIdx.y, c = slice >> 1, h = slice & 1;
+    const int rg = bx, slice = by, c = slice >> 1, h = slice & 1;
     if constexpr (!INJ) {
         if (rg == LR / (RW * WV)) { if (m.a[0].w_inject != nullptr) inject_slice<T>(m, slice); return; }
     }
@@ -427,6 +428,11 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
     }
 }
 
+template <int T, int RW, bool INJ = true>
+__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_down_a8(RdnaGr m) {
+    down_a8_body<T, RW, INJ>(m, blockIdx.x, blockIdx.y);
+}
+
 // STRATA_QFUSE: the consumer's q8_1 image of `mixed`, as fused_gr.cu's gr_q8_tail - the two blocks of a 32-column
 // group count in, the last one quantizes the group (one wave per token, the same bytes as native_quantize_q8_1)
 struct RdnaQ81 { half2 ds; int8_t qs[32]; };
@@ -460,7 +466,7 @@ __device__ __forceinline__ void q8_tail(const RdnaGr& m, int d0) {
 }
 
 template <int T, bool Q8 = false, bool A8 = false>
-__global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
+__device__ __forceinline__ void up_body(const RdnaGr& m, const int bx) {
 
     __shared__ __align__(16) uint32_t loq[A8 ? T : 1][LR / 4];
     __shared__ float lod[A8 ? T : 1][LR / 32];
@@ -471,7 +477,7 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
     // four lanes per row: quarter q reads uint4 q, q+4, ..., q+36 (10 of the row's 40) - issued first, so the DRAM
     // latency overlaps the partial folding below
     const int rr = t >> 2, q = t & 3;          // 64 rows: stream c = rr / UC, column dd = rr % UC
-    const int c = rr / UC, dd = rr - c * UC, d = blockIdx.x * UC + dd, i = c * N + d;
+    const int c = rr / UC, dd = rr - c * UC, d = bx * UC + dd, i = c * N + d;
     uint4 w[10];
     uint2 w8[10];
     float d8[10];
@@ -493,7 +499,7 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
         const int k = t / HC, cs = t - k * HC;
         const float s = m.ss[k * 2 * HC + 2 * cs] + m.ss[k * 2 * HC + 2 * cs + 1];
         rs[k][cs] = rsqrtf(s / (float) N + m.a[k].eps);
-        if (blockIdx.x == 0) m.a[k].rs[cs] = rs[k][cs];
+        if (bx == 0) m.a[k].rs[cs] = rs[k][cs];
     }
     __syncthreads();
     for (int i = t; i < T * PR; i += TH) {
@@ -505,8 +511,8 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
         if (j < LR) {
             const float x = s / (float) HC;
             lo[k][j] = x / (1.0f + __expf(-x));
-            if (blockIdx.x == 0) m.a[k].lo[j] = lo[k][j];
-        } else if (blockIdx.x == 0 && m.a[0].w_inject != nullptr) {
+            if (bx == 0) m.a[k].lo[j] = lo[k][j];
+        } else if (bx == 0 && m.a[0].w_inject != nullptr) {
             m.a[k].inject_out[j - LR] = s;
         }
     }
@@ -552,9 +558,43 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
         float s = 0.0f;
 #pragma unroll
         for (int cc = 0; cc < HC; ++cc) s += g[k][cc][col];
-        m.a[k].mixed[blockIdx.x * UC + col] = s / (float) HC;
+        m.a[k].mixed[bx * UC + col] = s / (float) HC;
     }
-    if (m.a[0].q8_mixed != nullptr) q8_tail<T>(m, blockIdx.x * UC);   // STRATA_QFUSE
+    if (m.a[0].q8_mixed != nullptr) q8_tail<T>(m, bx * UC);   // STRATA_QFUSE
+}
+
+template <int T, bool Q8 = false, bool A8 = false>
+__global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
+    up_body<T, Q8, A8>(m, blockIdx.x);
+}
+
+// STRATA_GR_FUSED=1: the down and up passes of the A8 read (inject rows in their own blocks) in ONE launch - every
+// block runs its down slice, a sense-reversing grid barrier (all 168 blocks are co-resident: 113 VGPRs, 4.4 KB LDS),
+// then the first UB blocks run the up pass.  The same arithmetic per element as the two launches; one graph node less.
+__device__ __forceinline__ void grid_barrier(unsigned* bar, unsigned nblocks) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        volatile unsigned* gen = bar + 1;
+        const unsigned g = *gen;
+        __threadfence();
+        if (atomicAdd(bar, 1u) == nblocks - 1) {
+            atomicExch(bar, 0u);
+            __threadfence();
+            atomicAdd(bar + 1, 1u);
+        } else {
+            while (*gen == g) __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+    __threadfence();   // every wave: the other blocks' partials and sums
+}
+template <int T>
+__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_fused(RdnaGr m) {
+    constexpr int NBX = LR / (2 * WV) + 1;   // the down grid's x extent (row groups + the inject group)
+    const int b = (int) blockIdx.x;
+    down_a8_body<T, 2, false>(m, b % NBX, b / NBX);
+    grid_barrier(m.bar, gridDim.x);
+    if (b < UB) up_body<T, true, true>(m, b);
 }
 
 __global__ void inj_check(const float* a, const float* b, const float* sa, const float* sb, int T, int apply, int inj, volatile float* rec) {
@@ -605,6 +645,11 @@ void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
         static const bool a8 = [] { const char* v = std::getenv("STRATA_GR_RDNA_A8"); return v && v[0] == '1'; }();
         if (a8) {
             static const bool inj_up = [] { const char* v = std::getenv("STRATA_GR_INJ_UP"); return v && v[0] == '1'; }();
+            static const bool fused = [] { const char* v = std::getenv("STRATA_GR_FUSED"); return v && v[0] == '1'; }();
+            if (inj_up && fused && m.bar != nullptr && sb == nullptr) {   // one launch (the profiler's stamps need two)
+                rdna_gr_fused<T><<<(LR / (2 * WV) + 1) * 2 * HC, TH, 0, st>>>(m);
+                return;
+            }
             if (inj_up) {   // the inject rows in their own blocks: no float copy of the rows in the int8 blocks
                 static const bool chk = std::getenv("STRATA_GR_INJ_CHECK") != nullptr;
                 if (chk) {   // debug: the INJ kernel into a second part buffer, compared after the new one
@@ -658,6 +703,9 @@ bool rdna_r8_scratch_init(long long elems) {
     if (std::getenv("STRATA_GR_INJ_CHECK")) (void) inj_rec();   // debug buffer: mapped at load, not during a capture
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (g_gr_bar[dev] == nullptr) {   // STRATA_GR_FUSED's barrier words
+        if (cudaMalloc(&g_gr_bar[dev], 64) != cudaSuccess || cudaMemset(g_gr_bar[dev], 0, 64) != cudaSuccess) return false;
+    }
     for (int r = 0; r < 2; ++r)
         if (g_r8_scratch[dev][r] == nullptr && cudaMalloc(&g_r8_scratch[dev][r], (size_t) elems * 2) != cudaSuccess) return false;
     return true;
@@ -688,6 +736,8 @@ void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* s
     for (int t = 0; t < n_tok; ++t) m.a[t] = a[t];
     m.part = scratch;
     m.ss = scratch + (size_t) n_tok * 2 * HC * PR;
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) m.bar = g_gr_bar[dev];
     cudaStream_t st = (cudaStream_t) stream;
     switch (n_tok) {
         case 1: launch<1>(m, st, sb, si); break;
