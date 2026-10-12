@@ -671,6 +671,45 @@ void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, 
     check("copy_row_to_first");
 }
 
+// [claude] STRATA_MTP_TOP2 (diagnostic): the selected row's runner-up (the best token after the argmax, the argmax's tie
+// rule: larger value, then smaller index), mapped through the draft vocabulary, to out[j] (host-mapped)
+__global__ void __launch_bounds__(1024) mtp_top2_kernel(const float* __restrict__ logits, int64_t nv,
+                                                        const int32_t* __restrict__ row_dev,
+                                                        const int32_t* __restrict__ dvocab, int32_t* out, int j) {
+    __shared__ float sv[1024];
+    __shared__ int si[1024];
+    const float* lg = logits + (size_t) (*row_dev) * nv;
+    auto better = [](float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); };
+    int b1 = -1;
+    for (int pass = 0; pass < 2; ++pass) {
+        float bv = -INFINITY; int bi = 0x7fffffff;
+        for (int64_t i = threadIdx.x; i < nv; i += blockDim.x) {
+            if ((int) i == b1) continue;
+            const float v = lg[i];
+            if (better(v, (int) i, bv, bi)) { bv = v; bi = (int) i; }
+        }
+        sv[threadIdx.x] = bv; si[threadIdx.x] = bi;
+        __syncthreads();
+        for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+            if ((int) threadIdx.x < o && better(sv[threadIdx.x + o], si[threadIdx.x + o], sv[threadIdx.x], si[threadIdx.x])) {
+                sv[threadIdx.x] = sv[threadIdx.x + o]; si[threadIdx.x] = si[threadIdx.x + o];
+            }
+            __syncthreads();
+        }
+        b1 = si[0];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const int id = b1 < 0 || b1 >= nv ? -1 : dvocab ? dvocab[b1] : b1;
+        __threadfence_system();
+        ((volatile int32_t*) out)[j] = id;
+    }
+}
+void mtp_top2(const float* logits, int64_t nv, const int32_t* row_dev, const int32_t* dvocab, int32_t* out, int j,
+              void* stream) {
+    mtp_top2_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(logits, nv, row_dev, dvocab, out, j);
+    check("mtp_top2");
+}
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
     mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,

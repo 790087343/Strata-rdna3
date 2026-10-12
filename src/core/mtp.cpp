@@ -157,7 +157,7 @@ MtpDrafter::~MtpDrafter() {
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_top2_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
 
@@ -368,7 +368,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(64, (void**) &h_row_, (void**) &m_row_) &&
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
-              (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_));
+              (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_)) &&
+              (!top2_env() || mapped(T * 4 + 64, (void**) &h_top2_, (void**) &m_top2_));
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
     auto carve = [&](Bump& b) {
@@ -1113,6 +1114,8 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok && m_top2_ != nullptr && !coupled)
+        mtp_top2(head_logits_, dhead_ != nullptr ? n_dvocab_ : n_vocab_, row_ + 1, dhead_ != nullptr ? dvocab_ : nullptr, m_top2_, 0, cs_);
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
@@ -1139,6 +1142,8 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok && m_top2_ != nullptr && !coupled)
+        mtp_top2(head_logits_, dhead_ != nullptr ? n_dvocab_ : n_vocab_, row_ + 1, dhead_ != nullptr ? dvocab_ : nullptr, m_top2_, j, cs_);
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }

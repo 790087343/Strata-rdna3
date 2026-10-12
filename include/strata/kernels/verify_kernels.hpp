@@ -104,6 +104,8 @@ void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_e
 void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t* count, void* stream);
 /// The draft chain's next input: R_dst[:] = R_src[row], tok_dst[0] = ids[row], out[j] = ids[row], with
 /// row = *row_dev (device memory).  `out` may be mapped host memory.
+void mtp_top2(const float* logits, int64_t nv, const int32_t* row_dev, const int32_t* dvocab, int32_t* out, int j,
+              void* stream);   // [claude] STRATA_MTP_TOP2: the selected row's runner-up to out[j] (host-mapped)
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
                 float* out_p = nullptr);

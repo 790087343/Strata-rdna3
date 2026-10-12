@@ -67,7 +67,7 @@ public:
     void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
-    int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
+    int32_t top2(int j) const { return h_top2_ != nullptr && j >= 0 && j < max_t_ ? ((volatile int32_t*) h_top2_)[j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
@@ -249,6 +249,7 @@ private:
     int32_t *h_tok_ = nullptr, *m_tok_ = nullptr, *h_step_ = nullptr, *m_step_ = nullptr;
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
+    int32_t *h_top2_ = nullptr, *m_top2_ = nullptr;   // STRATA_MTP_TOP2: each draft's runner-up (host-mapped)
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
