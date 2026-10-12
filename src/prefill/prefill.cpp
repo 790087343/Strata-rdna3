@@ -93,6 +93,11 @@ bool native_supported(int, int) { return false; }
 void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
 void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
+void set_mid_hook(void (*)(void*), void*) {}
+bool f16_on() { return false; }
+void act_f16(const float*, int64_t, int64_t, void*, void*) {}
+void experts_native_f16(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
+                        float*, void*) {}
 }  // namespace strata::prefill::fused
 #endif
 
@@ -1047,9 +1052,11 @@ struct MoeBufs { size_t gu, h, xq, hq; };
 MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
     if (!fused) return {T * K * 1280, T * K * 640, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640)};
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
+    // [claude] STRATA_PF_F16: H as FP16 [T K][640] and the activations as FP16 [T][N]
+    const bool f16 = fused::f16_on();
     return {std::max(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
-            std::max(ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4),
-            std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
+            std::max({ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4, f16 ? T * K * 640 / 2 : (size_t) 0}),
+            std::max({mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N), f16 ? T * N * 2 : (size_t) 0}),
             mmq::q8_bytes((int64_t) (ts * K), 640)};
 }
 uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
@@ -2003,11 +2010,11 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfCount };
+               kPfAfterComb, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj"};
+                                        "gdn recurrence", "gdn out proj", "after combine"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -3074,7 +3081,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         pt.mark(kPfGather, cs);
                         // the layer's input to int8 once per token; the rows of each expert from the router's ids
-                        if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                        if (fused_nat && fused::f16_on()) fused::act_f16(m.mixed, T, N, m.Xq, m.cs);
+                        else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         else fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // launches over the experts in id order, each at most kMaxBatch experts of which at most a
@@ -3111,10 +3119,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             pt.mark(kPfGemmGU, cs);
                             if (fused_nat) {
+                                struct MidCtx { PfTimer* pt; cudaStream_t cs; } mid{&pt, cs};
+                                if (pt.on) fused::set_mid_hook([](void* c) { auto* x = (MidCtx*) c; x->pt->mark(kPfGemmD, x->cs); }, &mid);
                                 const auto& f = lay.fmt[(size_t) l];
                                 const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
-                                fused::experts_native(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
-                                                      m.Dm, m.cs);
+                                if (fused::f16_on())
+                                    fused::experts_native_f16(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
+                                                              m.Dm, m.cs);
+                                else
+                                    fused::experts_native(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
+                                                          m.Dm, m.cs);
+                                if (pt.on) fused::set_mid_hook(nullptr, nullptr);
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
@@ -4022,6 +4037,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    pt.mark(kPfAfterComb, cs);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);

@@ -38,5 +38,15 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 /// through Alloc's 256-byte takes from a 256-aligned cache slot or cudaMalloc).
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream);
+/// [claude] STRATA_PF_F16=1 (gfx11): the native kernels with FP16 operands - weights decoded to FP16 with their scales
+/// applied, FP16 activations and H, FP32 accumulation, no per-WMMA scale epilogue.  f16_on(): requested and available.
+bool f16_on();
+/// x [rows][cols] FP32 -> `xh` FP16 [rows][cols] (saturated to +-65504); cols a multiple of 4
+void act_f16(const float* x, int64_t rows, int64_t cols, void* xh, void* stream);
+/// experts_native() on FP16 rows: `xh` from act_f16, H as FP16 [n][640] in `hh`, down into `dm` as there
+void experts_native_f16(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xh,
+                        const int32_t* src, void* hh, float* dm, void* stream);
+/// [claude] STRATA_PREFILL_TIMING: called by experts_native between the gate/up and the down launches (nullptr: none)
+void set_mid_hook(void (*fn)(void*), void* ctx);
 
 }  // namespace strata::prefill::fused
