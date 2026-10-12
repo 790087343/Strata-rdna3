@@ -3802,6 +3802,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }();
                         const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
                                                   MMQ_GROUP <= mmq::kGatherGroupMax;
+                        static const bool group_res_env = [] {
+                            const char* v = std::getenv("STRATA_PF_GROUP_RES");
+                            return v != nullptr && std::atoi(v) != 0;
+                        }();
+                        const bool group_res = group_res_env && !group_gather && use_mmq && lay.native &&
+                                               MMQ_GROUP <= mmq::kGatherGroupMax;
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
@@ -3844,6 +3850,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                     flush();
                                     gg = mmq::GatherGroup{};
+                                } else if (group_res && lay.native) {
+                                    // [claude] STRATA_PF_GROUP_RES: outside the streamed walk, the resident experts (no
+                                    // staging slot to give back) are gathered a run at a time in one launch; a staged
+                                    // one closes the run and is gathered alone, so its slot is released as before.
+                                    // The same bytes into the same group slots.
+                                    if (slot < 0) {
+                                        gg.blob[q] = blob_dev;
+                                        gg.n = (int) q + 1;
+                                    } else {
+                                        flush();
+                                        const auto& f = lay.fmt[(size_t) l];
+                                        mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
+                                                           mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                        gg.first = gg.n = (int) q + 1;
+                                    }
+                                    if (q + 1 == MMQ_GROUP || j + 1 == order.size()) {
+                                        flush();
+                                        gg = mmq::GatherGroup{};
+                                    }
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
