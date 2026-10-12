@@ -969,7 +969,14 @@ typedef float nh_f8 __attribute__((ext_vector_type(8)));
 #ifndef STRATA_NH_NOPF
 #define STRATA_NH_NOPF 1   // B fetched at its stage (no register prefetch: -64 VGPRs)
 #endif
-constexpr int HLD = 72;   // halves per decoded weight row of a stage: 64 + 8 (the int8 kernel's bank spread)
+constexpr int HLD = 72;
+// STRATA_PF_F16_CHECK=1 (debug): the largest |value| the FP16 rows see (activations and H, as float bits; FP16 saturates
+// at 65504), reported after each prompt chunk's experts
+__device__ unsigned int g_nh_absmax = 0;
+__device__ __forceinline__ void nh_track(float v) {
+    const unsigned int u = __float_as_uint(fabsf(v));
+    if (u > 0x46000000u) atomicMax(&g_nh_absmax, u);   // only past 8192: the common case costs a compare
+}   // halves per decoded weight row of a stage: 64 + 8 (the int8 kernel's bank spread)
 __device__ __forceinline__ nh_f8 nh_wmma(nh_h16 a, nh_h16 b, nh_f8 c) {
 #if STRATA_NAT_W11
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -1149,9 +1156,12 @@ native_h11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _F
                 if (r < nrows) {
                     uint32_t hw[16];
 #pragma unroll
-                    for (int j = 0; j < 16; ++j)
+                    for (int j = 0; j < 16; ++j) {
+                        nh_track(hs[r][32 * hh + 2 * j]);
+                        nh_track(hs[r][32 * hh + 2 * j + 1]);
                         hw[j] = nh_pack(fminf(fmaxf(hs[r][32 * hh + 2 * j], -65504.0f), 65504.0f),
                                         fminf(fmaxf(hs[r][32 * hh + 2 * j + 1], -65504.0f), 65504.0f));
+                    }
                     uint4* o4 = reinterpret_cast<uint4*>(out + (size_t) (row0 + r) * 640 + fb * 64 + 32 * hh);
 #pragma unroll
                     for (int k = 0; k < 4; ++k) o4[k] = make_uint4(hw[4 * k], hw[4 * k + 1], hw[4 * k + 2], hw[4 * k + 3]);
@@ -1204,8 +1214,6 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
     __shared__ __align__(16) uint4 ssign[SGN];
     __shared__ int srow[TP];
     __shared__ int spp[kMaxBatch + 1];                    // work pairs before each expert of the batch
-    static_assert((size_t) TP * 65 * 4 <= sizeof(smem), "H tile must fit the stage buffers");
-    float(*hs)[65] = reinterpret_cast<float(*)[65]>(smem);
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
     if constexpr (grid_bytes(WT) > 0) {
@@ -1253,15 +1261,24 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
             uint32_t q[8];
             float s0, s1;
             convert<WT>(raw, sgrid, kv, q, s0, s1, ssign);
-            const float mn = has_min(WT) ? s1 : 0.0f;
+            // packed FP16: a code byte c (int8) as the half 1024 + (c ^ 128) by byte permute, minus 1152 (exact for
+            // |c| <= 128), then one packed FMA with the scale (and minimum) as halves - ~7 VALU per 4 values where the
+            // FP32 route took ~18 (the scale rounds once to FP16: <= 2^-11 relative, per block)
+            const nh_h2 sa = {(_Float16) s0, (_Float16) s0};
+            const nh_h2 sb = {(_Float16) (K16 ? s1 : s0), (_Float16) (K16 ? s1 : s0)};
+            const _Float16 mh = (_Float16) (has_min(WT) ? s1 : 0.0f);
+            const nh_h2 mn2 = {mh, mh};
+            const nh_h2 off = {(_Float16) -1152.0f, (_Float16) -1152.0f};
             uint32_t hw[16];
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
-                const float sc = (K16 && k >= 4) ? s1 : s0;
-                const int v0 = (int) (int8_t) (q[k] & 255), v1 = (int) (int8_t) ((q[k] >> 8) & 255);
-                const int v2 = (int) (int8_t) ((q[k] >> 16) & 255), v3 = (int) (int8_t) (q[k] >> 24);
-                hw[2 * k] = nh_pack(fmaf((float) v0, sc, mn), fmaf((float) v1, sc, mn));
-                hw[2 * k + 1] = nh_pack(fmaf((float) v2, sc, mn), fmaf((float) v3, sc, mn));
+                const uint32_t u = q[k] ^ 0x80808080u;
+                const uint32_t lo = __builtin_amdgcn_perm(0x64646464u, u, 0x07010700u);   // halves 1024 + u0, 1024 + u1
+                const uint32_t hi = __builtin_amdgcn_perm(0x64646464u, u, 0x07030702u);   // halves 1024 + u2, 1024 + u3
+                const nh_h2 sc = (K16 && k >= 4) ? sb : sa;
+                const nh_h2 a0 = __builtin_bit_cast(nh_h2, lo) + off, a1 = __builtin_bit_cast(nh_h2, hi) + off;
+                hw[2 * k] = __builtin_bit_cast(uint32_t, a0 * sc + mn2);
+                hw[2 * k + 1] = __builtin_bit_cast(uint32_t, a1 * sc + mn2);
             }
             uint4* d = reinterpret_cast<uint4*>(&wt[ur][32 * uj]);
 #pragma unroll
@@ -1320,32 +1337,35 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
             }
         }
         if constexpr (GU) {
-            __syncthreads();                              // every wave is done reading the stage buffers
+            // H straight from the accumulators (no LDS tile, no barriers): lane l < 16 holds, for token column l, the
+            // gate of features 16 wm + 8 mt + i (i = 0..7) and gets their up rows from lane l + 16 - eight consecutive
+            // FP16 features, one 16-byte store
             if (on) {
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-                    for (int nt = 0; nt < 4; ++nt)
+                    for (int nt = 0; nt < 4; ++nt) {
+                        float hv[8];
 #pragma unroll
                         for (int i = 0; i < 8; ++i) {
                             const float up = __shfl_xor_sync(0xffffffffu, acc[mt][nt][i], 16);
                             const float gt = acc[mt][nt][i];
-                            if (hi == 0) hs[64 * wn + 16 * nt + l16][16 * wm + 8 * mt + i] = gt / (1.0f + __expf(-gt)) * up;
+                            hv[i] = gt / (1.0f + __expf(-gt)) * up;
                         }
-            }
-            __syncthreads();
-            {   // H block fb as FP16 (saturated): a thread per (token, half) over the 128 tokens
-                const int r = tid >> 1, hh = tid & 1;
-                if (r < nrows) {
-                    uint32_t hw[16];
+                        const int r = 64 * wn + 16 * nt + l16;
+                        if (hi == 0 && r < nrows) {
+                            uint32_t hw[4];
 #pragma unroll
-                    for (int j = 0; j < 16; ++j)
-                        hw[j] = nh_pack(fminf(fmaxf(hs[r][32 * hh + 2 * j], -65504.0f), 65504.0f),
-                                        fminf(fmaxf(hs[r][32 * hh + 2 * j + 1], -65504.0f), 65504.0f));
-                    uint4* o4 = reinterpret_cast<uint4*>(out + (size_t) (row0 + r) * 640 + fb * 64 + 32 * hh);
-#pragma unroll
-                    for (int k = 0; k < 4; ++k) o4[k] = make_uint4(hw[4 * k], hw[4 * k + 1], hw[4 * k + 2], hw[4 * k + 3]);
-                }
+                            for (int j = 0; j < 4; ++j) {
+                                nh_track(hv[2 * j]);
+                                nh_track(hv[2 * j + 1]);
+                                hw[j] = nh_pack(fminf(fmaxf(hv[2 * j], -65504.0f), 65504.0f),
+                                                fminf(fmaxf(hv[2 * j + 1], -65504.0f), 65504.0f));
+                            }
+                            *reinterpret_cast<uint4*>(out + (size_t) (row0 + r) * 640 + fb * 64 + 16 * wm + 8 * mt) =
+                                make_uint4(hw[0], hw[1], hw[2], hw[3]);
+                        }
+                    }
             }
         } else {
             if (on) {
@@ -1354,7 +1374,11 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
 #pragma unroll
                     for (int nt = 0; nt < 4; ++nt) {
                         const int r = 64 * wn + 16 * nt + l16;
+#ifdef STRATA_NH_NODM   // timing only: no down store (results are wrong)
+                        if (r < nrows && acc[mt][nt][0] == 12345.678f) {
+#else
                         if (r < nrows) {
+#endif
                             float* d = dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + hi;
 #pragma unroll
                             for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
@@ -1369,6 +1393,7 @@ __global__ void act_f16_kernel(const float4* __restrict__ x, uint2* __restrict__
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n4) return;
     const float4 v = x[i];
+    nh_track(v.x); nh_track(v.y); nh_track(v.z); nh_track(v.w);
     auto c = [](float f) { return fminf(fmaxf(f, -65504.0f), 65504.0f); };
     y[i] = make_uint2(nh_pack(c(v.x), c(v.y)), nh_pack(c(v.z), c(v.w)));
 }
@@ -1723,6 +1748,19 @@ void experts_native_f16(const Batch& b, const NativeGeom& g, int n_expert, int64
     else STRATA_NH_D(T_IQ4_NL);
 #undef STRATA_NH_D
     ck(cudaGetLastError(), "experts_native_f16");
+    static const bool check = std::getenv("STRATA_PF_F16_CHECK") != nullptr;
+    if (check) {
+        unsigned int u = 0;
+        cudaStreamSynchronize(s);
+        (void) hipMemcpyFromSymbol(&u, HIP_SYMBOL(g_nh_absmax), sizeof u);
+        static unsigned int last = 0;
+        if (u != last) {
+            float f = 0.0f;
+            std::memcpy(&f, &u, sizeof f);
+            std::fprintf(stderr, "prefill FP16 experts: largest |activation or H| so far %.1f (FP16 max 65504)\n", f);
+            last = u;
+        }
+    }
 #else
     (void) b; (void) g; (void) n_expert; (void) n; (void) scratch; (void) xh; (void) src; (void) hh; (void) dm; (void) stream;
 #endif
