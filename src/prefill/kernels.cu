@@ -2624,13 +2624,16 @@ __global__ void __launch_bounds__(GW_NT) gdn_chunk_scan_wmma(float* __restrict__
 #pragma unroll
         for (int i = 0; i < 8; ++i) (sw + (16 * r + 2 * i) * rs)[lo] = st[r][i];
 }
-// the FP16 k / q / k^T of a super-block's chunks (GW_SBT / 32 chunks x 16 key heads x 3 x 32 x 128 halves)
+// the WMMA recurrence's scratch, one a device: the FP16 k / q / k^T of a super-block's chunks (GW_SBT / 32 chunks x
+// 16 key heads x 3 x 32 x 128 halves: 24 MB), their FP16 T and P (x 48 value heads x 2 x 32 x 32: 12 MB), gamma
+// (x 48 x 32 floats) and a 32-float sink line - 37 MB (the generic chunk scratch is not used: 51 MB)
 uint16_t* gdn_kq16_scratch() {
     static uint16_t* bufs[64] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return nullptr; }
     if (bufs[dev] == nullptr) {
-        const size_t n = (size_t) (GW_SBT / GW_L) * HK * 3 * GW_L * S;
+        constexpr size_t nb = GW_SBT / GW_L;
+        const size_t n = nb * HK * 3 * GW_L * S + nb * HV * 2 * GW_L * GW_L + 2 * (nb * HV * GW_L + 32);
         if (cudaMalloc((void**) &bufs[dev], n * 2) != cudaSuccess) { cudaGetLastError(); bufs[dev] = nullptr; }
     }
     return bufs[dev];
@@ -2649,12 +2652,12 @@ float* gdn_chunk_scratch_hip() {
 
 // [claude] the WMMA recurrence (STRATA_GDN_CHUNK_GDV=0): a prep and a scan launch per GW_SBT tokens; the scratch holds
 // T / P (FP16) and gamma of a super-block's chunks, then a sink line for the scan's past-the-end rows
-void gdn_chunk_wmma(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
-                    float* scratch, cudaStream_t s, int skip) {
+void gdn_chunk_wmma(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, cudaStream_t s,
+                    int skip) {
     uint16_t* kq16 = gdn_kq16_scratch();
-    const int nb = (int) ((std::min<int64_t>(GW_SBT, T) + GW_L - 1) / GW_L);
-    uint16_t* tp16 = reinterpret_cast<uint16_t*>(scratch);
-    float* gm = scratch + (size_t) nb * HV * GW_L * GW_L;   // 2 x 32 x 32 halves a (chunk, head) = 1024 floats
+    const int nb = GW_SBT / GW_L;
+    uint16_t* tp16 = reinterpret_cast<uint16_t*>(kq16 + (size_t) nb * HK * 3 * GW_L * S);   // after k / q / k^T
+    float* gm = reinterpret_cast<float*>(tp16 + (size_t) nb * HV * 2 * GW_L * GW_L);
     float* sink = gm + (size_t) nb * HV * GW_L;
     // STRATA_GDN_WMMA_SPLIT=1: the state and the corrections as FP16 hi + lo pairs (twice the matrix work; the FP16
     // k / q / T / P dominate the error either way: o rel 3.6e-4 split, 4.6e-4 not, on random inputs)
@@ -2672,9 +2675,7 @@ template <int HCH, int GDVT>
 void gdn_chunk_launch_hip(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
                           float* scratch, cudaStream_t s) {
     static const int skip = [] { const char* v = std::getenv("STRATA_GDN_CHUNK_SKIP"); return v ? std::atoi(v) : 0; }();   // timing only
-    if constexpr (GDVT == 0) {
-        gdn_chunk_wmma(state, h, gate, beta, y, T, scratch, s, skip);
-    } else {
+    {
         const int nb = (int) ((std::min<int64_t>(HSB, T) + HCH - 1) / HCH);
         const size_t tsz = (size_t) nb * HV * HCH * HCH;
         float *tm = scratch, *pm = tm + tsz, *gm = pm + tsz;
@@ -2691,12 +2692,17 @@ void gdn_chunk_launch_hip(float* state, const float* h, const float* gate, const
 cudaError_t gdn_rec_chunked_hip(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
                                 cudaStream_t s) {
     if (T <= 0) return cudaSuccess;
-    float* scratch = gdn_chunk_scratch_hip();
-    if (scratch == nullptr) return cudaErrorMemoryAllocation;
     // STRATA_GDN_CHUNK_GDV: 1632 (16-token chunks, 32 columns), 1664, 3216, 3232 (default 1664); 0: the WMMA scan
     static const int shape = [] { const char* v = std::getenv("STRATA_GDN_CHUNK_GDV"); return v ? std::atoi(v) : 1664; }();
+    if (shape == 0) {   // its own scratch (an error: the caller takes the token kernels)
+        if (gdn_kq16_scratch() == nullptr) return cudaErrorMemoryAllocation;
+        static const int skip = [] { const char* v = std::getenv("STRATA_GDN_CHUNK_SKIP"); return v ? std::atoi(v) : 0; }();   // timing only
+        gdn_chunk_wmma(state, h, gate, beta, y, T, s, skip);
+        return cudaSuccess;
+    }
+    float* scratch = gdn_chunk_scratch_hip();
+    if (scratch == nullptr) return cudaErrorMemoryAllocation;
     switch (shape) {
-        case 0: gdn_chunk_launch_hip<32, 0>(state, h, gate, beta, y, T, scratch, s); break;
         case 3216: gdn_chunk_launch_hip<32, 16>(state, h, gate, beta, y, T, scratch, s); break;
         case 3232: gdn_chunk_launch_hip<32, 32>(state, h, gate, beta, y, T, scratch, s); break;
         case 1632: gdn_chunk_launch_hip<16, 32>(state, h, gate, beta, y, T, scratch, s); break;
@@ -2798,7 +2804,6 @@ void gdn_recurrence_warm() {
     const char* g = std::getenv("STRATA_GDN_CHUNK_GDV");
     if (c == nullptr || std::atoi(c) == 0 || g == nullptr || std::atoi(g) != 0) return;
     gdn_kq16_scratch();
-    gdn_chunk_scratch_hip();
     hipFuncAttributes fa;
     (void) hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(&gdn_chunk_prep_wmma));
     (void) hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(&gdn_chunk_scan_wmma<false>));
