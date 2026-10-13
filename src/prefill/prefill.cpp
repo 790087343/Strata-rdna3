@@ -2020,8 +2020,13 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
                                         "qsa kv append+q prep"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    // [claude] STRATA_PREFILL_TIMING=2: also name every single phase interval over 200 ms (device, chunk, layer)
+    bool slow = [] { const char* e = std::getenv("STRATA_PREFILL_TIMING"); return e && std::atoi(e) == 2; }();
+    int64_t layer = -1, p0 = 0;
+    int dev = -1;
     std::vector<cudaEvent_t> ev;
     std::vector<int> ph;
+    std::vector<int64_t> lay;
     size_t used = 0;
     double ms[kPfCount] = {};
     void mark(int phase, cudaStream_t s) {
@@ -2031,8 +2036,10 @@ struct PfTimer {
             cudaEventCreate(&e);
             ev.push_back(e);
             ph.push_back(0);
+            lay.push_back(-1);
         }
         ph[used] = phase;
+        lay[used] = layer;
         cudaEventRecord(ev[used], s);
         ++used;
     }
@@ -2041,10 +2048,16 @@ struct PfTimer {
         if (!on || used < 2) return;
         for (size_t i = 0; i + 1 < used; ++i) {
             float t = 0.0f;
-            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) ms[ph[i]] += t;
+            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) {
+                ms[ph[i]] += t;
+                if (slow && t > 200.0f)
+                    std::fprintf(stderr, "strata prefill slow phase: device %d, chunk from %lld, layer %lld, %s %.0f ms\n", dev,
+                                 (long long) p0, (long long) lay[i], kPfNames[ph[i]], t);
+            }
         }
         std::swap(ev[0], ev[used - 1]);
         std::swap(ph[0], ph[used - 1]);
+        std::swap(lay[0], lay[used - 1]);
         used = 1;
     }
     ~PfTimer() {
@@ -2589,6 +2602,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
+            pt.layer = l; pt.p0 = p0; pt.dev = m.device;
             if (dp && dp_k > 0 && !dp_wait(l, dp_k, err)) return false;   // [claude] DP: chunk k-1's state of layer l
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
