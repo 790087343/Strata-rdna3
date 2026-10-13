@@ -1166,6 +1166,8 @@ struct alignas(16) SmemW {
     float vs[4][WCH];            // V scale per (group, cell)
     int valid[WCH];              // the cell has a resident pool row
     uint8_t v[4][WCH][WVS];      // per wave: the chunk's V codes of its group, one row per cell
+    uint8_t k[4][WCH][WVS];      // [claude] KLDS: per wave, the chunk's K codes of its group (one 64-byte load per cell)
+    float ks[4][WCH];            // [claude] KLDS: K scale per (group, cell)
     float qmax[4];
     float alpha[16];
     float lsum[16];
@@ -1193,7 +1195,7 @@ __device__ __forceinline__ wh8 i8_to_h(const uint32_t* x) {   // PA_KL codes, ex
 // SPLIT = true (default): q and p carried as FP16 hi + lo pairs (two WMMAs each: FP32-level). S23 (opt-in
 // STRATA_PA_FAST=1): SPLIT = false, one FP16 image each - half the matrix work, rounding-level (FP16 attention as the
 // usual flash-attention kernels), quality-gated
-template <bool SPLIT>
+template <bool SPLIT, bool KLDS = false>
 __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                    const int32_t* __restrict__ ids,
                                                                    const int32_t* __restrict__ steps, int n_kv_heads,
@@ -1276,18 +1278,38 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
             dst[0] = v0; dst[1] = v1; dst[2] = v2; dst[3] = v3;
             S.vs[warp][lane] = vsc;
             if (warp == 0) S.valid[lane] = myrow >= 0;
+            if constexpr (KLDS) {   // [claude] this wave's K slice of the chunk: one coalesced 64-byte row piece per cell
+                uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0, k2 = k0, k3 = k0;
+                float ksc_l = 0.0f;
+                if (myrow >= 0) {
+                    const uint4* src = reinterpret_cast<const uint4*>(p.k_q + myrow * HD + dim0);
+                    k0 = __ldg(src); k1 = __ldg(src + 1); k2 = __ldg(src + 2); k3 = __ldg(src + 3);
+                    ksc_l = __half2float(__ushort_as_half(__ldg(p.k_scale + myrow * (HD / KV_Q8_GROUP) + warp)));
+                }
+                uint4* kd = reinterpret_cast<uint4*>(&S.k[warp][lane][0]);
+                kd[0] = k0; kd[1] = k1; kd[2] = k2; kd[3] = k3;
+                S.ks[warp][lane] = ksc_l;
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");   // the wave's own rows, read below by its lanes
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+            }
         }
         // q.k over this wave's 64 dims for two 16-cell tiles, times the cell's K scale for this group
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
-            const long long rr = __shfl(myrow, nt * 16 + col);
+            const long long rr = KLDS ? -1 : __shfl(myrow, nt * 16 + col);
             wf8 s = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             float ksc = 0.0f;
-            if (rr >= 0) ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp)));
+            if constexpr (KLDS) ksc = S.ks[warp][nt * 16 + col];   // 0 for a masked cell (staged above)
+            else if (rr >= 0) ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp)));
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {
                 uint32_t kx[PA_KL / 4] = {};
-                if (rr >= 0) {
+                if constexpr (KLDS) {
+                    const uint32_t* src = reinterpret_cast<const uint32_t*>(&S.k[warp][nt * 16 + col][kk * 16 + PA_KOFF(half)]);
+#pragma unroll
+                    for (int j = 0; j < PA_KL / 4; ++j) kx[j] = src[j];
+                } else if (rr >= 0) {
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(p.k_q + rr * HD + dim0 + kk * 16 + PA_KOFF(half));
 #if STRATA_PA_GFX11
                     const uint4 v = __ldg(reinterpret_cast<const uint4*>(src));
@@ -1430,7 +1452,12 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
         static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
-        if (fast && n_q >= min_t)
+        static const bool klds = [] { const char* e = std::getenv("STRATA_PA_KLDS"); return e != nullptr && e[0] == '1'; }();
+        if (fast && n_q >= min_t && klds)   // [claude] STRATA_PA_KLDS=1: K through LDS like V (bitwise: the same codes and scales)
+            prompt_attn_wmma_kernel<false, true><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
+                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+        else if (fast && n_q >= min_t)
             prompt_attn_wmma_kernel<false><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
                 q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
                 (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
