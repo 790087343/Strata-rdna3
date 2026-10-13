@@ -1226,6 +1226,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
+    gdn_recurrence_warm();
     return true;
 }
 
