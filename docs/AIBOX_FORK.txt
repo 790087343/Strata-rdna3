@@ -2,7 +2,7 @@ aibox production source snapshot
 ===============================
 Upstream: https://github.com/Niko1221/Strata
 Base: 6f32ec070f23ced9f50e704d854d775da52591ab (0.1.39)
-Repository: https://github.com/nicejunjie/Strata-private (public since 2026-10-14)
+Repository: https://github.com/nicejunjie/Strata-rdna3 (public since 2026-10-14; was Strata-private, branch rdna3 was claude-iq3-single)
 Maintained branch: aibox-production
 
 This branch preserves the locally modified engine source as of 2026-10-06.
