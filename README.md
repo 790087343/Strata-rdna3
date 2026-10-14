@@ -9,6 +9,67 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
 
+> [!NOTE]
+> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) tuned for AMD RDNA3 (RX 7900 XTX, gfx1100).**
+> The upstream README follows below unchanged. This section describes what the fork adds and how fast it runs.
+
+## RDNA3 / RX 7900 XTX fork
+
+Measured on one or two **RX 7900 XTX** (24 GB each, PCIe 4.0 x8) with a Ryzen 9 9950X3D2 and 128 GB of RAM, with
+every expert computed (no expert skipping). Lines are the median of 3 trials (the faint band is the trial range); every
+request was checked for exact input length, 256 output tokens and correct retrieval.
+
+<p align="center"><img src="docs/media/rdna3/decode.png" width="49%" alt="Flash-Next decode speed, 1 and 2 RX 7900 XTX"> <img src="docs/media/rdna3/prefill.png" width="49%" alt="Flash-Next prefill speed, 1 and 2 RX 7900 XTX"></p>
+<p align="center"><img src="docs/media/rdna3/at-32k.png" width="49%" alt="Flash-Next at 32K context"> <img src="docs/media/rdna3/stock-to-tuned.png" width="49%" alt="Stock Strata to this fork on the RX 7900 XTX"></p>
+<p align="center"><img src="docs/media/rdna3/vs-rtx4090.png" width="49%" alt="Two RX 7900 XTX against a public RTX 4090 run on the same requests"></p>
+
+| Flash-Next, tokens/s (prefill / decode) | 32K | 128K | ≈256K |
+|---|---|---|---|
+| IQ3_S, 2 GPUs | 6,020 / 124.3 | 6,426 / 122.9 | 5,909 / 118.2 |
+| IQ3_S, 1 GPU | 3,432 / 100.0 | 3,436 / 100.4 | 3,091 / 93.6 |
+| UD-IQ4_XS, 2 GPUs | 5,550 / 110.8 | 6,193 / 112.0 | 5,728 / 108.4 |
+| UD-IQ4_XS, 1 GPU | 3,140 / 77.7 | 3,201 / 82.5 | 2,903 / 77.5 |
+| UD-Q4_K_XL, 2 GPUs | 4,711 / 97.5 | 5,724 / 101.7 | 5,309 / 92.7 |
+| UD-Q4_K_XL, 1 GPU | 3,511 / 67.5 | 3,556 / 67.0 | 3,127 / 56.2 |
+
+Against stock Strata on the same card (UD-IQ4_XS, 32K): prefill 1,151 -> 3,140 tok/s on one GPU and 1,727 -> 5,550 on
+two; decode 55.7 -> 77.7 and 51.2 -> 110.8 tok/s.
+
+**What the fork adds** (all gfx1100 HIP; most are opt-in environment switches, so stock behaviour is unchanged):
+- Decode: RDNA hyper-connection reads (int8 / int8-activation, fused down+up with a grid barrier), multi-column
+  Q4_K/Q5_K/Q6_K/IQ4_XS GEMVs, fused router publish, fused waits and CPU-row combine, a register top-k for QSA at
+  262K capacity, `--pcie-frac 0` for layer split.
+- Prefill: matrix-core (WMMA) prompt attention and QSA selection (imported from
+  [xyzzing/Strata](https://github.com/xyzzing/Strata)), the chunked GDN recurrence on FP16 matrix cores, FP16-operand
+  expert kernels, K-quant MMQ, a dual-GPU data-parallel prompt path (`STRATA_DP_PREFILL=1`), LDS-staged attention.
+- Loading: on Linux the expert arena is read with O_DIRECT when the page cache could not keep it (a 72 GB Q4 arena
+  loads at ~1.9 instead of ~1.0 GiB/s).
+- Fixes: MTP top-2 accounting, a one-token-window commit, a host deadlock in fused prefill batches.
+
+**Build** (Linux, ROCm 7 Python wheels as installed by `setup.py`, plus rocWMMA headers for the matrix-core paths):
+
+```bash
+R=<rocm sdk root>  # e.g. .venv/lib/python3.13/site-packages/_rocm_sdk_devel
+export HIP_PLATFORM=amd HIP_COMPILER=clang HIP_RUNTIME=rocclr ROCM_PATH=$R HIP_PATH=$R PATH=$R/bin:$R/llvm/bin:$PATH
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_PREFILL_MMQ=ON \
+  -DSTRATA_MMQ_KQUANTS=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$R \
+  "-DCMAKE_HIP_FLAGS=--rocm-path=$R --rocm-device-lib-path=$R/lib/llvm/amdgcn/bitcode" \
+  -DSTRATA_ROCWMMA_INCLUDE_DIR=<rocWMMA>/library/include
+cmake --build build -j
+```
+
+`STRATA_MMQ_KQUANTS=ON` matters for the Q4 (k-quant) pack: without it, two-GPU Q4 prefill is 7-13 % slower
+(32K: ~4,170 instead of ~4,770 tok/s).  IQ3/IQ4 are unaffected.
+
+**Settings used for the numbers above:** the exact environment and command line of each of the six setups are in
+[`docs/RDNA3_SETTINGS.md`](docs/RDNA3_SETTINGS.md).  The tuned paths are environment switches (`STRATA_GR_RDNA=1`,
+`STRATA_HIP_WMMA=1`, `STRATA_DP_PREFILL=1`, ...); without them the engine behaves as upstream.
+
+Fork notes: [`AIBOX_RDNA3.txt`](AIBOX_RDNA3.txt), [`docs/AIBOX_FORK.txt`](docs/AIBOX_FORK.txt). License: MIT, as upstream.
+
+---
+
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.

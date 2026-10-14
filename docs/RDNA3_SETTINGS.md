@@ -1,0 +1,432 @@
+# Settings behind the RDNA3 fork's measurements
+
+Exact engine command lines of the 2026-10-13 measurements in the README (one or two RX 7900 XTX, gfx1100,
+Ryzen 9 9950X3D2, 128 GB RAM).  `<pack dir>` is the model's expert pack (`setup.py` builds it), `<model dir>` the
+GGUF shards, `<mtp dir>` the MTP draft head.  With two GPUs both are visible (`HIP_VISIBLE_DEVICES=1,0` here: the
+first one listed is CUDA0) and the engine splits the layers 24/24.
+
+## IQ3_S (GSQ-RCO), 2 GPUs
+
+```
+STRATA_HIPBLASLT_TUNING=tools/hip/gfx1100-hipblaslt-100200.txt
+STRATA_RDNA_MMVQ_WAVE=3
+STRATA_PEER_TRANSPORT=host
+STRATA_HIP_WMMA=1
+STRATA_SELECT_WMMA=1
+STRATA_PREFILL_CPU_SHARE=auto
+STRATA_HC_Q8=0
+STRATA_PREFILL_AUTO_MAX=32768
+STRATA_PREFILL_RING=384
+STRATA_PREFILL_MMQ_TILE_ROWS=32
+STRATA_ROUTE_TAIL_SKIP=0
+STRATA_HEAD_MIX_MULTI=1
+STRATA_ONE_TOKEN_COMMIT=0
+STRATA_AUX_CPUS=off
+STRATA_GR_RDNA=1
+STRATA_GR_RDNA_Q8=1
+STRATA_RDNA_Q6K=1
+STRATA_GR_RDNA_A8=1
+GPU_MAX_HW_QUEUES=8
+STRATA_PREFILL_SMALL_RING=96
+STRATA_PREFILL_SMALL_MAX=4096
+STRATA_QFUSE=1
+STRATA_COMBINE_CPU=1
+STRATA_VERIFY_QDEDUP=1
+STRATA_WAIT_FUSE=1
+STRATA_ROUTE_PUBLISH=1
+STRATA_GR_INJ_UP=1
+STRATA_PF_FUSED=1
+STRATA_STAGER_RING=64
+STRATA_PREFILL_CPU_SHARE_MAX=1024
+STRATA_GR_FUSED=1
+STRATA_GDN_HEAD=1
+STRATA_GDN_CHUNKED=1
+STRATA_GDN_CHUNK_GDV=0
+STRATA_PA_KLDS=1
+STRATA_GDN_PP=1
+STRATA_GDN_CONVL2=1
+STRATA_GDN_NOY=1
+STRATA_PF_GEMM=1
+STRATA_PF_PAD=1
+STRATA_HC_UPMIX=1
+STRATA_PF_HCDOWN=1
+STRATA_FUSE_CONVAB=1
+STRATA_PA_FAST=1
+STRATA_PF_GROUP_RES=1
+STRATA_PF_F16=2
+STRATA_KV_HOST_DMA=1
+STRATA_DP_PREFILL=1
+
+strata --serve \
+  --pack <pack dir> \
+  --native <model dir>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+  --expert-profile data/expert-profile.bin \
+  --prefill auto \
+  --spec-min-p 0.5 \
+  --mtp <mtp dir> \
+  --max-context 262144 \
+  --kv int8 \
+  --ple-io direct \
+  --stats \
+  --vision \
+  --pool-workers 8 \
+  --expert-cache auto \
+  --ple-row-cache 1048576 \
+  --kv-resident 32768 \
+  --pipeline-windows 2 \
+  --mtp-q4 all \
+  --mtp-window 4096 \
+  --pcie-frac 0 \
+  --spec 3 \
+  --vram-reserve-mib 512
+```
+
+## IQ3_S (GSQ-RCO), 1 GPU
+
+```
+STRATA_HIPBLASLT_TUNING=tools/hip/gfx1100-hipblaslt-100200.txt
+STRATA_RDNA_MMVQ_WAVE=3
+STRATA_PEER_TRANSPORT=host
+STRATA_HIP_WMMA=1
+STRATA_SELECT_WMMA=1
+STRATA_SH_STREAM=0
+STRATA_PREFILL_AUTO_MAX=32768
+STRATA_PREFILL_MMQ_TILE_ROWS=32
+STRATA_GR_RDNA=1
+STRATA_GR_RDNA_Q8=1
+STRATA_RDNA_Q6K=1
+STRATA_GR_RDNA_A8=1
+STRATA_QFUSE=1
+STRATA_COMBINE_CPU=1
+STRATA_VERIFY_QDEDUP=1
+STRATA_WAIT_FUSE=1
+STRATA_ROUTE_PUBLISH=1
+STRATA_GR_INJ_UP=1
+STRATA_PF_FUSED=1
+STRATA_STAGER_RING=64
+STRATA_PREFILL_CPU_SHARE=auto
+STRATA_PREFILL_CPU_SHARE_MAX=6144
+GPU_MAX_HW_QUEUES=6
+STRATA_GR_FUSED=1
+STRATA_GDN_HEAD=1
+STRATA_GDN_CHUNKED=1
+STRATA_GDN_CHUNK_GDV=0
+STRATA_PA_KLDS=1
+STRATA_GDN_PP=1
+STRATA_GDN_CONVL2=1
+STRATA_GDN_NOY=1
+STRATA_PF_GEMM=1
+STRATA_PF_PAD=1
+STRATA_HC_UPMIX=1
+STRATA_PF_HCDOWN=1
+STRATA_FUSE_CONVAB=1
+STRATA_HEAD_MIX_MULTI=1
+STRATA_PA_FAST=1
+STRATA_PF_GROUP_RES=1
+STRATA_PF_F16=2
+STRATA_PREFILL_RING=192
+STRATA_KV_HOST_DMA=1
+
+strata --serve \
+  --pack <pack dir> \
+  --native <model dir>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+  --expert-profile data/expert-profile.bin \
+  --prefill auto \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp <mtp dir> \
+  --max-context 262144 \
+  --kv int8 \
+  --ple-io direct \
+  --stats \
+  --vision \
+  --expert-cache auto \
+  --ple-row-cache 1048576 \
+  --kv-resident 32768 \
+  --pcie-frac 0 \
+  --vram-reserve-mib 512 \
+  --pool-workers 12 \
+  --mtp-q4 all \
+  --mtp-window 4096
+```
+
+## Unsloth UD-IQ4_XS, 2 GPUs
+
+```
+STRATA_HIPBLASLT_TUNING=tools/hip/gfx1100-hipblaslt-100200.txt
+STRATA_RDNA_MMVQ_WAVE=3
+STRATA_PEER_TRANSPORT=host
+STRATA_HIP_WMMA=1
+STRATA_SELECT_WMMA=1
+STRATA_PREFILL_CPU_SHARE=auto
+STRATA_HC_Q8=0
+STRATA_PREFILL_AUTO_MAX=32768
+STRATA_PREFILL_RING=384
+STRATA_PREFILL_MMQ_TILE_ROWS=64
+STRATA_ROUTE_TAIL_SKIP=0
+STRATA_HEAD_MIX_MULTI=1
+STRATA_ONE_TOKEN_COMMIT=0
+STRATA_AUX_CPUS=off
+STRATA_GR_RDNA=1
+STRATA_GR_RDNA_Q8=1
+STRATA_RDNA_Q6K=1
+STRATA_GR_RDNA_A8=1
+GPU_MAX_HW_QUEUES=8
+STRATA_PREFILL_SMALL_RING=96
+STRATA_PREFILL_SMALL_MAX=4096
+STRATA_QFUSE=1
+STRATA_COMBINE_CPU=1
+STRATA_VERIFY_QDEDUP=1
+STRATA_WAIT_FUSE=1
+STRATA_ROUTE_PUBLISH=1
+STRATA_GR_INJ_UP=1
+STRATA_PF_FUSED=1
+STRATA_STAGER_RING=64
+STRATA_GR_FUSED=1
+STRATA_GDN_HEAD=1
+STRATA_GDN_CHUNKED=1
+STRATA_GDN_CHUNK_GDV=0
+STRATA_PA_KLDS=1
+STRATA_GDN_PP=1
+STRATA_GDN_CONVL2=1
+STRATA_GDN_NOY=1
+STRATA_PF_GEMM=1
+STRATA_PF_PAD=1
+STRATA_HC_UPMIX=1
+STRATA_PF_HCDOWN=1
+STRATA_FUSE_CONVAB=1
+STRATA_PA_FAST=1
+STRATA_PF_GROUP_RES=1
+STRATA_PF_F16=2
+STRATA_KV_HOST_DMA=1
+STRATA_DP_PREFILL=1
+
+strata --serve \
+  --pack <pack dir> \
+  --native <model dir>/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+  --expert-profile data/expert-profile.bin \
+  --prefill auto \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp <mtp dir> \
+  --max-context 262144 \
+  --kv int8 \
+  --ple-io direct \
+  --stats \
+  --vision \
+  --pool-workers 8 \
+  --expert-cache auto \
+  --ple-row-cache 1048576 \
+  --kv-resident 32768 \
+  --pipeline-windows 2 \
+  --mtp-q4 all \
+  --mtp-window 4096 \
+  --pcie-frac 0 \
+  --vram-reserve-mib 512
+```
+
+## Unsloth UD-IQ4_XS, 1 GPU
+
+```
+STRATA_HIPBLASLT_TUNING=tools/hip/gfx1100-hipblaslt-100200.txt
+STRATA_RDNA_MMVQ_WAVE=3
+STRATA_PEER_TRANSPORT=host
+STRATA_HIP_WMMA=1
+STRATA_SELECT_WMMA=1
+STRATA_SH_STREAM=0
+STRATA_PREFILL_AUTO_MAX=32768
+STRATA_PREFILL_MMQ_TILE_ROWS=64
+STRATA_GR_RDNA=1
+STRATA_GR_RDNA_Q8=1
+STRATA_RDNA_Q6K=1
+STRATA_GR_RDNA_A8=1
+STRATA_QFUSE=1
+STRATA_COMBINE_CPU=1
+STRATA_VERIFY_QDEDUP=1
+STRATA_WAIT_FUSE=1
+STRATA_ROUTE_PUBLISH=1
+STRATA_GR_INJ_UP=1
+STRATA_PF_FUSED=1
+STRATA_STAGER_RING=64
+STRATA_PREFILL_CPU_SHARE=auto
+STRATA_PREFILL_CPU_SHARE_MAX=6144
+GPU_MAX_HW_QUEUES=6
+STRATA_GR_FUSED=1
+STRATA_GDN_HEAD=1
+STRATA_GDN_CHUNKED=1
+STRATA_GDN_CHUNK_GDV=0
+STRATA_PA_KLDS=1
+STRATA_GDN_PP=1
+STRATA_GDN_CONVL2=1
+STRATA_GDN_NOY=1
+STRATA_PF_GEMM=1
+STRATA_PF_PAD=1
+STRATA_HC_UPMIX=1
+STRATA_PF_HCDOWN=1
+STRATA_FUSE_CONVAB=1
+STRATA_HEAD_MIX_MULTI=1
+STRATA_PA_FAST=1
+STRATA_PF_GROUP_RES=1
+STRATA_PF_F16=2
+STRATA_PREFILL_RING=192
+STRATA_KV_HOST_DMA=1
+
+strata --serve \
+  --pack <pack dir> \
+  --native <model dir>/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+  --expert-profile data/expert-profile.bin \
+  --prefill auto \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp <mtp dir> \
+  --max-context 262144 \
+  --kv int8 \
+  --ple-io direct \
+  --stats \
+  --vision \
+  --expert-cache auto \
+  --ple-row-cache 1048576 \
+  --kv-resident 32768 \
+  --pcie-frac 0 \
+  --vram-reserve-mib 512 \
+  --pool-workers 12 \
+  --mtp-q4 all \
+  --mtp-window 4096
+```
+
+## Unsloth UD-Q4_K_XL, 2 GPUs
+
+```
+STRATA_HIPBLASLT_TUNING=tools/hip/gfx1100-hipblaslt-100200.txt
+STRATA_RDNA_MMVQ_WAVE=3
+STRATA_PEER_TRANSPORT=host
+STRATA_HIP_WMMA=1
+STRATA_SELECT_WMMA=1
+STRATA_PREFILL_CPU_SHARE=auto
+STRATA_HC_Q8=0
+STRATA_PREFILL_AUTO_MAX=32768
+STRATA_PREFILL_RING=384
+STRATA_ROUTE_TAIL_SKIP=0
+STRATA_HEAD_MIX_MULTI=1
+STRATA_ONE_TOKEN_COMMIT=0
+STRATA_AUX_CPUS=off
+STRATA_GR_RDNA=1
+STRATA_GR_RDNA_Q8=1
+STRATA_RDNA_Q6K=1
+STRATA_GR_RDNA_A8=1
+GPU_MAX_HW_QUEUES=8
+STRATA_QFUSE=1
+STRATA_COMBINE_CPU=1
+STRATA_VERIFY_QDEDUP=1
+STRATA_WAIT_FUSE=1
+STRATA_ROUTE_PUBLISH=1
+STRATA_GR_INJ_UP=1
+STRATA_GR_FUSED=1
+STRATA_GDN_HEAD=1
+STRATA_GDN_CHUNKED=1
+STRATA_GDN_CHUNK_GDV=0
+STRATA_PA_KLDS=1
+STRATA_GDN_PP=1
+STRATA_GDN_CONVL2=1
+STRATA_GDN_NOY=1
+STRATA_PF_GEMM=1
+STRATA_PF_PAD=1
+STRATA_HC_UPMIX=1
+STRATA_PF_HCDOWN=1
+STRATA_FUSE_CONVAB=1
+STRATA_PA_FAST=1
+STRATA_PF_GROUP_RES=1
+STRATA_KV_HOST_DMA=1
+STRATA_DP_PREFILL=1
+
+strata --serve \
+  --pack <pack dir> \
+  --native <model dir>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --expert-profile data/expert-profile.bin \
+  --prefill auto \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp <mtp dir> \
+  --max-context 262144 \
+  --kv int8 \
+  --ple-io direct \
+  --stats \
+  --pool-workers 8 \
+  --expert-cache auto \
+  --vision \
+  --ple-row-cache 1048576 \
+  --kv-resident 32768 \
+  --pipeline-windows 2 \
+  --mtp-q4 all \
+  --mtp-window 4096 \
+  --pcie-frac 0 \
+  --vram-reserve-mib 512
+```
+
+## Unsloth UD-Q4_K_XL, 1 GPU
+
+```
+STRATA_HIPBLASLT_TUNING=tools/hip/gfx1100-hipblaslt-100200.txt
+STRATA_RDNA_MMVQ_WAVE=3
+STRATA_PEER_TRANSPORT=host
+STRATA_HIP_WMMA=1
+STRATA_SELECT_WMMA=1
+STRATA_SH_STREAM=0
+STRATA_GR_RDNA=1
+STRATA_GR_RDNA_Q8=1
+STRATA_RDNA_Q6K=1
+STRATA_GR_RDNA_A8=1
+GPU_MAX_HW_QUEUES=6
+STRATA_QFUSE=1
+STRATA_COMBINE_CPU=1
+STRATA_VERIFY_QDEDUP=1
+STRATA_WAIT_FUSE=1
+STRATA_ROUTE_PUBLISH=1
+STRATA_GR_INJ_UP=1
+STRATA_PREFILL_CPU_SHARE=auto
+STRATA_PREFILL_CPU_SHARE_MAX=6144
+STRATA_GR_FUSED=1
+STRATA_GDN_HEAD=1
+STRATA_GDN_CHUNKED=1
+STRATA_GDN_CHUNK_GDV=0
+STRATA_PA_KLDS=1
+STRATA_GDN_PP=1
+STRATA_GDN_CONVL2=1
+STRATA_GDN_NOY=1
+STRATA_PF_GEMM=1
+STRATA_PF_PAD=1
+STRATA_HC_UPMIX=1
+STRATA_PF_HCDOWN=1
+STRATA_FUSE_CONVAB=1
+STRATA_HEAD_MIX_MULTI=1
+STRATA_PA_FAST=1
+STRATA_PF_GROUP_RES=1
+STRATA_KV_HOST_DMA=1
+STRATA_STAGER_RING=64
+STRATA_PF_FUSED=1
+STRATA_PF_FUSED_KQ=1
+STRATA_PF_F16=2
+STRATA_PREFILL_RING=384
+
+strata --serve \
+  --pack <pack dir> \
+  --native <model dir>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --expert-profile data/expert-profile.bin \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp <mtp dir> \
+  --max-context 262144 \
+  --kv int8 \
+  --ple-io direct \
+  --stats \
+  --expert-cache auto \
+  --vision \
+  --ple-row-cache 1048576 \
+  --kv-resident 32768 \
+  --pcie-frac 0 \
+  --vram-reserve-mib 512 \
+  --pool-workers 12 \
+  --mtp-q4 all \
+  --prefill 32768 \
+  --mtp-window 4096
+```
