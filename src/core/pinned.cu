@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <climits>
 #include <cerrno>
@@ -586,6 +587,78 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
     st.ok = true;
     st.bytes = bytes;
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+#elif defined(__linux__)
+    // [claude] the same reader on Linux: O_DIRECT preads straight into the arena (it is a byte image of the file), no
+    // bounce buffer and no file-cache pages.  A buffered read of a cold file goes to the drive one 128 KiB readahead
+    // window at a time per thread (6 readers: 1.2 GiB/s on a Crucial P3 Plus that streams 1.95 GiB/s unbuffered), and
+    // its 30-77 GB of cache pages have to be reclaimed while the pinned arena holds the same bytes.  Unaligned
+    // ranges or a refused O_DIRECT: ok = false with no error, so the caller falls back to the buffered reader.
+    constexpr uint64_t kAlign = 4096;
+    if (((uintptr_t) dst % kAlign) != 0 || chunk == 0 || chunk % kAlign != 0) return st;
+    struct Piece { uint64_t off, n; int layer; };
+    std::vector<Piece> pieces;
+    uint64_t bytes = 0;
+    for (size_t L = 0; L < layer_off.size(); ++L) {
+        if (layer_off[L] % kAlign != 0 || layer_bytes[L] % kAlign != 0) return st;
+        for (uint64_t p = 0; p < layer_bytes[L]; p += chunk)
+            pieces.push_back({layer_off[L] + p, std::min<uint64_t>(chunk, layer_bytes[L] - p), (int) L});
+        bytes += layer_bytes[L];
+    }
+    {
+        const int probe = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (probe < 0) return st;   // e.g. tmpfs refuses O_DIRECT: buffered
+        ::close(probe);
+    }
+    if (threads < 1) threads = 1;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<size_t> next{0};
+    std::mutex err_mu;
+    std::string err;
+    auto worker = [&]() {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (fd < 0) {
+            std::lock_guard<std::mutex> g(err_mu);
+            if (err.empty()) err = "cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
+            next = pieces.size();
+            return;
+        }
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= pieces.size()) break;
+            if (ready != nullptr)      // the slice must be registered before its pages are touched
+                while (ready->load(std::memory_order_acquire) <= pieces[i].layer + 1) std::this_thread::yield();
+            uint64_t got = 0;
+            while (got < pieces[i].n) {
+                const ssize_t r = ::pread(fd, dst + pieces[i].off + got, (size_t) (pieces[i].n - got),
+                                          (off_t) (pieces[i].off + got));
+                if (r < 0 && errno == EINTR) continue;
+                if (r <= 0) {   // an error or EOF: never a silent zero fill
+                    std::lock_guard<std::mutex> g(err_mu);
+                    if (err.empty())
+                        err = "short unbuffered read at offset " + std::to_string(pieces[i].off + got) + ": got " +
+                              std::to_string(got) + " of " + std::to_string(pieces[i].n) + " B" +
+                              (r < 0 ? std::string(" (") + std::strerror(errno) + ")" : std::string(" (end of file)"));
+                    next = pieces.size();
+                    break;
+                }
+                got += (uint64_t) r;
+            }
+        }
+        ::close(fd);
+    };
+    std::vector<std::thread> pool;
+    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+    st.layers = layer_off.size();
+    if (!err.empty()) {
+        st.seconds = -1.0;
+        st.error = err;
+        return st;
+    }
+    st.ok = true;
+    st.bytes = bytes;
+    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 #else
     (void) path; (void) dst; (void) layer_off; (void) layer_bytes; (void) threads; (void) chunk; (void) ready;
 #endif
@@ -654,9 +727,60 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
                       keepable ? "can" : "cannot");
     why = msg;
     return (!cached || !cache_counts) && !keepable;
+#elif defined(__linux__)
+    // [claude] the Windows rule on Linux: unbuffered when the drive is read anyway (the files are not in the cache) and
+    // the cache could not keep them beside the arena for the next start either.  `arena_bytes` is what the arena still
+    // has to take: a registered (pinned) arena is resident already and out of MemAvailable.  Cached pages are sampled
+    // with mincore (64 pages per file) instead of timed reads.
+    uint64_t total_bytes = 0, sampled = 0, resident = 0;
+    for (const std::string& f : files) {
+        const int fd = ::open(f.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        struct stat sb{};
+        if (fstat(fd, &sb) == 0 && sb.st_size > 0) {
+            const uint64_t size = (uint64_t) sb.st_size;
+            total_bytes += size;
+            void* m = mmap(nullptr, (size_t) size, PROT_READ, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED) {
+                const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+                for (int i = 0; i < 64; ++i) {
+                    const uint64_t at = size / 64 * (uint64_t) i / page * page;
+                    unsigned char v = 0;
+                    if (mincore((uint8_t*) m + at, (size_t) page, &v) == 0) {
+                        ++sampled;
+                        resident += v & 1;
+                    }
+                }
+                munmap(m, (size_t) size);
+            }
+        }
+        ::close(fd);
+    }
+    const bool cached = sampled > 0 && resident * 4 >= sampled * 3;
+    uint64_t avail = 0;
+    if (std::FILE* mi = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof line, mi))
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { avail = (uint64_t) kb << 10; break; }
+        std::fclose(mi);
+    }
+    if (avail == 0) {
+        why = "buffered (the available RAM is unknown)";
+        return false;
+    }
+    const uint64_t need = read_bytes == kAllFileBytes ? total_bytes : read_bytes;
+    const bool keepable = strata::platform::file_cache_keeps(avail, arena_bytes, need);
+    char msg[256];
+    std::snprintf(msg, sizeof msg, "%llu of %llu sampled pages in the file cache; %.1f GiB available, %.1f GiB still to "
+                  "be taken by the arena, %.1f GiB of files: the cache %s keep them",
+                  (unsigned long long) resident, (unsigned long long) sampled, (double) avail / (1ull << 30),
+                  (double) arena_bytes / (1ull << 30), (double) need / (1ull << 30), keepable ? "can" : "cannot");
+    why = msg;
+    return (!cached || !cache_counts) && !keepable;
 #else
     (void) files; (void) arena_bytes; (void) cache_counts; (void) read_bytes;
-    why = "buffered (not Windows)";
+    why = "buffered (no unbuffered reads on this platform)";
     return false;
 #endif
 }

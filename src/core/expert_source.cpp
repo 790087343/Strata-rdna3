@@ -4600,7 +4600,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         files.push_back(path);
     }
     std::string why;
-    const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
+#if defined(__linux__)
+    // [claude] the registration above made the pinned part of the arena resident: it is out of MemAvailable already
+    const uint64_t arena_left = want + (uint64_t) blob - std::min<uint64_t>(a->registered_bytes, want + (uint64_t) blob);
+#else
+    const uint64_t arena_left = want + (uint64_t) blob;
+#endif
+    bool unbuffered = experts_unbuffered(files, arena_left, why);
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
     std::atomic<int> ready{0};
@@ -4618,7 +4624,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp);
     } else {
         if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
-        if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
+        if (unbuffered && !st.ok && st.error.empty()) {   // unaligned ranges or no O_DIRECT: the buffered reader
+            unbuffered = false;
+            why += "; the unbuffered reader declined (unaligned ranges or no O_DIRECT)";
+        }
+        if (!unbuffered)
             st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp);
     }
     if (reg.joinable()) reg.join();
