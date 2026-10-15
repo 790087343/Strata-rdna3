@@ -115,3 +115,18 @@ the engine's own timings; a cell is the median of the three. It prints a table a
 What to expect: correctness checks pass every time. Speeds within a few percent of the reference on the same
 hardware, with decode varying more than prefill (it depends on how many MTP drafts are accepted, and on the
 cards' clocks and temperature). A 1K-8K first cell can read lower while the cards warm up.
+
+## Checked from scratch
+
+On 2026-10-14, a fresh anonymous clone of this repository (commit `7b30f1bb`) went through steps 1-6 exactly as
+written above, with system Python 3.14. The fresh install was kept apart from an existing Strata install with
+`XDG_CONFIG_HOME`. The results:
+
+- the model files matched `SHA256SUMS`;
+- the three `experts.bin`, the packs' `dense.bin`, `index.txt` and `conversions.json`, and the MTP head came out
+  byte-identical to the ones the README was measured with;
+- all 162 benchmark requests (6 setups x 9 lengths x 3) passed every check;
+- prefill was within 0.97-1.03x of `reference.json` in every cell;
+- decode was within 0.95-1.09x of `reference.json` in every cell but one. The exception, `iq3-1gpu` at 4K, read
+  1.26x: the reference cell there is low (86 tok/s against 95-108 for its neighbours).
+
