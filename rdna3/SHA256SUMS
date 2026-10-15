@@ -1,5 +1,5 @@
 # model files as published (Hugging Face ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF, unsloth): in setup.py's data folder
-# cd $D/models && sha256sum -c <repo>/rdna3/SHA256SUMS
+# cd $D/models && sha256sum -c <(grep -v -e "^#" -e packs/ <repo>/rdna3/SHA256SUMS)
 4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb86465e0f7d2aca3  IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
 316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113  IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
 b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0  mmproj-Qwen3.8-Flash-Next-BF16.gguf
@@ -11,7 +11,7 @@ d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833  unsloth-UD-IQ4
 56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3  unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf
 753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a  unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf
 # step 4's expert files (tools/iq_pack.py --experts-bin), byte-identical to the ones the README was measured with:
-# cd $D && sha256sum -c <(grep packs/ <repo>/rdna3/SHA256SUMS)
+# cd $D && sha256sum -c <(grep "  packs/" <repo>/rdna3/SHA256SUMS)
 ed9d0a872b4d9fb992a05f3f5114107b0689767f0d95e2fb7e2ffe091000e67c  packs/iq3_s/experts.bin
 e943ad2da0ff1e7c8c15e086c04a1ba09d9d3268211fa8f07621e34741de64fa  packs/unsloth-ud-iq4_xs/experts.bin
 11729cf107eebc4b31b9847aa6038f8db67bc404fd9f41a8cd702e351d0342fd  packs/unsloth-ud-q4_k_xl/experts.bin
