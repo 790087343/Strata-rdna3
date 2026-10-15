@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SETUPS = [f"{q}-{g}gpu" for q in ("iq3", "iq4", "q4") for g in (1, 2)]
-PACKS = {"iq3": ("qwen-iq3_s", "qwen-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"),
+PACKS = {"iq3": ("iq3_s", "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"),   # setup.py's folder names
          "iq4": ("unsloth-ud-iq4_xs", "unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"),
          "q4": ("unsloth-ud-q4_k_xl", "unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")}
 

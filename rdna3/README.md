@@ -16,7 +16,7 @@ Everything needed to rebuild the engine and re-measure the README's table and ch
 | ROCm | TheRock wheels `rocm-sdk-*==7.10.0a20251120`, `gfx110X-dgpu` index, installed into `.venv` by `setup.py` |
 | rocWMMA | headers at commit `1ab208f4` (tag `rocm-7.1.1`), fetched by `setup.py` |
 | llama.cpp (ggml, gguf-py) | commit `3cf03257`, fetched by `setup.py` |
-| cmake, ninja | 4.4.3 and 1.13.2 from pip (`requirements.txt`) |
+| cmake, ninja | from `PATH` when present (here cmake 4.2.3, ninja 1.13.2), else 4.4.3 / 1.13.2 from pip (`requirements.txt`) |
 | Engine | this branch (`rdna3`), compiled by `./setup.sh --build` |
 
 RAM: a 1-GPU setup keeps the experts that do not fit the card in RAM, so you need roughly the size of the pack's
@@ -45,14 +45,23 @@ compiles the engine and the CPU image encoder for gfx1100 with the fork's option
 `STRATA_ROCWMMA_INCLUDE_DIR`; 10-20 minutes). Later runs reuse all of that. Each run downloads its model's GGUF
 shards from Hugging Face (checked against their published sha256), writes its pack, and fetches the MTP draft head.
 
+> [!WARNING]
+> `setup.py` (upstream behaviour) **moves** the model files of every Strata install it ran from before, listed in
+> `~/.config/strata/settings.json`, into the data folder you give it. If this PC already has a Strata install whose
+> models you want to keep where they are, give this one its own settings: `export XDG_CONFIG_HOME=$PWD/.config`
+> before the commands below (and before every later `./setup.sh`).
+
 ```bash
-D=../Strata-data          # models/, packs/, mtp/ (~100 GB per model, more for the packs)
+D=$PWD/../Strata-data     # models/, packs/, mtp/: an absolute path
 ./setup.sh --setup --build --backend hip --family qwen    --model IQ3_S      --vision cpu --data-dir $D --no-start --yes
 ./setup.sh --setup --build --backend hip --family unsloth --model UD-IQ4_XS  --vision cpu --data-dir $D --no-start --yes
 ./setup.sh --setup --build --backend hip --family unsloth --model UD-Q4_K_XL --vision cpu --data-dir $D --no-start --yes
 ```
 
-Already have the GGUFs? Add `--gguf-dir <folder with every shard>`. `UD-Q4_K_XL` prints a warning about AMD cards:
+Already have the GGUFs? Put them, under their original names, in `$D/models/IQ3_S/`, `$D/models/unsloth-UD-IQ4_XS/`
+and `$D/models/unsloth-UD-Q4_K_XL/` before running setup (it then only checks that each file is whole), and compare
+them with [`SHA256SUMS`](SHA256SUMS). `--gguf-dir` also works for running the model with `./setup.sh`, but
+`rdna3/run.py` expects the files in `$D/models/`. `UD-Q4_K_XL` prints a warning about AMD cards:
 that warning is upstream's, written before this fork's K-quant prompt kernels; `--yes` accepts it.
 
 ## 4. One expert file per model
@@ -63,8 +72,8 @@ the engine reads them, written once:
 
 ```bash
 export STRATA_GGUF_PY=$PWD/third_party/llama.cpp/gguf-py
-.venv/bin/python tools/iq_pack.py --gguf $D/models/qwen-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
-    --out $D/packs/qwen-iq3_s --experts-bin
+.venv/bin/python tools/iq_pack.py --gguf $D/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+    --out $D/packs/iq3_s --experts-bin
 .venv/bin/python tools/iq_pack.py --gguf $D/models/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
     --out $D/packs/unsloth-ud-iq4_xs --experts-bin
 .venv/bin/python tools/iq_pack.py --gguf $D/models/unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \

@@ -1,7 +1,7 @@
 {
  "exe": "@STRATA@/engine/strata",
  "cwd": "@STRATA@",
- "tokenizer": "@DATA@/packs/qwen-iq3_s/tokenizer",
+ "tokenizer": "@DATA@/packs/iq3_s/tokenizer",
  "model_name": "qwen-flash-iq3",
  "backend": "hip",
  "gpu": "@GPUS@",
@@ -12,9 +12,9 @@
  "lib_dirs": "@ROCM_LIBS@",
  "args": [
   "--pack",
-  "@DATA@/packs/qwen-iq3_s",
+  "@DATA@/packs/iq3_s",
   "--native",
-  "@DATA@/models/qwen-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "@DATA@/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
   "--expert-profile",
   "@STRATA@/data/expert-profile.bin",
   "--prefill",
@@ -110,7 +110,7 @@
  "vision": {
   "exe": "@STRATA@/engine/strata-vision",
   "mmproj": "@DATA@/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
-  "model": "@DATA@/models/qwen-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "model": "@DATA@/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
   "gpu": false,
   "max_tokens": 4096,
   "threads": 16
