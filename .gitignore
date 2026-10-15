@@ -29,6 +29,7 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp
+/third_party/rocwmma
 /models/
 /packs/
 /mtp/
@@ -61,3 +62,5 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+/rdna3/state/
+/rdna3/results/

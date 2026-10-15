@@ -1,0 +1,231 @@
+{
+ "_about": "README run, 2026-10-13: median of 3 per cell, tokens/s (engine timings); HIP devices 1 and 1,0",
+ "iq3-1gpu": {
+  "1024": {
+   "prefill": 763.2,
+   "decode": 94.7
+  },
+  "2048": {
+   "prefill": 1091.2,
+   "decode": 95.7
+  },
+  "4096": {
+   "prefill": 1516.0,
+   "decode": 86.4
+  },
+  "8192": {
+   "prefill": 2384.9,
+   "decode": 95.7
+  },
+  "16384": {
+   "prefill": 3069.7,
+   "decode": 87.4
+  },
+  "32768": {
+   "prefill": 3431.5,
+   "decode": 100.0
+  },
+  "65536": {
+   "prefill": 3520.0,
+   "decode": 98.1
+  },
+  "131072": {
+   "prefill": 3436.1,
+   "decode": 100.4
+  },
+  "261632": {
+   "prefill": 3090.7,
+   "decode": 93.6
+  }
+ },
+ "iq3-2gpu": {
+  "1024": {
+   "prefill": 1074.6,
+   "decode": 126.2
+  },
+  "2048": {
+   "prefill": 1498.5,
+   "decode": 121.4
+  },
+  "4096": {
+   "prefill": 2243.0,
+   "decode": 123.5
+  },
+  "8192": {
+   "prefill": 3042.9,
+   "decode": 126.1
+  },
+  "16384": {
+   "prefill": 4409.2,
+   "decode": 124.2
+  },
+  "32768": {
+   "prefill": 6020.1,
+   "decode": 124.3
+  },
+  "65536": {
+   "prefill": 6322.7,
+   "decode": 120.2
+  },
+  "131072": {
+   "prefill": 6425.9,
+   "decode": 122.9
+  },
+  "261632": {
+   "prefill": 5908.7,
+   "decode": 118.2
+  }
+ },
+ "iq4-1gpu": {
+  "1024": {
+   "prefill": 656.7,
+   "decode": 87.0
+  },
+  "2048": {
+   "prefill": 935.5,
+   "decode": 86.6
+  },
+  "4096": {
+   "prefill": 1341.7,
+   "decode": 81.0
+  },
+  "8192": {
+   "prefill": 1992.0,
+   "decode": 78.6
+  },
+  "16384": {
+   "prefill": 2761.0,
+   "decode": 82.5
+  },
+  "32768": {
+   "prefill": 3140.5,
+   "decode": 77.7
+  },
+  "65536": {
+   "prefill": 3250.8,
+   "decode": 81.0
+  },
+  "131072": {
+   "prefill": 3201.4,
+   "decode": 82.5
+  },
+  "261632": {
+   "prefill": 2903.0,
+   "decode": 77.5
+  }
+ },
+ "iq4-2gpu": {
+  "1024": {
+   "prefill": 917.2,
+   "decode": 117.6
+  },
+  "2048": {
+   "prefill": 1227.1,
+   "decode": 118.1
+  },
+  "4096": {
+   "prefill": 1622.7,
+   "decode": 108.3
+  },
+  "8192": {
+   "prefill": 2219.7,
+   "decode": 108.5
+  },
+  "16384": {
+   "prefill": 3706.2,
+   "decode": 106.9
+  },
+  "32768": {
+   "prefill": 5549.7,
+   "decode": 110.8
+  },
+  "65536": {
+   "prefill": 6069.5,
+   "decode": 109.3
+  },
+  "131072": {
+   "prefill": 6193.2,
+   "decode": 112.0
+  },
+  "261632": {
+   "prefill": 5727.6,
+   "decode": 108.4
+  }
+ },
+ "q4-1gpu": {
+  "1024": {
+   "prefill": 495.7,
+   "decode": 61.2
+  },
+  "2048": {
+   "prefill": 741.8,
+   "decode": 66.3
+  },
+  "4096": {
+   "prefill": 1101.8,
+   "decode": 68.3
+  },
+  "8192": {
+   "prefill": 1539.8,
+   "decode": 67.9
+  },
+  "16384": {
+   "prefill": 2819.5,
+   "decode": 63.6
+  },
+  "32768": {
+   "prefill": 3511.4,
+   "decode": 67.5
+  },
+  "65536": {
+   "prefill": 3625.0,
+   "decode": 65.7
+  },
+  "131072": {
+   "prefill": 3556.1,
+   "decode": 67.0
+  },
+  "261632": {
+   "prefill": 3127.4,
+   "decode": 56.2
+  }
+ },
+ "q4-2gpu": {
+  "1024": {
+   "prefill": 726.2,
+   "decode": 109.7
+  },
+  "2048": {
+   "prefill": 1000.2,
+   "decode": 106.7
+  },
+  "4096": {
+   "prefill": 1024.1,
+   "decode": 112.1
+  },
+  "8192": {
+   "prefill": 1403.3,
+   "decode": 102.6
+  },
+  "16384": {
+   "prefill": 2924.4,
+   "decode": 105.9
+  },
+  "32768": {
+   "prefill": 4710.8,
+   "decode": 97.5
+  },
+  "65536": {
+   "prefill": 5592.2,
+   "decode": 99.2
+  },
+  "131072": {
+   "prefill": 5723.9,
+   "decode": 101.7
+  },
+  "261632": {
+   "prefill": 5308.8,
+   "decode": 92.7
+  }
+ }
+}

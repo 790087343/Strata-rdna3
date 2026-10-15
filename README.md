@@ -46,7 +46,12 @@ two; decode 55.7 -> 77.7 and 51.2 -> 110.8 tok/s.
   loads at ~1.9 instead of ~1.0 GiB/s).
 - Fixes: MTP top-2 accounting, a one-token-window commit, a host deadlock in fused prefill batches.
 
-**Build** (Linux, ROCm 7 Python wheels as installed by `setup.py`, plus rocWMMA headers for the matrix-core paths):
+**Reproduce it:** [`rdna3/README.md`](rdna3/README.md) goes from a clean Linux install to the table above: pinned
+toolchain (`./setup.sh --build` installs ROCm, rocWMMA and llama.cpp at fixed versions and compiles the engine with
+the fork's options), the six measured setups as ready configs (`rdna3/run.py`), and the benchmark that produced the
+numbers (`rdna3/bench.py`, compared against `rdna3/reference.json`).
+
+**Manual build** (what `./setup.sh --build` runs on gfx1100; ROCm from its `.venv`, rocWMMA headers at `1ab208f4`):
 
 ```bash
 R=<rocm sdk root>  # e.g. .venv/lib/python3.13/site-packages/_rocm_sdk_devel

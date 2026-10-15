@@ -165,6 +165,10 @@ def ms_meta(repo: str, path: str):
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
+# [rdna3 fork] rocWMMA headers (tag rocm-7.1.1) for the gfx1100 matrix-core paths (STRATA_ROCWMMA_INCLUDE_DIR):
+# header-only, the commit the README numbers were built with
+ROCWMMA_COMMIT = "1ab208f49945c38626b79e3f0c284d65ac44a781"
+ROCWMMA_ZIP = f"https://github.com/ROCm/rocWMMA/archive/{ROCWMMA_COMMIT}.zip"
 
 # The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
@@ -1753,6 +1757,25 @@ def get_llama_cpp():
     return llama
 
 
+def get_rocwmma() -> Path:
+    """[rdna3 fork] rocWMMA at the pinned commit (headers only), as a zip like llama.cpp: <dir>/library/include."""
+    rw = ROOT / "third_party" / "rocwmma"
+    if (rw / "library" / "include" / "rocwmma" / "rocwmma.hpp").exists():
+        return rw
+    z = ROOT / "third_party" / f"rocwmma-{ROCWMMA_COMMIT[:7]}.zip"
+    download(ROCWMMA_ZIP, z, "rocWMMA headers")
+    tmp = ROOT / "third_party" / "_unpack_rocwmma"
+    shutil.rmtree(tmp, ignore_errors=True)
+    with zipfile.ZipFile(z) as f:
+        f.extractall(tmp, [m for m in f.namelist() if "/library/include/" in m])
+    shutil.rmtree(rw, ignore_errors=True)
+    shutil.move(str(next(tmp.iterdir())), str(rw))
+    shutil.rmtree(tmp, ignore_errors=True)
+    z.unlink(missing_ok=True)
+    z.with_name(z.name + ".done").unlink(missing_ok=True)
+    return rw
+
+
 def req_name(line: str) -> str:
     """The distribution name of a requirement line ("numpy==2.5.3; python_version >= '3.12'" -> "numpy")."""
     return re.split(r"[\s<>=!~;\[]", line.strip(), maxsplit=1)[0].lower().replace("_", "-")
@@ -2629,6 +2652,14 @@ def hipblaslt_table(arch, lib_dirs, ver=None):
     return None
 
 
+def rdna3_defs(archs) -> list:
+    """[rdna3 fork] gfx1100: the K-quant MMQ prompt kernels (UD-Q4_K_XL prefill is 7-13 % slower without them) and the
+    rocWMMA headers for the matrix-core QSA selection, as the README numbers were built; other cards as upstream."""
+    if "gfx1100" not in archs:
+        return []
+    return ["-DSTRATA_MMQ_KQUANTS=ON", f"-DSTRATA_ROCWMMA_INCLUDE_DIR={get_rocwmma() / 'library' / 'include'}"]
+
+
 def build_engine_hip(gpu, llama, vision="none") -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`).
     gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision "cpu"
@@ -2670,7 +2701,8 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
-                 f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
+                 f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta), *rdna3_defs(archs)],
+                None, "")
     shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
             "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {})}
