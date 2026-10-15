@@ -62,7 +62,7 @@ def config(setup, data, gpus=None, vision=True):
         # the measured setups read the experts from one prepacked file (rdna3/README.md, step 5)
         sys.exit(f"{pack / 'experts.bin'} is missing; write it once with\n"
                  f"  STRATA_GGUF_PY={ROOT / 'third_party/llama.cpp/gguf-py'} .venv/bin/python tools/iq_pack.py "
-                 f"--gguf {shard} --out {pack} --experts-bin")
+                 f"--gguf {shard} --out {pack}" + (" --compat-bf16" if "unsloth" in pack.name else "") + " --experts-bin")
     return cfg
 
 

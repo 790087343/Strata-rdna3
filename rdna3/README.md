@@ -75,12 +75,13 @@ export STRATA_GGUF_PY=$PWD/third_party/llama.cpp/gguf-py
 .venv/bin/python tools/iq_pack.py --gguf $D/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
     --out $D/packs/iq3_s --experts-bin
 .venv/bin/python tools/iq_pack.py --gguf $D/models/unsloth-UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
-    --out $D/packs/unsloth-ud-iq4_xs --experts-bin
+    --out $D/packs/unsloth-ud-iq4_xs --compat-bf16 --experts-bin
 .venv/bin/python tools/iq_pack.py --gguf $D/models/unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-    --out $D/packs/unsloth-ud-q4_k_xl --experts-bin
+    --out $D/packs/unsloth-ud-q4_k_xl --compat-bf16 --experts-bin
 ```
 
-(50, 60 and 77 GB.)
+(50, 60 and 77 GB. `--compat-bf16` is what `setup.py` passes for the Unsloth files: their Q8_0 hyper-connection
+projections become BF16, the form the engine reads; without it `iq_pack.py` stops before writing anything.)
 
 ## 5. Run a setup
 
