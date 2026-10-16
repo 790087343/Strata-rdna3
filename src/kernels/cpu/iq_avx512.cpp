@@ -15,6 +15,9 @@
 #include "ggml-common.h"
 
 #include <immintrin.h>
+#if !defined(_MSC_VER)
+#include <cpuid.h>
+#endif
 
 #include <cmath>
 #include <cstdlib>
@@ -240,7 +243,219 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
     }
 }
 
+// ---- IQ3_S, one token, bitwise ggml-cpu (2026-10-15)
+// ggml's AVX2 dot builds each 8-entry grid vector from 8 scalar loads (~2 uops an entry) and keeps 8 int32 lanes:
+// lane k = sum over the block's 8 sub-blocks of scale_sb * (entry k of sub-block sb) . (its 4 activations).  Here the
+// grid is split into 4 byte planes (byte b of every word), each looked up for the block's 64 indices with 4 vpermt2b
+// and 3 masked blends (index bit 7 from the qs byte, bit 8 from qh).  Two unpack rounds turn the planes into vectors
+// u_m whose dword (lane L, q) is entry 16L + 4m + q; the activation is permuted to match once per call and the
+// signs by one word transpose.  The integer sums land in exactly ggml's 8 lanes (integer adds are exact in any
+// order) and the float FMA and horizontal sum are ggml's, so every result is ggml's to the bit.
+alignas(64) uint8_t iq3s_plane[4][512];
+const bool iq3s_planes_ready = [] {
+    for (int e = 0; e < 512; ++e)
+        for (int b = 0; b < 4; ++b) iq3s_plane[b][e] = (uint8_t) (iq3s_grid[e] >> (8 * b));
+    return true;
+}();
+
+inline float hsum_float_8_ggml(const __m256 x) {   // ggml-cpu/arch/x86/quants.c hsum_float_8, verbatim
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+
+// yp[256 i + 64 m + 16 L + j] = y[i].qs[64 L + 16 m + j]: the activations in u_m's order
+inline void iq3s_permute_act(const block_q8_K* y, int nb, int8_t* yp) {
+    for (int i = 0; i < nb; ++i)
+        for (int m = 0; m < 4; ++m)
+            for (int L = 0; L < 4; ++L) std::memcpy(yp + 256 * i + 64 * m + 16 * L, y[i].qs + 64 * L + 16 * m, 16);
+}
+
+inline float iq3s_row_1t(const uint8_t* row, int nb, const block_q8_K* y, const int8_t* yp) {
+    const __m512i zero = _mm512_setzero_si512();
+    const __m256i widx = _mm256_setr_epi16(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m512i* T0 = (const __m512i*) iq3s_plane[0];
+    const __m512i* T1 = (const __m512i*) iq3s_plane[1];
+    const __m512i* T2 = (const __m512i*) iq3s_plane[2];
+    const __m512i* T3 = (const __m512i*) iq3s_plane[3];
+    __m256 accf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* b = row + (size_t) i * 110;   // d, qs[64], qh[8], signs[32], scales[4]
+        if (prefetch_ahead > 0) {
+            _mm_prefetch((const char*) b + prefetch_ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) b + prefetch_ahead + 64, _MM_HINT_T0);
+        }
+        const __m512i qs = _mm512_loadu_si512((const void*) (b + 2));
+        const __mmask64 m7 = _mm512_movepi8_mask(qs);
+        const __mmask64 m8 = _cvtu64_mask64(u64(b + 66));
+        auto plane = [&](const __m512i* T) {
+            const __m512i r0 = _mm512_permutex2var_epi8(_mm512_load_si512(T + 0), qs, _mm512_load_si512(T + 1));
+            const __m512i r1 = _mm512_permutex2var_epi8(_mm512_load_si512(T + 2), qs, _mm512_load_si512(T + 3));
+            const __m512i r2 = _mm512_permutex2var_epi8(_mm512_load_si512(T + 4), qs, _mm512_load_si512(T + 5));
+            const __m512i r3 = _mm512_permutex2var_epi8(_mm512_load_si512(T + 6), qs, _mm512_load_si512(T + 7));
+            return _mm512_mask_blend_epi8(m8, _mm512_mask_blend_epi8(m7, r0, r1), _mm512_mask_blend_epi8(m7, r2, r3));
+        };
+        const __m512i p0 = plane(T0), p1 = plane(T1), p2 = plane(T2), p3 = plane(T3);
+        const __m512i t0 = _mm512_unpacklo_epi8(p0, p1), t1 = _mm512_unpackhi_epi8(p0, p1);
+        const __m512i t2 = _mm512_unpacklo_epi8(p2, p3), t3 = _mm512_unpackhi_epi8(p2, p3);
+        const __m512i u0 = _mm512_unpacklo_epi16(t0, t2), u1 = _mm512_unpackhi_epi16(t0, t2);
+        const __m512i u2 = _mm512_unpacklo_epi16(t1, t3), u3 = _mm512_unpackhi_epi16(t1, t3);
+        alignas(32) uint64_t sm[4];
+        _mm256_store_si256((__m256i*) sm,
+                           _mm256_permutexvar_epi16(widx, _mm256_loadu_si256((const __m256i*) (b + 74))));
+        const uint8_t s0 = b[106], s1 = b[107], s2 = b[108], s3 = b[109];
+        const __m512i sce = scales4(2 * (s0 & 15) + 1, 2 * (s1 & 15) + 1, 2 * (s2 & 15) + 1, 2 * (s3 & 15) + 1);
+        const __m512i sco = scales4(2 * (s0 >> 4) + 1, 2 * (s1 >> 4) + 1, 2 * (s2 >> 4) + 1, 2 * (s3 >> 4) + 1);
+        const int8_t* a = yp + 256 * i;
+        auto part = [&](const __m512i& u, int m, const __m512i& sc) {
+            const __m512i yv = _mm512_loadu_si512((const void*) (a + 64 * m));
+            const __m512i ys = _mm512_mask_sub_epi8(yv, _cvtu64_mask64(sm[m]), zero, yv);
+            return _mm512_madd_epi16(_mm512_maddubs_epi16(u, ys), sc);
+        };
+        const __m512i lo = _mm512_add_epi32(part(u0, 0, sce), part(u2, 2, sco));   // entries k = 0..3
+        const __m512i hi = _mm512_add_epi32(part(u1, 1, sce), part(u3, 3, sco));   // entries k = 4..7
+        const __m256i l2 = _mm256_add_epi32(_mm512_castsi512_si256(lo), _mm512_extracti64x4_epi64(lo, 1));
+        const __m256i h2 = _mm256_add_epi32(_mm512_castsi512_si256(hi), _mm512_extracti64x4_epi64(hi, 1));
+        const __m128i l4 = _mm_add_epi32(_mm256_castsi256_si128(l2), _mm256_extracti128_si256(l2, 1));
+        const __m128i h4 = _mm_add_epi32(_mm256_castsi256_si128(h2), _mm256_extracti128_si256(h2, 1));
+        const __m256i sumi = _mm256_set_m128i(h4, l4);
+        const float d = h2f(u16(b)) * y[i].d;
+        accf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accf);
+    }
+    return hsum_float_8_ggml(accf);
+}
+
+// ---- IQ3_XXS, one token, bitwise ggml-cpu's ggml_vec_dot_iq3_xxs_q8_K AVX2 path (2026-10-15)
+// The same byte-plane decode with a 256-entry grid (2 vpermt2b + 1 blend a plane), the sign bytes from the 7-bit
+// keven_signs indices with one vpmultishiftqb and one vpermt2b into a table of their sign bits, ggml's lanes,
+// FMA order and final 0.25 * hsum.
+alignas(64) uint8_t iq3xxs_plane[4][256];
+alignas(64) uint8_t ksigns_bits[128];   // ksigns_iq2xs: bit b = the sign of weight b (ggml-cpu's keven_signs_q2xs bytes)
+const bool iq3xxs_tables_ready = [] {
+    for (int e = 0; e < 256; ++e)
+        for (int b = 0; b < 4; ++b) iq3xxs_plane[b][e] = (uint8_t) (iq3xxs_grid[e] >> (8 * b));
+    for (int i = 0; i < 128; ++i) ksigns_bits[i] = ksigns_iq2xs[i];
+    return true;
+}();
+
+inline float iq3xxs_row_1t(const uint8_t* row, int nb, const block_q8_K* y, const int8_t* yp) {
+    const __m512i zero = _mm512_setzero_si512();
+    const __m256i widx = _mm256_setr_epi16(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    // byte offsets 0, 7, 14, 21 of each 32-bit half: the four 7-bit sign indices of a sub-block
+    const __m512i msh = _mm512_set1_epi64(0x352E2720150E0700ll);
+    const __m512i T7 = _mm512_set1_epi8(127);
+    const __m512i sbA = _mm512_load_si512((const void*) ksigns_bits), sbB = _mm512_load_si512((const void*) (ksigns_bits + 64));
+    const __m512i* T0 = (const __m512i*) iq3xxs_plane[0];
+    const __m512i* T1 = (const __m512i*) iq3xxs_plane[1];
+    const __m512i* T2 = (const __m512i*) iq3xxs_plane[2];
+    const __m512i* T3 = (const __m512i*) iq3xxs_plane[3];
+    __m256 accf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* b = row + (size_t) i * 98;   // d, qs[64] grid indices, 8 x u32 signs + scale
+        if (prefetch_ahead > 0) {
+            _mm_prefetch((const char*) b + prefetch_ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) b + prefetch_ahead + 64, _MM_HINT_T0);
+        }
+        const __m512i qs = _mm512_loadu_si512((const void*) (b + 2));
+        const __mmask64 m7 = _mm512_movepi8_mask(qs);
+        auto plane = [&](const __m512i* T) {
+            const __m512i r0 = _mm512_permutex2var_epi8(_mm512_load_si512(T + 0), qs, _mm512_load_si512(T + 1));
+            const __m512i r1 = _mm512_permutex2var_epi8(_mm512_load_si512(T + 2), qs, _mm512_load_si512(T + 3));
+            return _mm512_mask_blend_epi8(m7, r0, r1);
+        };
+        const __m512i p0 = plane(T0), p1 = plane(T1), p2 = plane(T2), p3 = plane(T3);
+        const __m512i t0 = _mm512_unpacklo_epi8(p0, p1), t1 = _mm512_unpackhi_epi8(p0, p1);
+        const __m512i t2 = _mm512_unpacklo_epi8(p2, p3), t3 = _mm512_unpackhi_epi8(p2, p3);
+        const __m512i u0 = _mm512_unpacklo_epi16(t0, t2), u1 = _mm512_unpackhi_epi16(t0, t2);
+        const __m512i u2 = _mm512_unpacklo_epi16(t1, t3), u3 = _mm512_unpackhi_epi16(t1, t3);
+        // the 32 sign bytes (weights 8j..8j+7 of sub-block sb at byte 4 sb + j) in natural order, then u_m's masks
+        const __m256i aux = _mm256_loadu_si256((const __m256i*) (b + 66));
+        const __m512i sidx = _mm512_and_si512(_mm512_multishift_epi64_epi8(msh, _mm512_castsi256_si512(aux)), T7);
+        const __m512i sbits = _mm512_permutex2var_epi8(sbA, sidx, sbB);
+        alignas(32) uint64_t sm[4];
+        _mm256_store_si256((__m256i*) sm, _mm256_permutexvar_epi16(widx, _mm512_castsi512_si256(sbits)));
+        uint32_t a32[8];
+        std::memcpy(a32, b + 66, 32);
+        const __m512i sce = scales4(2 * (int) (a32[0] >> 28) + 1, 2 * (int) (a32[2] >> 28) + 1, 2 * (int) (a32[4] >> 28) + 1,
+                                    2 * (int) (a32[6] >> 28) + 1);
+        const __m512i sco = scales4(2 * (int) (a32[1] >> 28) + 1, 2 * (int) (a32[3] >> 28) + 1, 2 * (int) (a32[5] >> 28) + 1,
+                                    2 * (int) (a32[7] >> 28) + 1);
+        const int8_t* a = yp + 256 * i;
+        auto part = [&](const __m512i& u, int m, const __m512i& sc) {
+            const __m512i yv = _mm512_loadu_si512((const void*) (a + 64 * m));
+            const __m512i ys = _mm512_mask_sub_epi8(yv, _cvtu64_mask64(sm[m]), zero, yv);
+            return _mm512_madd_epi16(_mm512_maddubs_epi16(u, ys), sc);
+        };
+        const __m512i lo = _mm512_add_epi32(part(u0, 0, sce), part(u2, 2, sco));
+        const __m512i hi = _mm512_add_epi32(part(u1, 1, sce), part(u3, 3, sco));
+        const __m256i l2 = _mm256_add_epi32(_mm512_castsi512_si256(lo), _mm512_extracti64x4_epi64(lo, 1));
+        const __m256i h2 = _mm256_add_epi32(_mm512_castsi512_si256(hi), _mm512_extracti64x4_epi64(hi, 1));
+        const __m128i l4 = _mm_add_epi32(_mm256_castsi256_si128(l2), _mm256_extracti128_si256(l2, 1));
+        const __m128i h4 = _mm_add_epi32(_mm256_castsi256_si128(h2), _mm256_extracti128_si256(h2, 1));
+        const __m256i sumi = _mm256_set_m128i(h4, l4);
+        const float d = h2f(u16(b)) * y[i].d;
+        accf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accf);
+    }
+    return 0.25f * hsum_float_8_ggml(accf);
+}
+
 }  // namespace
+
+bool iq3xxs_1t_supported() noexcept { return iq3xxs_tables_ready && iq3s_1t_supported(); }
+
+void iq3xxs_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
+                       int r1) {
+    const block_q8_K* y = (const block_q8_K*) act;
+    const int nb = n / QK_K;
+    alignas(64) thread_local int8_t yp[16384];
+    if (n > 16384) return;
+    iq3s_permute_act(y, nb, yp);
+    for (int r = r0; r < r1; ++r) {
+        const float g = iq3xxs_row_1t(blob + (size_t) r * gu_row, nb, y, yp);
+        const float u = iq3xxs_row_1t(blob + up_off + (size_t) r * gu_row, nb, y, yp);
+        ff[r] = (g / (1.f + std::exp(-g))) * u;
+    }
+}
+
+bool iq3s_1t_supported() noexcept {
+    static const bool ok = [] {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+#if defined(_MSC_VER)
+        int x[4];
+        __cpuidex(x, 7, 0);
+        a = (unsigned) x[0]; b = (unsigned) x[1]; c = (unsigned) x[2]; d = (unsigned) x[3];
+#else
+        __cpuid_count(7, 0, a, b, c, d);
+#endif
+        return iq3s_planes_ready && ((b >> 30) & 1u) && ((b >> 16) & 1u) && ((c >> 1) & 1u);   // AVX512BW, F, VBMI
+    }();
+    return ok;
+}
+
+void iq3s_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
+                     int r1) {
+    const block_q8_K* y = (const block_q8_K*) act;
+    const int nb = n / QK_K;
+    alignas(64) thread_local int8_t yp[16384];
+    if (n > 16384) return;
+    iq3s_permute_act(y, nb, yp);
+    for (int r = r0; r < r1; ++r) {
+        const float g = iq3s_row_1t(blob + (size_t) r * gu_row, nb, y, yp);
+        const float u = iq3s_row_1t(blob + up_off + (size_t) r * gu_row, nb, y, yp);
+        ff[r] = (g / (1.f + std::exp(-g))) * u;
+    }
+}
+
+void iq3s_rows_1t(const uint8_t* w, size_t row_bytes, int n, const void* act, float* out, int r0, int r1) {
+    const block_q8_K* y = (const block_q8_K*) act;
+    const int nb = n / QK_K;
+    alignas(64) thread_local int8_t yp[16384];
+    if (n > 16384) return;
+    iq3s_permute_act(y, nb, yp);
+    for (int r = r0; r < r1; ++r) out[r] = iq3s_row_1t(w + (size_t) r * row_bytes, nb, y, yp);
+}
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {

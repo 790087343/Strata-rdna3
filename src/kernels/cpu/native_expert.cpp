@@ -156,6 +156,19 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // independent of the drafting: iq_avx1_parity checks every width bit for bit).
     static const bool avx1 = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
+    // IQ3_S below the multi-token rule: the byte-plane kernel, bit for bit ggml-cpu's dot here (2.6x per core on Zen 5;
+    // claude_cpubench parity: every IQ3_S layer of both packs).  STRATA_IQ3S_1T=0: ggml's.
+    static const bool iq3s_1t = avx512 && iq3s_1t_supported() && [] { const char* v = std::getenv("STRATA_IQ3S_1T"); return v == nullptr || std::atoi(v) != 0; }();
+    if (iq3s_1t && f.gu_type == 21 && nt == 1 && nt < mt_min) {
+        iq3s_gu_rows_1t(blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
+        return;
+    }
+    // IQ3_XXS the same way (bit for bit ggml's ggml_vec_dot_iq3_xxs_q8_K).  STRATA_IQ3XXS_1T=0: ggml's.
+    static const bool iq3xxs_1t = avx512 && iq3xxs_1t_supported() && [] { const char* v = std::getenv("STRATA_IQ3XXS_1T"); return v == nullptr || std::atoi(v) != 0; }();
+    if (iq3xxs_1t && f.gu_type == 18 && nt == 1 && nt < mt_min) {
+        iq3xxs_gu_rows_1t(blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
+        return;
+    }
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).

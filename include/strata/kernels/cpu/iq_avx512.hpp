@@ -15,4 +15,17 @@ void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
 
+/// IQ3_S gate/up rows for ONE token, bit for bit ggml-cpu's ggml_vec_dot_iq3_s_q8_K (its x86 AVX2 path: the same
+/// integer lanes, the same FMA order and horizontal sum), with the grid read through byte planes (vpermt2b) instead
+/// of 16 scalar lookups per 64 weights.  Needs AVX512-VBMI (iq3s_1t_supported).  `act` is one block_q8_K row.
+bool iq3s_1t_supported() noexcept;
+void iq3s_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
+                     int r1);
+/// IQ3_XXS gate/up rows for one token, bit for bit ggml-cpu's ggml_vec_dot_iq3_xxs_q8_K (the same byte planes)
+bool iq3xxs_1t_supported() noexcept;
+void iq3xxs_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
+                       int r1);
+/// the same IQ3_S dot for single rows (out[r] = w_r . a), rows [r0, r1)
+void iq3s_rows_1t(const uint8_t* w, size_t row_bytes, int n, const void* act, float* out, int r0, int r1);
+
 }  // namespace strata::kernels::cpu
