@@ -97,6 +97,7 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaDriverGetVersion hipDriverGetVersion
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaSetDeviceFlags hipSetDeviceFlags
@@ -106,6 +107,7 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemcpyPeer hipMemcpyPeer
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync

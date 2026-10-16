@@ -24,6 +24,7 @@
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaDriverGetVersion hipDriverGetVersion
@@ -97,6 +98,7 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemcpyPeer hipMemcpyPeer
 #define cudaMemcpyDefault hipMemcpyDefault
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
