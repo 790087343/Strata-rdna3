@@ -229,6 +229,8 @@ private:
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
+    bool bind_fused_helper(int64_t T);  // [claude] the same on the fused int8 kernels
+    bool make_stage_helper(Prefill* helper, std::string& err);  // [claude] set_stage_helper's streams and events
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
 
     std::string next_err_;

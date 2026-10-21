@@ -2944,7 +2944,57 @@ __global__ void f16_to_f32_wide_kernel(float4* __restrict__ dst, const uint4* __
     dst[2 * i] = make_float4(a.x, a.y, b.x, b.y);
     dst[2 * i + 1] = make_float4(c.x, c.y, e.x, e.y);
 }
+// [claude] the layer split's fused-path help: the routed pairs one card computes, the other's sums
+__global__ void help_remap_kernel(const int32_t* __restrict__ ids, const uint8_t* __restrict__ flag, int want,
+                                  int32_t* __restrict__ out, int64_t n, int ne) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int32_t e = ids[i];
+    out[i] = (int) flag[e] == want ? e : ne;
+}
+__global__ void help_sum16_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                  const float* __restrict__ w, const int32_t* __restrict__ ids_r, int ne,
+                                  uint16_t* __restrict__ out, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k)
+        if (ids_r[t * 10 + k] != ne) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    out[i] = hf_sat(s);
+}
+__global__ void moe_combine_help16_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                          const float* __restrict__ w, const int32_t* __restrict__ ids_r, int ne,
+                                          const float* __restrict__ shared, const float* __restrict__ sg,
+                                          const uint16_t* __restrict__ peer16, float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k)
+        if (ids_r[t * 10 + k] != ne) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    bo[i] = (s + __half2float(__ushort_as_half(peer16[i]))) + shared[i] * sigm(sg[t]);
+}
 }  // namespace
+void help_remap(const int32_t* ids, const uint8_t* flag, int want, int32_t* out, int64_t n, int ne, void* stream) {
+    if (n <= 0) return;
+    help_remap_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(ids, flag, want, out, n, ne);
+    check("help_remap");
+}
+void help_sum16(const float* Dm, const int32_t* slot, const float* w, const int32_t* ids_r, int ne, uint16_t* out,
+                int64_t T, void* stream) {
+    if (T <= 0) return;
+    help_sum16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, ids_r, ne, out, T);
+    check("help_sum16");
+}
+void moe_combine_help16(const float* Dm, const int32_t* slot, const float* w, const int32_t* ids_r, int ne,
+                        const float* shared, const float* sg, const uint16_t* peer16, float* bo, int64_t T, void* stream) {
+    moe_combine_help16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, ids_r, ne, shared, sg,
+                                                                                      peer16, bo, T);
+    check("moe_combine_help16");
+}
 void moe_combine_peer16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
                         const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream) {
     moe_combine_peer16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, peer16,

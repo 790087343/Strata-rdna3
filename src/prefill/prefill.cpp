@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <atomic>
 #include <condition_variable>
@@ -112,6 +113,7 @@ constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+constexpr int kHelpEvents = 512;    // [claude] the helper ring's events (the fused help may take more slots: STRATA_PREFILL_HELP_RING)
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
@@ -684,14 +686,40 @@ struct PeerPrefill {
     std::vector<int32_t> bounds_host;
     std::vector<void*> owned;
     int64_t layers = 0, experts = 0, rows = 0, over_cap = 0;   // stats
+    // [claude] FUSED HELP (a layer split's one-chunk prompt on the fused int8 kernels, STRATA_PREFILL_HELP=1): the
+    // helper card streams its share of the stage's experts into its ring and runs them on the same fused kernels from
+    // the stage's activations and routing (copied over P2P), then sends one FP16 sum per token back into the stage's
+    // GU (free once its own experts are done).  Both cards group the routing with a dummy expert NE that collects the
+    // other card's pairs.  On the stage's device: ids_rp, flag_p; on the helper's: the rest (its own stage's buffers).
+    bool fused = false;
+    bool borrow_streams = false;          // s / s_cp / s_out are the helper stage's own (cs, copy): not destroyed here
+    std::vector<char> fh_layer;           // [layer]: runs the native fused kernels (the help takes its experts)
+    int prim_dev = -1;
+    int32_t *ids_rp = nullptr, *ids_rh = nullptr, *hids = nullptr, *hslot = nullptr, *hsrc = nullptr;
+    uint8_t *flag_p = nullptr, *flag_h = nullptr;
+    void *hXq = nullptr, *hGU = nullptr, *hH = nullptr;
+    float *hw = nullptr, *hDm = nullptr;
+    uint16_t* hsum = nullptr;
+    size_t fh_cap = 0;                    // T * K the two ids_r buffers hold
+    size_t fh_layers = 0;                 // layers the flag buffers hold
+    cudaEvent_t ev_pdone = nullptr;       // on the stage: its own experts of the layer are done (GU is free)
+    std::vector<uint8_t> flag_host;
     ~PeerPrefill() {
         if (dev < 0) return;
         int prev = 0;
         cudaGetDevice(&prev);
+        if (prim_dev >= 0) {
+            cudaSetDevice(prim_dev);
+            if (ids_rp) cudaFree(ids_rp);
+            if (flag_p) cudaFree(flag_p);
+            if (ev_pdone) cudaEventDestroy(ev_pdone);
+        }
         cudaSetDevice(dev);
         if (s) cudaStreamSynchronize(s);
         ctx.reset();
         for (void* p : owned) cudaFree(p);
+        if (ids_rh) cudaFree(ids_rh);
+        if (flag_h) cudaFree(flag_h);
         if (ev_done) cudaEventDestroy(ev_done);
         if (s_out) cudaStreamSynchronize(s_out);
         for (cudaEvent_t e : ev_grp) if (e) cudaEventDestroy(e);
@@ -699,9 +727,11 @@ struct PeerPrefill {
         if (s_cp) cudaStreamSynchronize(s_cp);
         for (cudaEvent_t e : pcopied) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : pused) if (e) cudaEventDestroy(e);
-        if (s_cp) cudaStreamDestroy(s_cp);
-        if (s_out) cudaStreamDestroy(s_out);
-        if (s) cudaStreamDestroy(s);
+        if (!borrow_streams) {
+            if (s_cp) cudaStreamDestroy(s_cp);
+            if (s_out) cudaStreamDestroy(s_out);
+            if (s) cudaStreamDestroy(s);
+        }
         cudaSetDevice(prev);
         if (ev_in) cudaEventDestroy(ev_in);
         if (x_stream) { cudaStreamSynchronize(x_stream); cudaStreamDestroy(x_stream); }
@@ -1054,7 +1084,8 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
     // [claude] STRATA_PF_F16: H as FP16 [T K][640] and the activations as FP16 [T][N]
     const bool f16 = fused::f16_on();
-    return {std::max(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
+    // (n_expert + 1: the layer split's fused help groups the other card's pairs under a dummy expert)
+    return {std::max(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert + 1) + 3) / 4),
             std::max({ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4, f16 ? T * K * 640 / 2 : (size_t) 0}),
             std::max({mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N), f16 ? T * N * 2 : (size_t) 0}),
             mmq::q8_bytes((int64_t) (ts * K), 640)};
@@ -1563,12 +1594,34 @@ double split_help_frac(int64_t T) {
 }
 }  // namespace
 
+namespace {
+// [claude] a native pack with layers on the fused kernels (STRATA_PF_FUSED=1): its stage help is the fused one
+bool fused_help_pack() {
+    if (fused_ring()) return true;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || !mmq_plan().any) return false;
+    for (const auto& f : lay.fmt)
+        if (fused::native_supported(f.gu_type, f.d_type)) return true;
+    return false;
+}
+}  // namespace
+
 bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     Impl& m = *impl_;
     m.help_pp.reset();
+    helper_ = nullptr;
     if (helper == nullptr || helper == this || !split_help_env()) return true;
     const Impl& h = *helper->impl_;
     if (m.device < 0 || h.device < 0 || h.device == m.device || !mmq_plan().any) return true;
+    // [claude] the fused help sets itself up at the first prompt it helps (bind_stage_helper): a session that never
+    // reads a one-chunk prompt on two cards keeps none of its events
+    if (fused_help_pack()) { helper_ = helper; return true; }
+    return make_stage_helper(helper, err);
+}
+
+bool Prefill::make_stage_helper(Prefill* helper, std::string& err) {
+    Impl& m = *impl_;
+    const Impl& h = *helper->impl_;
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = nullptr;   // stream-only: it holds no experts, it streams a share of this stage's
     pp->compact = true;
@@ -1583,17 +1636,22 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     cudaGetDevice(&prev);
     pp->dev = h.device;
     cudaSetDevice(pp->dev);
-    ok = ok && cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
-         cudaStreamCreateWithFlags(&pp->s_out, cudaStreamNonBlocking) == cudaSuccess &&
-         cudaStreamCreateWithFlags(&pp->s_cp, cudaStreamNonBlocking) == cudaSuccess &&
-         cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
+    // [claude] the fused help runs on the helper stage's own streams (bound per prompt): three more streams per card
+    // took HW queues the decode's streams then shared (2 GPUs, 8 queues: decode -8..-16% with STRATA_PREFILL_HELP=1
+    // even when no prompt was helped)
+    pp->borrow_streams = fused_help_pack();
+    if (!pp->borrow_streams)
+        ok = ok && cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&pp->s_out, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&pp->s_cp, cudaStreamNonBlocking) == cudaSuccess;
+    ok = ok && cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
     for (int i = 0; ok && i < PeerPrefill::kGrpEv; ++i)
         ok = cudaEventCreateWithFlags(&pp->ev_grp[i], cudaEventDisableTiming) == cudaSuccess;
     for (int b = 0; ok && b < 2; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
     // the ring's events; its slots are the helper stage's own ring, bound per prompt (bind_stage_helper)
-    pp->pcopied.assign((size_t) kSplitHelpRing, nullptr);
-    pp->pused.assign((size_t) kSplitHelpRing, nullptr);
-    for (int i = 0; ok && i < kSplitHelpRing; ++i)
+    pp->pcopied.assign((size_t) kHelpEvents, nullptr);
+    pp->pused.assign((size_t) kHelpEvents, nullptr);
+    for (int i = 0; ok && i < kHelpEvents; ++i)
         ok = cudaEventCreateWithFlags(&pp->pcopied[(size_t) i], cudaEventDisableTiming) == cudaSuccess &&
              cudaEventCreateWithFlags(&pp->pused[(size_t) i], cudaEventDisableTiming) == cudaSuccess;
     cudaSetDevice(prev);
@@ -1603,11 +1661,123 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     return true;
 }
 
+namespace {
+// [claude] the fused help's share of a stage's streamed experts (STRATA_PREFILL_HELP_FRAC, default 0.5: both links
+// stream about as much) and the helper ring's slots (STRATA_PREFILL_HELP_RING, default 96)
+double fused_help_frac() {
+    static const double v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_HELP_FRAC");
+        return e ? std::clamp(std::atof(e), 0.0, 0.9) : 0.5;
+    }();
+    return v;
+}
+int fused_help_ring() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_HELP_RING");
+        return std::clamp(e ? std::atoi(e) : 96, 6, kHelpEvents);
+    }();
+    return v;
+}
+}  // namespace
+
+// [claude] the layer split's help on the fused int8 kernels (fused_ring()): a one-chunk prompt of T tokens whose every
+// layer of this stage runs the native fused kernels; the helper stage's own prompt buffers (it idles until this stage
+// hands over) take the activations, the routing, its grouping, H, Dm and its per-token sums
+bool Prefill::bind_fused_helper(int64_t T) {
+    Impl& m = *impl_;
+    // STRATA_PREFILL_TIMING: why a prompt is not helped, once per reason
+    auto no = [](const char* why) {
+        static std::set<std::string> said;
+        if (std::getenv("STRATA_PREFILL_TIMING") != nullptr && said.insert(why).second)
+            std::fprintf(stderr, "strata prefill: no fused help: %s\n", why);
+        return false;
+    };
+    const double frac = fused_help_frac();
+    if (frac <= 0.0) return no("share 0");
+    if (T < stream_all_min()) return no("below the fused path's chunk");
+    if (m.src == nullptr || m.ring <= STAGE) return no("this stage's layout does not stream");
+    if (core::peer_portable()) return no("--peer-device");   // --peer-device: the fused path is off (no_peer)
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native) return no("not a native pack");
+    std::vector<char> fl((size_t) std::max<int64_t>(stage_le_, 0), 0);
+    bool any = false;
+    for (int64_t l = stage_lb_; l < stage_le_; ++l) {   // the layers the loop runs fused (fused_nat there)
+        const MmqPlan& mp = mmq_plan();
+        fl[(size_t) l] = mp.any && (mp.layer[(size_t) l] || mp.fo[(size_t) l]) &&
+                         fused::native_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type);
+        any |= fl[(size_t) l] != 0;
+    }
+    if (!any) return no("no layer of this stage runs the fused kernels");
+    Impl& h = *helper_->impl_;
+    if (h.T < T || h.ring <= STAGE || h.Xq == nullptr || h.GU == nullptr || h.H == nullptr ||
+        h.Dm == nullptr || h.ids == nullptr || h.w == nullptr || h.slot_dev == nullptr || h.src_dev == nullptr ||
+        h.bo == nullptr)
+        return no(h.T < T ? "the helper's layout is smaller" : "the helper's buffers");
+    // the sums come back into this stage's H (free once its own experts of the layer are done): T x N FP16
+    if ((size_t) moe_bufs((size_t) m.T, m.g->n_expert, m.fused_bufs).h * 4 < (size_t) T * N * 2 || m.H == nullptr)
+        return no("H cannot hold the sums");
+    if (h.cs == nullptr || h.copy == nullptr) return no("the helper's streams");
+    PeerPrefill& P = *m.help_pp;
+    P.fused = true;
+    P.fh_layer = std::move(fl);
+    if (P.borrow_streams) { P.s = h.cs; P.s_cp = h.copy; P.s_out = h.copy; }
+    P.prim_dev = m.device;
+    P.ps_frac = frac;
+    P.T_max = T;
+    P.RP = std::min(h.ring, fused_help_ring());
+    P.pstage.assign(h.stage_dev, h.stage_dev + P.RP);
+    P.plive.assign((size_t) P.RP, 0);
+    P.hXq = h.Xq; P.hids = h.ids; P.hw = h.w; P.hGU = h.GU; P.hslot = h.slot_dev; P.hsrc = h.src_dev;
+    P.hH = h.H; P.hDm = h.Dm; P.hsum = reinterpret_cast<uint16_t*>(h.bo);
+    const size_t tk = (size_t) std::max<int64_t>(m.T, T) * K;
+    const size_t nl = (size_t) m.g->n_layers;
+    if (P.fh_cap < tk || P.fh_layers < nl || P.ev_pdone == nullptr) {
+        {
+            const core::OnDevice on(m.device);
+            if (P.ids_rp) cudaFree(P.ids_rp);
+            if (P.flag_p) cudaFree(P.flag_p);
+            P.ids_rp = nullptr; P.flag_p = nullptr;
+            bool ok = cudaMalloc((void**) &P.ids_rp, tk * 4) == cudaSuccess &&
+                      cudaMalloc((void**) &P.flag_p, nl * NE) == cudaSuccess &&
+                      (P.ev_pdone != nullptr || cudaEventCreateWithFlags(&P.ev_pdone, cudaEventDisableTiming) == cudaSuccess);
+            if (!ok) { cudaGetLastError(); P.fh_cap = 0; return no("VRAM for the tables"); }
+        }
+        {
+            const core::OnDevice on(P.dev);
+            if (P.ids_rh) cudaFree(P.ids_rh);
+            if (P.flag_h) cudaFree(P.flag_h);
+            P.ids_rh = nullptr; P.flag_h = nullptr;
+            if (cudaMalloc((void**) &P.ids_rh, tk * 4) != cudaSuccess || cudaMalloc((void**) &P.flag_h, nl * NE) != cudaSuccess) {
+                cudaGetLastError();
+                P.fh_cap = 0;
+                return false;
+            }
+        }
+        P.fh_cap = tk;
+        P.fh_layers = nl;
+    }
+    if (static bool said = false; !said) {
+        said = true;
+        std::fprintf(stderr, "strata prefill: layer split help on the fused kernels: the idle stage's GPU streams %.0f%% "
+                     "of a one-chunk prompt's streamed experts through %d ring slots (STRATA_PREFILL_HELP_FRAC / _RING)\n",
+                     frac * 100.0, P.RP);
+    }
+    return true;
+}
+
 // A one-chunk prompt of T tokens on a layer split: binds the stream-only peer to the helper stage's prompt buffers
 // (that stage idles until this one hands its rows over).  False when it cannot help this prompt.
 bool Prefill::bind_stage_helper(int64_t T) {
     Impl& m = *impl_;
+    if (!m.help_pp && helper_ != nullptr && !m.pp && fused_help_pack()) {
+        std::string e;
+        if (!make_stage_helper(helper_, e)) { helper_ = nullptr; return false; }
+    }
     if (!m.help_pp || helper_ == nullptr || m.pp) return false;
+    // [claude] a native pack whose layers run the fused kernels (STRATA_PF_FUSED=1): the fused help (the MMQ help below
+    // refuses such layers); UD-Q4_K_XL is not fused_ring() - a few of its layers are not covered - but most are
+    if (fused_help_pack())
+        return bind_fused_helper(T);
     const double frac = split_help_frac(T);
     if (frac <= 0.0 || T < stream_all_min() || m.src == nullptr || m.ring <= STAGE || fused_ring()) return false;
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
@@ -2155,6 +2325,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // place of a --peer-device peer, and gives the stage back its own buffers when the run ends
     const bool single_chunk = hand_in_ == nullptr ? n <= m.T : single_chunk_;
     const bool helped = !dp && single_chunk && bind_stage_helper(n);
+    if (!helped && !dp && std::getenv("STRATA_PREFILL_TIMING") != nullptr && helper_ != nullptr)   // [claude]
+        std::fprintf(stderr, "strata prefill: not helped: %lld tokens (one chunk %d, layout %lld)\n", (long long) n,
+                     (int) single_chunk, (long long) m.T);
     if (helped) std::swap(m.pp, m.help_pp);
     struct HelpScope {
         Impl& m;
@@ -2442,7 +2615,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else {
                         b = m.src->blob_stable(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (ps_on && m.src->pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
+                        if (ps_on && m.src->pinned(l, e) &&   // multi-GPU: every ps_frac-th one goes to the peer's ring
+                            (!m.pp->fused || ((size_t) l < m.pp->fh_layer.size() && m.pp->fh_layer[(size_t) l]))) {
                             ps_acc += m.pp->ps_frac;
                             if (ps_acc >= 1.0) {
                                 ps_acc -= 1.0;
@@ -2464,6 +2638,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
             }
             m.stager->start(std::move(js));
+            if (ps_on && m.pp->fused) {   // [claude] the fused help: which experts the helper takes, on both cards
+                PeerPrefill& P = *m.pp;
+                P.flag_host.assign(m.pp->ps_flag.begin(), m.pp->ps_flag.end());
+                const size_t nb = std::min(P.flag_host.size(), P.fh_layers * (size_t) NE);
+                cudaMemcpyAsync(P.flag_p, P.flag_host.data(), nb, cudaMemcpyHostToDevice, m.cs);
+                const core::OnDevice on(P.dev);
+                cudaMemcpyAsync(P.flag_h, P.flag_host.data(), nb, cudaMemcpyHostToDevice, P.s);
+            }
         }
         struct StagerDone {
             Stager* st;
@@ -3115,6 +3297,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
+                    // [claude] layer split, fused help: the helper card computes this layer's flagged experts
+                    const bool fh_now = fused_l && ps_on && m.pp->fused && (size_t) l < m.pp->fh_layer.size() &&
+                                        m.pp->fh_layer[(size_t) l];
+                    const int ne_grp = fh_now ? (int) NE + 1 : (int) m.g->n_expert;
                     // set_cpu_pool: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm), computed on a thread
                     // that reads on_cpu: declared first, so the future (which waits for the thread) goes first
                     std::vector<char> on_cpu;
@@ -3136,7 +3322,56 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (fused_nat && fused::f16_on()) fused::act_f16(m.mixed, T, N, m.Xq, m.cs);
                         else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         else fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
-                        fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
+                        if (!fh_now) {
+                            fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
+                        } else {
+                            // [claude] the helper's pairs under the dummy expert NE here, this card's under it there; the
+                            // helper reads the activations and the routing over P2P and streams its experts into its
+                            // ring meanwhile, so both cards' links and kernels work on this layer at once
+                            PeerPrefill& P = *m.pp;
+                            help_remap(m.ids, P.flag_p + (size_t) l * NE, 0, P.ids_rp, T * K, (int) NE, m.cs);
+                            fused::group(P.ids_rp, T * K, (int) K, ne_grp, m.GU, m.slot_dev, m.src_dev, m.cs);
+                            cudaEventRecord(P.ev_in, m.cs);
+                            const core::OnDevice on(P.dev);
+                            const cudaStream_t ps = P.s;
+                            cudaStreamWaitEvent(ps, P.ev_in, 0);
+                            const size_t xb = fused::f16_on() ? (size_t) T * N * 2 : fused::act_bytes(T, N);
+                            cudaMemcpyPeerAsync(P.hXq, P.dev, m.Xq, m.device, xb, ps);
+                            cudaMemcpyPeerAsync(P.hids, P.dev, m.ids, m.device, (size_t) T * K * 4, ps);
+                            cudaMemcpyPeerAsync(P.hw, P.dev, m.w, m.device, (size_t) T * K * 4, ps);
+                            help_remap(P.hids, P.flag_h + (size_t) l * NE, 1, P.ids_rh, T * K, (int) NE, ps);
+                            fused::group(P.ids_rh, T * K, (int) K, ne_grp, P.hGU, P.hslot, P.hsrc, ps);
+                            const auto& f = lay.fmt[(size_t) l];
+                            const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                            const size_t RP = (size_t) P.RP, pper = std::max<size_t>(1, RP / 3);
+                            size_t pk = P.pseq_start[(size_t) l];
+                            const size_t pend = P.pseq_start[(size_t) l + 1];
+                            for (int32_t e = 0; e < m.g->n_expert && pk < pend;) {
+                                fused::Batch b;
+                                b.e0 = e;
+                                const size_t k0 = pk;
+                                for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
+                                    if (pk < pend && P.pseq[pk].e == e) {
+                                        if (pk - k0 == pper) break;
+                                        b.blob[e - b.e0] = P.pstage[pk % RP];
+                                        ++pk;
+                                    }   // else: none of its rows are here (this card's experts are the flagged ones)
+                                }
+                                b.e1 = e;
+                                if (pk == k0) continue;
+                                p_issue_until(pk);
+                                cudaStreamWaitEvent(ps, P.pcopied[(pk - 1) % RP], 0);
+                                if (fused::f16_on())
+                                    fused::experts_native_f16(b, ng, ne_grp, T * K, P.hGU, P.hXq, P.hsrc, P.hH, P.hDm, ps);
+                                else
+                                    fused::experts_native(b, ng, ne_grp, T * K, P.hGU, P.hXq, P.hsrc, P.hH, P.hDm, ps);
+                                for (size_t kk = k0; kk < pk; ++kk) cudaEventRecord(P.pused[kk % RP], ps);
+                                P.pk = pk;
+                                P.ps_experts += (int64_t) (pk - k0);
+                                p_issue_until(P.pk + RP);
+                            }
+                            help_sum16(P.hDm, P.hslot, P.hw, P.ids_rh, (int) NE, P.hsum, T, ps);
+                        }
                         // launches over the experts in id order, each at most kMaxBatch experts of which at most a
                         // third of the ring streamed: the next batch's blobs arrive while one computes.  An expert
                         // the routing did not pick has no tiles; its ring slot is given back with its batch.
@@ -3155,6 +3390,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (k - k0 == per) break;
                                     b.blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
                                     ++k;
+                                } else if (fh_now && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) {
+                                    b.blob[e - b.e0] = nullptr;   // [claude] the helper's: no rows here
                                 } else {                  // not streamed: resident (the walk streams all others)
                                     b.blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
                                     // counted whether routed or not (the routing stays on the GPU): at a streamed
@@ -3176,11 +3413,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto& f = lay.fmt[(size_t) l];
                                 const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
                                 if (fused::f16_on())
-                                    fused::experts_native_f16(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
-                                                              m.Dm, m.cs);
+                                    fused::experts_native_f16(b, ng, ne_grp, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                                 else
-                                    fused::experts_native(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
-                                                          m.Dm, m.cs);
+                                    fused::experts_native(b, ng, ne_grp, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                                 if (pt.on) fused::set_mid_hook(nullptr, nullptr);
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
@@ -3193,6 +3428,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 consumed = k;
                                 give_back(consumed);
                             }
+                        }
+                        if (fh_now) {   // [claude] the helper's sums into H, which this card's experts no longer read
+                            PeerPrefill& P = *m.pp;
+                            cudaEventRecord(P.ev_pdone, m.cs);
+                            const core::OnDevice on(P.dev);
+                            cudaStreamWaitEvent(P.s, P.ev_pdone, 0);
+                            cudaMemcpyPeerAsync(m.H, m.device, P.hsum, P.dev, (size_t) T * N * 2, P.s);
+                            cudaEventRecord(P.ev_done, P.s);
                         }
                     } else {
                         // group the (token, k) pairs by expert on the host
@@ -4083,7 +4326,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!m.pp->p2p && !m.pp->sums)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
-                    if (peer_now && m.pp->sums && m.pp->f16)
+                    if (fh_now) {
+                        cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
+                        moe_combine_help16(m.Dm, m.slot_dev, m.w, m.pp->ids_rp, (int) NE, m.shared, m.sg,
+                                           reinterpret_cast<const uint16_t*>(m.H), m.bo, T, m.cs);
+                    } else if (peer_now && m.pp->sums && m.pp->f16)
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_now && m.pp->sums)
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);

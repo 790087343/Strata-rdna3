@@ -105,6 +105,15 @@ void peer_scatter_add(float* sum, const float* rows, const float* wk, const int3
 /// eddoursul/Strata's moe_gather_add, with the weight looked up through the row's pair.
 void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk, const int32_t* pair, const int32_t* tok,
                      const int32_t* start, const int32_t* list, int64_t n_tok, void* stream);
+/// [claude] layer split, fused-path help: out[i] = ids[i] when flag[ids[i]] == want, else ne (the dummy expert that
+/// collects the pairs the other card computes, so neither card's grouping hands it their rows)
+void help_remap(const int32_t* ids, const uint8_t* flag, int want, int32_t* out, int64_t n, int ne, void* stream);
+/// out[t, :] = FP16 of sum over k with ids_r[t, k] != ne of w[t, k] * D[slot[t, k], :] (the helper's per-token sums)
+void help_sum16(const float* D, const int32_t* slot, const float* w, const int32_t* ids_r, int ne, uint16_t* out,
+                int64_t T, void* stream);
+/// bo[t, :] = (sum over k with ids_r[t, k] != ne of w[t, k] * D[slot[t, k], :]) + peer16[t, :] + shared * sigmoid(sg[t])
+void moe_combine_help16(const float* D, const int32_t* slot, const float* w, const int32_t* ids_r, int ne,
+                        const float* shared, const float* sg, const uint16_t* peer16, float* bo, int64_t T, void* stream);
 /// moe_combine_peer with the peer's sums in FP16 (`peer16`, may be mapped host memory)
 void moe_combine_peer16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
                         const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream);
