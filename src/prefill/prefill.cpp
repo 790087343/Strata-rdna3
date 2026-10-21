@@ -1663,7 +1663,9 @@ bool Prefill::make_stage_helper(Prefill* helper, std::string& err) {
 
 namespace {
 // [claude] the fused help's share of a stage's streamed experts (STRATA_PREFILL_HELP_FRAC, default 0.5: both links
-// stream about as much) and the helper ring's slots (STRATA_PREFILL_HELP_RING, default 96)
+// stream about as much; 2x RX 7900 XTX, Q4 one chunk 4K / 8448: 0.4 1532 / 2773, 0.5 1727 / 2860, 0.6 1538 / 2746) and
+// the helper ring's slots (STRATA_PREFILL_HELP_RING, default: the helper stage's whole ring; 96 slots - under one layer
+// of the share - stalled its link while it waited for a layer's activations: Q4 8448 2526 vs 2860 at 384)
 double fused_help_frac() {
     static const double v = [] {
         const char* e = std::getenv("STRATA_PREFILL_HELP_FRAC");
@@ -1674,7 +1676,7 @@ double fused_help_frac() {
 int fused_help_ring() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_PREFILL_HELP_RING");
-        return std::clamp(e ? std::atoi(e) : 96, 6, kHelpEvents);
+        return std::clamp(e ? std::atoi(e) : kHelpEvents, 6, kHelpEvents);
     }();
     return v;
 }
