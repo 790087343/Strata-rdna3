@@ -113,7 +113,18 @@ constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
-constexpr int kHelpEvents = 512;    // [claude] the helper ring's events (the fused help may take more slots: STRATA_PREFILL_HELP_RING)
+constexpr int kHelpEvents = 512;
+// [claude] DP share (STRATA_DP_SHARE=1, opt-in): on the DP prompt path each expert both cards would stream is
+// streamed by one of them, which computes it for both chunks (docs/STRATA_DP_SHARE_DESIGN_20261021.txt); the other
+// chunk's tokens go through it in pieces of STRATA_DP_SHARE_TOK (default 2048) tokens
+inline bool dp_share_env() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_DP_SHARE"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+inline int64_t dp_share_tok() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_DP_SHARE_TOK"); return std::clamp<int64_t>(e ? std::atoll(e) : 2048, 256, 32768); }();
+    return v;
+}    // [claude] the helper ring's events (the fused help may take more slots: STRATA_PREFILL_HELP_RING)
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
@@ -915,6 +926,41 @@ struct Prefill::Impl {
     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
     std::unique_ptr<PeerPrefill> help_pp;
+    // [claude] DP share: the other chunk's piece (activations, routing, its grouping, H, Dm, the sums), this chunk's
+    // regrouped routing, and per layer which experts this card computes for its own chunk / for the other one
+    uint16_t *ds_xq = nullptr, *ds_h = nullptr, *ds_sum = nullptr;
+    int32_t *ds_ids = nullptr, *ds_idr = nullptr, *ds_slot = nullptr, *ds_src = nullptr, *ds_own = nullptr;
+    float *ds_w = nullptr, *ds_dm = nullptr;
+    uint8_t *ds_gu = nullptr, *ds_keep = nullptr, *ds_help = nullptr;
+    size_t ds_flags_n = 0;
+    int64_t ds_th = 0;
+    cudaStream_t ds_hs = nullptr;
+    bool ds_on = false;                    // this prompt runs the DP share (set by run_dp)
+};
+
+// [claude] defined before run_impl, which reads the DP share mailbox
+struct Prefill::DpLink {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<int64_t> pub[2];        // per layer: the last chunk whose layer state path i has published (-1: none)
+    std::vector<cudaEvent_t> ev[2];     // per layer, recorded on path i's stream (its device)
+    int dev[2] = {0, 0};
+    bool abort = false;
+    // [claude] DP share: path i's request for the other path's share of its chunk's MoE at a layer (k: the chunk, -1
+    // none), and the chunk whose sums path i's help recorded (ev_sum on path i's device, after the copy into the
+    // requester's H); ev_in / ev_pdone on the requester's device: its activations and routing / its own experts done
+    struct DsReq { int64_t k = -1, T = 0; const void* xq = nullptr; const int32_t* ids = nullptr; const float* w = nullptr; void* h = nullptr; };
+    std::vector<DsReq> req[2];
+    std::vector<int64_t> sum_k[2];
+    std::vector<cudaEvent_t> ev_in[2], ev_pdone[2], ev_sum[2];
+    ~DpLink() {
+        for (int i = 0; i < 2; ++i) {
+            const core::OnDevice on(dev[i]);
+            for (cudaEvent_t e : ev[i]) if (e) cudaEventDestroy(e);
+            for (auto* v : {&ev_in[i], &ev_pdone[i], &ev_sum[i]})
+                for (cudaEvent_t e : *v) if (e) cudaEventDestroy(e);
+        }
+    }
 };
 
 namespace {
@@ -1337,6 +1383,15 @@ bool Prefill::carve(size_t T, void* alloc) {
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+    }
+    if (dp_share_env() && mmq_plan().any) {   // [claude] DP share (bytes_needed_impl takes the same)
+        const size_t th = (size_t) std::min<int64_t>((int64_t) T, dp_share_tok());
+        m.ds_th = (int64_t) th;
+        m.ds_xq = o.take<uint16_t>(th * N, ok); m.ds_ids = o.take<int32_t>(th * K, ok); m.ds_w = o.take<float>(th * K, ok);
+        m.ds_idr = o.take<int32_t>(th * K, ok); m.ds_slot = o.take<int32_t>(th * K, ok); m.ds_src = o.take<int32_t>(th * K, ok);
+        m.ds_gu = o.take<uint8_t>(fused::group_bytes((int64_t) (th * K), (int) m.g->n_expert + 1), ok);
+        m.ds_h = o.take<uint16_t>(th * K * 640, ok); m.ds_dm = o.take<float>(th * K * N, ok);
+        m.ds_sum = o.take<uint16_t>(th * N, ok); m.ds_own = o.take<int32_t>(T * K, ok);
     }
     m.ring = ring_slots(T);
     if (o.base == nullptr && m.ring > 0) {
@@ -2099,6 +2154,14 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
+    if (dp_share_env() && mmq_plan().any) {   // [claude] DP share: carve's takes
+        const size_t th = (size_t) std::min<int64_t>((int64_t) T, dp_share_tok());
+        o.take<uint16_t>(th * N, ok); o.take<int32_t>(th * K, ok); o.take<float>(th * K, ok);
+        o.take<int32_t>(th * K, ok); o.take<int32_t>(th * K, ok); o.take<int32_t>(th * K, ok);
+        o.take<uint8_t>(fused::group_bytes((int64_t) (th * K), (int) g.n_expert + 1), ok);
+        o.take<uint16_t>(th * K * 640, ok); o.take<float>(th * K * N, ok);
+        o.take<uint16_t>(th * N, ok); o.take<int32_t>(T * K, ok);
+    }
     if (owned_pages) {
         if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
     } else {
@@ -2565,6 +2628,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
         }
         const bool ps_on = stream_all && m.pp && m.pp->ps_frac > 0.0;
+        // [claude] DP share: this chunk (a DP prompt of two chunks, the streamed walk, the threaded ring issuer)
+        const bool ds_chunk = dp && m.ds_on && stream_all && dp_link_ && [] {
+            const char* v = std::getenv("STRATA_PREFILL_ISSUER");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        std::vector<uint8_t> ds_flag, ds_layer, ds_helped;
+        std::vector<std::vector<size_t>> ds_seq;
         if (m.pp && !ps_on) m.pp->ps_flag.clear();
         // multi-GPU: the peer's ring - issue its copies up to `limit` / give entries back (the peer device is current)
         auto p_issue_until = [&](size_t limit) {
@@ -2603,12 +2673,57 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 m.pp->p_issued = m.pp->pk = 0;
             }
             double ps_acc = 0.0;
+            // [claude] DP share: the experts neither path holds (the peer's residency view is its dp_res_), on layers
+            // that run the fused kernels, alternate between the two paths: 2 = this one streams it and computes it for
+            // both chunks, 1 = the other one does
+            if (ds_chunk) {
+                const int32_t* pres = dp_peer_->dp_res_.empty() ? nullptr : dp_peer_->dp_res_.data();
+                const core::ExpertSource* psrc = dp_peer_->impl_->src;
+                const int64_t E = m.g->n_expert;
+                ds_flag.assign((size_t) (g.n_layers * E), 0);
+                ds_layer.assign((size_t) g.n_layers, 0);
+                ds_seq.assign((size_t) g.n_layers, {});
+                const MmqPlan& mp = mmq_plan();
+                for (int64_t l = LB; l < LE; ++l) {
+                    const auto& f = lay0.fmt[(size_t) l];
+                    if (!(mp.any && (mp.layer[(size_t) l] || mp.fo[(size_t) l]) && fused::native_supported(f.gu_type, f.d_type)))
+                        continue;
+                    ds_layer[(size_t) l] = 1;
+                    int64_t cnt = 0, n_me = 0, n_peer = 0;   // what each path streams of this layer
+                    for (int32_t e = 0; e < E; ++e) {
+                        const size_t i = (size_t) (l * E + e);
+                        const bool mine_res = m.host_res && m.cache && m.host_res[i] >= 0;
+                        const bool peer_res = pres != nullptr && pres[i] >= 0;
+                        if (mine_res || peer_res || !m.src->pinned(l, e) || psrc == nullptr || !psrc->pinned(l, e)) {
+                            n_me += !mine_res;
+                            n_peer += !peer_res;
+                            continue;
+                        }
+                        const bool to_me = (cnt++ % 2) == dp_index_;
+                        ds_flag[i] = to_me ? 2 : 1;
+                        (to_me ? n_me : n_peer) += 1;
+                    }
+                    // a layer's slots go back only after both chunks used them: a layer that would not fit either
+                    // path's ring runs without the share on both (the same counts on both paths)
+                    const int64_t room = std::min<int64_t>(m.ring, dp_peer_->impl_->ring) - 16;
+                    if (std::max(n_me, n_peer) > room) {
+                        ds_layer[(size_t) l] = 0;
+                        std::fill(ds_flag.begin() + l * E, ds_flag.begin() + (l + 1) * E, (uint8_t) 0);
+                    }
+                }
+                std::vector<uint8_t> keep(ds_flag.size()), help(ds_flag.size());
+                for (size_t i = 0; i < ds_flag.size(); ++i) { keep[i] = ds_flag[i] != 1; help[i] = ds_flag[i] == 2; }
+                cudaMemcpy(m.ds_keep, keep.data(), keep.size(), cudaMemcpyHostToDevice);
+                cudaMemcpy(m.ds_help, help.data(), help.size(), cudaMemcpyHostToDevice);
+                ds_helped.assign((size_t) g.n_layers, 0);
+            }
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    if (ds_chunk && ds_flag[(size_t) l * m.g->n_expert + e] == 1) continue;   // [claude] the other path streams it
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -2633,6 +2748,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     seq.push_back({(int32_t) l, e, b, job});
+                    if (ds_chunk && ds_flag[(size_t) l * m.g->n_expert + e] == 2) ds_seq[(size_t) l].push_back(seq.size() - 1);
                 }
             }
             for (int64_t l = LE; l <= g.n_layers; ++l) {
@@ -2757,6 +2873,70 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         auto give_back = [&](size_t upto) {
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
             else issue_until(upto + (size_t) m.ring);
+        };
+        // [claude] DP share: this path's share of layer l for the OTHER path's chunk (its request in the mailbox): the
+        // activations, routing and weights in pieces of ds_th tokens over P2P, the share's experts from this path's
+        // ring (held until both chunks used them), per-token FP16 sums into the requester's H once its own experts are
+        // done.  block: wait for the request (else return when it is not there yet).  False: an abort or an error.
+        auto ds_help_peer = [&](int64_t l, bool block) -> bool {
+            if (ds_helped[(size_t) l]) return true;
+            DpLink& L = *dp_link_;
+            const int me = dp_index_, peer = 1 - dp_index_;
+            DpLink::DsReq r;
+            {
+                std::unique_lock<std::mutex> lk(L.mu);
+                if (block) L.cv.wait(lk, [&] { return L.abort || L.req[peer][(size_t) l].k >= 0; });
+                if (L.abort) { err = "prefill DP: the other GPU's path stopped"; return false; }
+                if (L.req[peer][(size_t) l].k < 0) return true;
+                r = L.req[peer][(size_t) l];
+            }
+            const int pdev = dp_peer_->impl_->device;
+            const cudaStream_t hs = m.ds_hs;
+            cudaStreamWaitEvent(hs, L.ev_in[peer][(size_t) l], 0);
+            const std::vector<size_t>& mine = ds_seq[(size_t) l];
+            if (!mine.empty()) {   // one copy stream, in order: the share's last blob covers the others
+                wait_issued(mine.back());
+                cudaStreamWaitEvent(hs, m.copied[mine.back() % (size_t) m.ring], 0);
+            }
+            const auto& f = lay0.fmt[(size_t) l];
+            const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+            const int ne1 = (int) m.g->n_expert + 1;
+            const size_t rb = fused::f16_on() ? (size_t) N * 2 : fused::act_bytes(1, N);   // one token's activations
+            for (int64_t t0 = 0; t0 < r.T; t0 += m.ds_th) {
+                const int64_t nt = std::min<int64_t>(m.ds_th, r.T - t0);
+                cudaMemcpyPeerAsync(m.ds_xq, m.device, (const uint8_t*) r.xq + (size_t) t0 * rb, pdev, (size_t) nt * rb, hs);
+                cudaMemcpyPeerAsync(m.ds_ids, m.device, r.ids + t0 * K, pdev, (size_t) (nt * K) * 4, hs);
+                cudaMemcpyPeerAsync(m.ds_w, m.device, r.w + t0 * K, pdev, (size_t) (nt * K) * 4, hs);
+                help_remap(m.ds_ids, m.ds_help + (size_t) l * m.g->n_expert, 1, m.ds_idr, nt * K, (int) m.g->n_expert, hs);
+                fused::group(m.ds_idr, nt * K, (int) K, ne1, m.ds_gu, m.ds_slot, m.ds_src, hs);
+                for (size_t j = 0; j < mine.size();) {   // batches of the share's experts in id order
+                    fused::Batch b;
+                    b.e0 = seq[mine[j]].e;
+                    while (j < mine.size() && seq[mine[j]].e - b.e0 < fused::kMaxBatch) {
+                        b.blob[seq[mine[j]].e - b.e0] = m.stage_dev[mine[j] % (size_t) m.ring];
+                        ++j;
+                    }
+                    b.e1 = seq[mine[j - 1]].e + 1;
+                    if (fused::f16_on())
+                        fused::experts_native_f16(b, ng, ne1, nt * K, m.ds_gu, m.ds_xq, m.ds_src, m.ds_h, m.ds_dm, hs);
+                    else
+                        fused::experts_native(b, ng, ne1, nt * K, m.ds_gu, m.ds_xq, m.ds_src, m.ds_h, m.ds_dm, hs);
+                }
+                help_sum16(m.ds_dm, m.ds_slot, m.ds_w, m.ds_idr, (int) m.g->n_expert, m.ds_sum, nt, hs);
+                if (t0 == 0) cudaStreamWaitEvent(hs, L.ev_pdone[peer][(size_t) l], 0);   // its H is free
+                cudaMemcpyPeerAsync((uint8_t*) r.h + (size_t) t0 * N * 2, pdev, m.ds_sum, m.device, (size_t) nt * N * 2, hs);
+            }
+            if (cudaEventRecord(L.ev_sum[me][(size_t) l], hs) != cudaSuccess) {
+                err = std::string("prefill DP share: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lk(L.mu);
+                L.sum_k[me][(size_t) l] = r.k;
+            }
+            L.cv.notify_all();
+            ds_helped[(size_t) l] = 1;
+            return true;
         };
         if (ps_on) {
             int pd = 0;
@@ -3302,7 +3482,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // [claude] layer split, fused help: the helper card computes this layer's flagged experts
                     const bool fh_now = fused_l && ps_on && m.pp->fused && (size_t) l < m.pp->fh_layer.size() &&
                                         m.pp->fh_layer[(size_t) l];
-                    const int ne_grp = fh_now ? (int) NE + 1 : (int) m.g->n_expert;
+                    // [claude] DP share: this layer's experts neither path holds are split between the two paths
+                    const bool ds_now = fused_l && ds_chunk && ds_layer[(size_t) l];
+                    const int ne_grp = (fh_now || ds_now) ? (int) NE + 1 : (int) m.g->n_expert;
                     // set_cpu_pool: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm), computed on a thread
                     // that reads on_cpu: declared first, so the future (which waits for the thread) goes first
                     std::vector<char> on_cpu;
@@ -3324,7 +3506,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (fused_nat && fused::f16_on()) fused::act_f16(m.mixed, T, N, m.Xq, m.cs);
                         else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         else fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
-                        if (!fh_now) {
+                        if (ds_now) {
+                            // [claude] DP share: the other path's request for this layer may be in already (this path
+                            // runs behind it): its share of the other chunk first, then this chunk with the other
+                            // path's share under the dummy expert, the request posted for it
+                            if (!ds_help_peer(l, false)) return false;
+                            help_remap(m.ids, m.ds_keep + (size_t) l * NE, 1, m.ds_own, T * K, (int) NE, m.cs);
+                            fused::group(m.ds_own, T * K, (int) K, ne_grp, m.GU, m.slot_dev, m.src_dev, m.cs);
+                            cudaEventRecord(dp_link_->ev_in[dp_index_][(size_t) l], m.cs);
+                        } else if (!fh_now) {
                             fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         } else {
                             // [claude] the helper's pairs under the dummy expert NE here, this card's under it there; the
@@ -3392,8 +3582,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (k - k0 == per) break;
                                     b.blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
                                     ++k;
-                                } else if (fh_now && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) {
-                                    b.blob[e - b.e0] = nullptr;   // [claude] the helper's: no rows here
+                                } else if ((fh_now && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) ||
+                                           (ds_now && ds_flag[(size_t) l * m.g->n_expert + e] == 1)) {
+                                    b.blob[e - b.e0] = nullptr;   // [claude] the helper's / the other path's: no rows here
                                 } else {                  // not streamed: resident (the walk streams all others)
                                     b.blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
                                     // counted whether routed or not (the routing stays on the GPU): at a streamed
@@ -3422,12 +3613,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
-                            for (size_t kk = k0; kk < k; ++kk) {
+                            for (size_t kk = k0; kk < k && !ds_now; ++kk) {
                                 cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
                                 m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
                             }
-                            if (k > k0) {
+                            if (k > k0 && !ds_now) {
                                 consumed = k;
+                                give_back(consumed);
+                            }
+                        }
+                        if (ds_now) {
+                            // [claude] DP share: this chunk's own experts are done (H is free for the sums); the
+                            // request; the other chunk's share of this layer (waits for its request); then the layer's
+                            // ring slots go back once both chunks used them
+                            DpLink& L = *dp_link_;
+                            cudaEventRecord(L.ev_pdone[dp_index_][(size_t) l], m.cs);
+                            {
+                                std::lock_guard<std::mutex> lk(L.mu);
+                                L.req[dp_index_][(size_t) l] = DpLink::DsReq{dp_k, T, m.Xq, m.ids, m.w, m.H};
+                            }
+                            L.cv.notify_all();
+                            if (!ds_help_peer(l, true)) return false;
+                            // the slots go back on the help stream, behind both uses (its own help of this layer,
+                            // then this chunk's experts): the compute stream never waits for the help
+                            cudaStreamWaitEvent(m.ds_hs, L.ev_pdone[dp_index_][(size_t) l], 0);
+                            for (size_t kk = seq_start[(size_t) l]; kk < kend; ++kk) {
+                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.ds_hs);
+                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                            }
+                            if (kend > seq_start[(size_t) l]) {
+                                consumed = kend;
                                 give_back(consumed);
                             }
                         }
@@ -4328,7 +4543,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!m.pp->p2p && !m.pp->sums)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
-                    if (fh_now) {
+                    if (ds_now) {   // [claude] DP share: the other path's sums for this chunk
+                        DpLink& L = *dp_link_;
+                        const int peer = 1 - dp_index_;
+                        {
+                            std::unique_lock<std::mutex> lk(L.mu);
+                            L.cv.wait(lk, [&] { return L.abort || L.sum_k[peer][(size_t) l] == dp_k; });
+                            if (L.abort) { err = "prefill DP: the other GPU's path stopped"; return false; }
+                        }
+                        cudaStreamWaitEvent(m.cs, L.ev_sum[peer][(size_t) l], 0);
+                        moe_combine_help16(m.Dm, m.slot_dev, m.w, m.ds_own, (int) NE, m.shared, m.sg,
+                                           reinterpret_cast<const uint16_t*>(m.H), m.bo, T, m.cs);
+                    } else if (fh_now) {
                         cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
                         moe_combine_help16(m.Dm, m.slot_dev, m.w, m.pp->ids_rp, (int) NE, m.shared, m.sg,
                                            reinterpret_cast<const uint16_t*>(m.H), m.bo, T, m.cs);
@@ -4637,20 +4863,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 }
 
 // ======================= [claude] dual data-parallel prompt path (docs/DP_PREFILL_DESIGN.md) =======================
-struct Prefill::DpLink {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::vector<int64_t> pub[2];        // per layer: the last chunk whose layer state path i has published (-1: none)
-    std::vector<cudaEvent_t> ev[2];     // per layer, recorded on path i's stream (its device)
-    int dev[2] = {0, 0};
-    bool abort = false;
-    ~DpLink() {
-        for (int i = 0; i < 2; ++i) {
-            const core::OnDevice on(dev[i]);
-            for (cudaEvent_t e : ev[i]) if (e) cudaEventDestroy(e);
-        }
-    }
-};
 
 std::shared_ptr<Prefill::DpLink> Prefill::make_dp_link(int n_layers, int dev_a, int dev_b, std::string& err) {
     auto L = std::make_shared<DpLink>();
@@ -4665,6 +4877,15 @@ std::shared_ptr<Prefill::DpLink> Prefill::make_dp_link(int n_layers, int dev_a, 
                 err = "prefill DP: events";
                 return nullptr;
             }
+        if (dp_share_env()) {   // [claude] DP share: the mailbox and its events
+            L->req[i].assign((size_t) n_layers, DpLink::DsReq{});
+            L->sum_k[i].assign((size_t) n_layers, -1);
+            for (auto* v : {&L->ev_in[i], &L->ev_pdone[i], &L->ev_sum[i]}) {
+                v->assign((size_t) n_layers, nullptr);
+                for (cudaEvent_t& e : *v)
+                    if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) { err = "prefill DP: share events"; return nullptr; }
+            }
+        }
         // direct copies between the two cards where the platform allows it (else cudaMemcpyPeer stages through RAM)
         int can = 0;
         if (cudaDeviceCanAccessPeer(&can, L->dev[i], L->dev[1 - i]) == cudaSuccess && can) {
@@ -4821,6 +5042,40 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         std::lock_guard<std::mutex> lk(a.dp_link_->mu);
         for (int i = 0; i < 2; ++i) std::fill(a.dp_link_->pub[i].begin(), a.dp_link_->pub[i].end(), (int64_t) -1);
         a.dp_link_->abort = false;
+        for (int i = 0; i < 2; ++i) {   // [claude] DP share: an empty mailbox
+            for (auto& r : a.dp_link_->req[i]) r = DpLink::DsReq{};
+            std::fill(a.dp_link_->sum_k[i].begin(), a.dp_link_->sum_k[i].end(), (int64_t) -1);
+        }
+    }
+    // [claude] DP share: two chunks (one each), both layouts with its buffers; its help streams live for this prompt
+    const bool ds = dp_share_env() && plan.size() == 2 && !a.dp_link_->req[0].empty() && a.impl_->ds_own != nullptr &&
+                    b.impl_->ds_own != nullptr && a.impl_->ds_th > 0 && b.impl_->ds_th > 0;
+    for (int i = 0; i < 2 && ds; ++i) {
+        Impl& xm = *P[i]->impl_;
+        const core::OnDevice on(xm.device);
+        const size_t nf = (size_t) (xm.g->n_layers * xm.g->n_expert);
+        if (xm.ds_flags_n < nf) {
+            if (xm.ds_keep) cudaFree(xm.ds_keep);
+            if (xm.ds_help) cudaFree(xm.ds_help);
+            xm.ds_keep = xm.ds_help = nullptr;
+            if (cudaMalloc((void**) &xm.ds_keep, nf) != cudaSuccess || cudaMalloc((void**) &xm.ds_help, nf) != cudaSuccess) {
+                cudaGetLastError();
+                xm.ds_flags_n = 0;
+                continue;
+            }
+            xm.ds_flags_n = nf;
+        }
+        if (xm.ds_hs == nullptr && cudaStreamCreateWithFlags(&xm.ds_hs, cudaStreamNonBlocking) != cudaSuccess) {
+            cudaGetLastError();
+            xm.ds_hs = nullptr;
+        }
+    }
+    const bool ds_ok = ds && a.impl_->ds_hs && b.impl_->ds_hs && a.impl_->ds_flags_n && b.impl_->ds_flags_n;
+    a.impl_->ds_on = b.impl_->ds_on = ds_ok;
+    if (ds_ok) if (static bool said = false; !said) {
+        said = true;
+        std::fprintf(stderr, "strata prefill: DP share on: each expert both GPUs would stream is streamed by one of them "
+                             "and computed for both chunks (STRATA_DP_SHARE=1, pieces of %lld tokens)\n", (long long) a.impl_->ds_th);
     }
     // the foreign sessions start from the owners' state at pos0: a fresh prompt's zeroed state, a resumed checkpoint,
     // or the live state of an earlier turn - never what the last DP prompt left in them
@@ -4859,6 +5114,7 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
             for (int j = 0; j < 2; ++j) {   // undo the per-prompt settings
                 P[j]->impl_->host_res = sv[j].res; P[j]->stage_lb_ = sv[j].lb; P[j]->stage_le_ = sv[j].le;
                 P[j]->next_ = sv[j].next; P[j]->on_stage_chunk = std::move(sv[j].osc); P[j]->dp_active_ = false;
+                P[j]->impl_->ds_on = false;
             }
             return false;
         }
@@ -4887,6 +5143,12 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         Prefill& X = *P[i];
         const core::OnDevice on(X.impl_->device);
         cudaStreamSynchronize(X.impl_->cs);
+        if (X.impl_->ds_hs) {   // [claude] DP share: the help stream is the prompt's only (decode shares no HW queue with it)
+            cudaStreamSynchronize(X.impl_->ds_hs);
+            cudaStreamDestroy(X.impl_->ds_hs);
+            X.impl_->ds_hs = nullptr;
+        }
+        X.impl_->ds_on = false;
         X.impl_->host_res = sv[i].res;
         X.stage_lb_ = sv[i].lb;
         X.stage_le_ = sv[i].le;
