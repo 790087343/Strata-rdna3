@@ -170,6 +170,8 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// commit() for this card alone (TP: the caller commits the peer itself, e.g. on another thread).
+    bool commit_one(int n_keep, std::string& err);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -327,6 +329,7 @@ public:
     void set_pcie_off(bool off) { pcie_off_ = off; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_launch = 0;   ///< TP: the host time of the window graphs' launches (both cards)
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.

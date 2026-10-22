@@ -1605,7 +1605,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
-        if (!(tp_gpu_only_ && !tp_shexp_split())) {   // (STRATA_TP_SHEXP=0: the shared expert is whole on the other card)
+        // STRATA_TP_SHEXP: the shared expert whole on one card (the other skips it: its `shared_` rows stay zero), or split
+        const bool my_shexp = !tp_ || tp_shexp_split() || (tp_shexp_mode() == 1) == (tpl_.rank == 1);
+        if (my_shexp) {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
             if (!wgi || !wsg || !wsu || !wsd) return false;
@@ -2661,12 +2663,16 @@ bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn po
         if (x->adapt_gate_ != nullptr && x->adapt_gate_->active.load(std::memory_order_acquire) && x->ar_on() &&
             !x->adapt_gate_wait((int32_t) g.n_layers, err))
             return false;
-    for (Verifier* x : v) {
-        const OnDevice on(x->device_);
-        const cudaError_t le = cudaGraphLaunch(x->ar_off_ ? x->exec_nr_[T] : x->exec_[T], x->cs_);
-        x->trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-        (void) cudaStreamQuery(x->cs_);
+    {   // (the two launches' host time: a graph of ~1,100 nodes costs the runtime per node; ms_launch reports it)
+        const Clock::time_point tl = Clock::now();
+        for (Verifier* x : v) {
+            const OnDevice on(x->device_);
+            const cudaError_t le = cudaGraphLaunch(x->ar_off_ ? x->exec_nr_[T] : x->exec_[T], x->cs_);
+            x->trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+            if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+            (void) cudaStreamQuery(x->cs_);
+        }
+        ms_launch += ms_since(tl);
     }
     // the card whose layers come first is served first (its layer 0 gathers the PLE rows for both)
     Verifier* first = tp_lb_ <= tp_peer_->tp_lb_ ? this : tp_peer_;
@@ -2837,6 +2843,12 @@ namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
+    if (!commit_one(n_keep, err)) return false;
+    Verifier* nx = tp_ ? (tpl_.rank == 0 ? tp_peer_ : nullptr) : next_;   // TP: rank 0 commits both cards
+    return nx == nullptr || nx->commit(n_keep, err);
+}
+
+bool Verifier::commit_one(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -2881,8 +2893,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    Verifier* nx = tp_ ? (tpl_.rank == 0 ? tp_peer_ : nullptr) : next_;   // TP: rank 0 commits both cards
-    return nx == nullptr || nx->commit(n_keep, err);
+    return true;
 }
 
 bool Verifier::wait_commit(std::string& err) {

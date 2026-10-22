@@ -4280,9 +4280,53 @@ int main(int argc, char** argv) {
     if (multi_gpu) {
         profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
+        if (tp2_want) {
+            // THE DEAL (STRATA_TP_DEAL): which pairs the two caches hold, and how a layer's are split between them.  The
+            // global top of the ranking ("global": even ranks to card 0, odd to card 1) covered 79.6% of a 2048-token
+            // request's routing where the layer split's per-half top covered 88.3% (results/decode-20261022/tp-m1/static-*):
+            // the profile concentrates on some layers more than a new text does, and a budget per half of the layers
+            // ("half", the default: the layer split's own selection, each layer's pairs dealt alternately so both cards
+            // compute every layer) or per layer ("layer") holds that back.  STRATA_TP_DEAL_BUDGET: the pairs selected for
+            // each half (default 6800, about a card's cache); the rest of the ranking follows in rank order.
+            static const std::string deal = [] { const char* v = std::getenv("STRATA_TP_DEAL"); return std::string(v ? v : "half"); }();
+            static const int64_t budget = [] { const char* v = std::getenv("STRATA_TP_DEAL_BUDGET"); return v ? std::atoll(v) : 6800; }();
+            // STRATA_TP_DEAL_RATIO: card 1's share of each layer's selected pairs (default 0.5).  Card 0 also waits for the
+            // CPU rows and rings the host, so a little more of the GPU expert work on card 1 balances the pair.
+            static const double ratio = [] { const char* v = std::getenv("STRATA_TP_DEAL_RATIO"); return v ? std::atof(v) : 0.5; }();
+            std::vector<std::pair<int32_t, int32_t>> sel[2], tail[2];
+            std::vector<int64_t> per_layer((size_t) g.n_layers, 0);
+            int64_t taken[2] = {0, 0}, tail_n = 0;
+            const int64_t q_layer = std::max<int64_t>(1, 2 * budget / std::max<int64_t>(g.n_layers, 1));
+            for (const auto& pr : profile) {
+                const int64_t l = pr.first;
+                const int half = l < split_at[0] ? 0 : 1;
+                bool pick;
+                if (deal == "layer") pick = per_layer[(size_t) l] < q_layer;
+                else if (deal == "global") pick = taken[0] + taken[1] < 2 * budget;
+                else pick = taken[half] < budget;
+                if (pick) {
+                    // alternate within the layer, offset by layer ("split": the layer split's own placement, a test)
+                    const int64_t k = per_layer[(size_t) l] + (l & 1);   // the layer's rank among its selected (offset by layer)
+                    const int card = deal == "split" ? half
+                                   : ((int64_t) std::floor((double) (k + 1) * ratio) > (int64_t) std::floor((double) k * ratio)) ? 1 : 0;
+                    sel[card].push_back(pr);
+                    ++per_layer[(size_t) l];
+                    ++taken[half];
+                } else {
+                    tail[(size_t) (tail_n++ & 1)].push_back(pr);
+                }
+            }
+            for (int c = 0; c < 2; ++c) {
+                auto& dst = c == 0 ? mine : stages[0]->profile;
+                dst = sel[c];
+                dst.insert(dst.end(), tail[c].begin(), tail[c].end());
+            }
+            std::fprintf(stderr, "strata generate: tensor parallel deal \"%s\": %zu + %zu pairs selected (budget %lld a half), the rest in rank order\n",
+                         deal.c_str(), sel[0].size(), sel[1].size(), (long long) budget);
+        } else
         for (size_t i = 0; i < profile.size(); ++i) {
             const auto& pr = profile[i];
-            const int st = tp2_want ? (int) (i % 2) : stage_of(pr.first);
+            const int st = stage_of(pr.first);
             (st == 0 ? mine : stages[(size_t) st - 1]->profile).push_back(pr);
         }
         profile.swap(mine);
@@ -12416,12 +12460,30 @@ int main(int argc, char** argv) {
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
-                if (!dv.commit(a + 1, err)) {
+                // TENSOR PARALLEL: the two commit graphs' launches (~1.3 ms of host time) go out on a helper thread while
+                // this thread runs the drafter (its own stream; the commit touches neither the final rows nor the ring).
+                // STRATA_TP_COMMIT_THREAD=0: the commit first, as the serial loop does.
+                // STRATA_TP_COMMIT_THREAD=1: a thread instead (a launch on another thread stalls the drafter's host loop:
+                // the draft grew 1.5 -> 2.4 ms); the default with STRATA_MTP_DRAFT_ALL=1 runs card 0's commit inside the
+                // drafter, between its launches and its wait (mtp.draft's `between`), with no second thread; card 1's
+                // commit after the draft, so the drafter does not share its card with the commit graph.
+                static const bool tp_commit_thread = [] { const char* v = std::getenv("STRATA_TP_COMMIT_THREAD"); return v != nullptr && v[0] == '1'; }();
+                static const bool tp_draft_all = [] { const char* v = std::getenv("STRATA_MTP_DRAFT_ALL"); return v != nullptr && v[0] == '1'; }();
+                std::thread commit_thr;
+                bool commit_ok = true;
+                std::string commit_err;
+                const bool nf_now = nonfinite_hit(dv, first_window ? "first decode" : "decode");   // (reads the window's flags only)
+                bool commit_split = false;   // TP: card 0's commit in or beside the draft, card 1's after it
+                std::function<void()> commit0 = [&] { commit_ok = tpv[0].commit_one(a + 1, commit_err); };
+                if (tp_on && use_mtp && !nf_now && (tp_commit_thread || tp_draft_all)) {
+                    commit_split = true;
+                    if (tp_commit_thread) commit_thr = std::thread(commit0);
+                } else if (!dv.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (nonfinite_hit(dv, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
+                if (nf_now) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
                         std::printf("ERR an adaptive refill failed\n");
@@ -12452,8 +12514,25 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                const bool draft_now = use_mtp && !eos && produced_n < max_new;
+                const bool drafted = !draft_now ||
+                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p, nullptr,
+                                               commit_split && !tp_commit_thread ? &commit0 : nullptr);
+                if (commit_split) {
+                    if (!draft_now && !tp_commit_thread) commit0();   // no draft ran: card 0's commit now
+                    if (!tpv[1].commit_one(a + 1, err)) {   // card 1's commit, after the draft
+                        if (commit_thr.joinable()) commit_thr.join();
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (commit_thr.joinable()) commit_thr.join();
+                    if (!commit_ok) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", commit_err.c_str());
+                        return 1;
+                    }
+                }
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -12533,6 +12612,7 @@ int main(int argc, char** argv) {
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, dv.ms_gate);
+                if (tp_on) std::fprintf(stderr, "strata decode TP: the two window launches took %.2f ms a window of host time\n", dv.ms_launch / w);
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;

@@ -22,8 +22,11 @@
 
 namespace strata::core {
 
-/// STRATA_TP_SHEXP=0: the shared expert stays whole on card 0 (the default splits it by ff unit across the cards).
-bool tp_shexp_split();
+/// STRATA_TP_SHEXP: where the shared expert runs.  split (0): by ff unit across the cards (its weights sliced);
+/// card1 (1): whole on card 1, which otherwise waits for card 0's MoE at the layer's second exchange (the default);
+/// card0 (2): whole on card 0.  The whole card loads the shared-expert weights of the layers its stage does not hold.
+int tp_shexp_mode();
+inline bool tp_shexp_split() { return tp_shexp_mode() == 0; }
 
 /// The geometry card `rank` of `nranks` runs: the GDN / QSA heads split by head, everything else the model's.
 /// False with `err` when the heads do not divide.

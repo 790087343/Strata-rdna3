@@ -26,9 +26,14 @@
 
 namespace strata::core {
 
-bool tp_shexp_split() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_TP_SHEXP"); return v == nullptr || v[0] != '0'; }();
-    return on;
+int tp_shexp_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_TP_SHEXP");
+        if (v == nullptr) return 1;
+        const std::string s(v);
+        return s == "split" ? 0 : s == "card0" || s == "0" ? 2 : 1;
+    }();
+    return mode;
 }
 
 bool tp_geometry(const ModelGeometry& g, int rank, int nranks, ModelGeometry& out, std::string& err) {
@@ -242,7 +247,14 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                 int kind = -1;
                 for (const Want& w : wants) if (t.name.ends_with(w.suffix)) kind = w.kind;
                 if (kind < 0) continue;
-                if (!tp_shexp_split() && t.name.find("_shexp.") != std::string::npos) continue;   // whole, card 0's
+                const bool shexp = t.name.find("_shexp.") != std::string::npos;
+                if (shexp && !tp_shexp_split()) {
+                    // whole on one card: that card loads the layers its stage's table has no bytes for (kind 5)
+                    auto it0 = table_.table_.find(t.name);
+                    const bool mine = (tp_shexp_mode() == 1) == (rank == 1);
+                    if (!mine || (it0 != table_.table_.end() && it0->second.native_data != nullptr)) continue;
+                    kind = 5;
+                }
                 if (!strata::kernels::native_mmvq_supported(t.type)) { err = "tp: " + t.name + ": format not native"; return false; }
                 if (!done.insert(t.name).second) { err = "tp: duplicate tensor " + t.name; return false; }
                 auto it = table_.table_.find(t.name);
@@ -266,6 +278,8 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                 } else if (kind == 3) {
                     rows = scaled(v_heads(g, rank, nranks), S);
                     new_out = hv * S;
+                } else if (kind == 5) {   // the whole matrix
+                    rows = {{0, n_out}};
                 } else if (kind == 2) {
                     new_in = n_in / (uint64_t) nranks;
                     if (new_in * (uint64_t) nranks != n_in) { err = "tp: " + t.name + ": the reduction does not divide"; return false; }
@@ -314,7 +328,7 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
         err = std::string("tp: ") + e.what();
         return false;
     }
-    if (done.size() != (size_t) (g.n_gdn_layers() * 3 + g.n_qsa_layers() * 4 + (tp_shexp_split() ? g.n_layers * 3 : 0))) {
+    if (done.size() < (size_t) (g.n_gdn_layers() * 3 + g.n_qsa_layers() * 4)) {
         err = "tp: the shards hold " + std::to_string(done.size()) + " dense projections, not every layer's";
         return false;
     }

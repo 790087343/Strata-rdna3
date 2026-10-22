@@ -1285,7 +1285,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 }
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
+                       float* probs, float min_p, int* n_drafts, const std::function<void()>* between) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
@@ -1338,7 +1338,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     };
 
     int n = 0;
-    if (min_p <= 0.0f && max_steps > 0) {
+    // STRATA_MTP_DRAFT_ALL=1: with a min-p cut-off too, every step is launched at once and the cut-off applied by the
+    // caller to the probabilities (the same drafts are used): one launch and one wait instead of a launch + a wait per
+    // step, each a host round trip (~0.3 ms) - the extra drafts cost GPU time the window overlaps nothing with
+    static const bool draft_all = [] { const char* v = std::getenv("STRATA_MTP_DRAFT_ALL"); return v != nullptr && v[0] == '1'; }();
+    if ((min_p <= 0.0f || draft_all) && max_steps > 0) {
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1350,6 +1354,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         }
         (void) cudaStreamQuery(cs_);
+        if (between != nullptr && *between) (*between)();   // the caller's host work, under the round's GPU time
         prefetch_ple(tokens[a]);
         for (int j = 0; j + 1 < max_steps; ++j) {
             uint32_t spins = 0;
