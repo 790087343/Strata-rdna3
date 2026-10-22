@@ -45,6 +45,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/megakernel.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -154,6 +155,9 @@ inline bool g_qfuse_hc() {
     return false;
 #endif
 }
+// STRATA_MEGAKERNEL=1 (opt-in): a GDN layer's dense chain (q8_1 quantize, qkv/z GEMVs, conv + a/b, recurrence + norm,
+// out GEMV) as one persistent kernel instead of six nodes (megakernel_gdn.cu; bitwise the six - mk_gdn_parity)
+inline bool g_megakernel() { static const bool on = [] { const char* v = std::getenv("STRATA_MEGAKERNEL"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -663,6 +667,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
+        mk_counters_ = b.take<unsigned>(16);   // STRATA_MEGAKERNEL: the persistent kernel's counters (it re-zeroes them itself)
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, 4));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
@@ -729,6 +734,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     carve(real);
     {
         const int32_t one = 1;
+        (void) cudaMemset(mk_counters_, 0, 16 * sizeof(unsigned));   // STRATA_MEGAKERNEL: zero once; the kernel re-zeroes on exit
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
             err = "verify: the arena could not be set";
             return false;
@@ -1169,84 +1175,104 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
-                if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
-                    fork(0);
-                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
-                                 (int) HV, n, df_side_[0]);
-                    fork(1);
-                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
-                                df_side_[1]);
-                }
-                const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_;
-                // STRATA_RDNA_PAIR: q/k/v and z (the same input) in one launch when they share an RDNA format and mm()
-                // would take native_mmvq for both (bitwise the two calls)
-                auto il_path = [&](const WeightRef* w, int n_out) {
-                    return g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out);
-                };
-                const bool z_paired = !br && wqkv->native_type == wg->native_type && !il_path(wqkv, (int) C) &&
-                    !il_path(wg, (int) ZV) &&
-                    strata::kernels::rdna_mmvq_pair(wqkv->native_type, wqkv->native_data, wg->native_data, xq_,
-                                                    qkv + (size_t) tb * C, z_ + (size_t) tb * ZV, (int) N, (int) C,
-                                                    (int) ZV, n, cs);
-                if (!z_paired) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
-                stamp(l, 2, grp);
-                if (batch_rec_) {   // contiguous rows may be proposals for the same slot
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
-                        SessionState& sx = slot_ss(first);
-                        const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
-                                          (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
-                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
-                    }
-                } else
-                // a one-token window keeps its token: it advances the conv history and the state itself (commit)
-                if (fuse_ab)   // 143-amdk: the conv and the a/b projections in one launch
-                    gdn_conv_ab_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, tb, self_commit,
-                                      xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                                      (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
-                                      (int) HV, cs);
-                else
-                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
-                                  self_commit);
-                stamp(l, 3, grp);
-                if (br) {   // gate, beta and z, before the recurrence reads them
-                    join(0);
-                    join(1);
+                // STRATA_MEGAKERNEL: the whole dense chain as one persistent kernel where it covers the case (one token group
+                // from 0, no self-commit, no side branches/profile, Q8_0 projections, T <= 8); otherwise the six nodes
+                const bool use_mk = g_megakernel() && !br && !batch_rec_ && !self_commit && tb == 0 && n >= 1 &&
+                                    n <= 8 && wqkv->native_type == 8 && wg->native_type == 8 && wout->native_type == 8;
+                if (use_mk) {
+                    strata::kernels::MkGdnArgs a;
+                    a.x = xm; a.xq = xq_; a.w_qkv = wqkv->native_data; a.w_z = wg->native_data; a.w_out = wout->native_data;
+                    a.qkv = qkv; a.z = z_; a.hist = conv; a.w_conv = (const float*) wc->data; a.h = hb;
+                    a.w_alpha = (const uint16_t*) wa->data; a.w_beta = (const uint16_t*) wb->data; a.dt = (const float*) wdt->data;
+                    a.ssm_a = (const float*) wsa->data; a.gate = gate; a.beta = beta; a.state = state; a.gamma = (const float*) wnm->data;
+                    a.y = y_; a.yq = xq_;   // the out projection's q8_1 input reuses xq_ (its last reader, the qkv/z phase, is done)
+                    a.bo = bo_; a.n_embd = (int) N; a.conv_channels = (int) C; a.value_dim = (int) ZV; a.h_k = (int) HK; a.h_v = (int) HV;
+                    a.eps = EPS; a.counters = mk_counters_;
+                    if (q8_attn) a.diag |= 32;   // STRATA_QFUSE: xq_ already holds the input's q8_1 image - no quantize phase
+                    mk_gdn_dense(a, n, cs);
+                    stamp(l, 2, grp); stamp(l, 3, grp); stamp(l, 4, grp); stamp(l, 5, grp); stamp(l, 6, grp);   // (profile: the kernel lands in stage 2)
+                    il_ready = false;
+                    if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);   // TP: the half-width partial sums added
                 } else {
-                if (!fuse_ab)
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                             (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
-                             n, cs);
-                stamp(l, 4, grp);
-                if (!z_paired) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
-                stamp(l, 5, grp);
-                }
-                // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
-                        SessionState& sx = slot_ss(first);
-                        float* stx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
-                        gdn_step_norm_multi(stx, hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
-                                            beta + (size_t) first * HV, z_ + (size_t) first * ZV,
-                                            (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
-                                            (int) HK, (int) HV, t - first, nullptr, cs, 0);
+                    if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                    if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
+                        fork(0);
+                        gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                     (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                     (int) HV, n, df_side_[0]);
+                        fork(1);
+                        native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
+                                    df_side_[1]);
                     }
-                } else
-                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
-                stamp(l, 6, grp);
-                // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
-                // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
-                if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
-                il_ready = false;
-                mm(wout, bo_ + tb * N, (int) ZV, (int) N);
-                if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);   // TP: the half-width partial sums added
+                    const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_;
+                    // STRATA_RDNA_PAIR: q/k/v and z (the same input) in one launch when they share an RDNA format and mm()
+                    // would take native_mmvq for both (bitwise the two calls)
+                    auto il_path = [&](const WeightRef* w, int n_out) {
+                        return g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out);
+                    };
+                    const bool z_paired = !br && wqkv->native_type == wg->native_type && !il_path(wqkv, (int) C) &&
+                        !il_path(wg, (int) ZV) &&
+                        strata::kernels::rdna_mmvq_pair(wqkv->native_type, wqkv->native_data, wg->native_data, xq_,
+                                                        qkv + (size_t) tb * C, z_ + (size_t) tb * ZV, (int) N, (int) C,
+                                                        (int) ZV, n, cs);
+                    if (!z_paired) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                    stamp(l, 2, grp);
+                    if (batch_rec_) {   // contiguous rows may be proposals for the same slot
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            while (t < te && brow_[t] == brow_[first]) ++t;
+                            SessionState& sx = slot_ss(first);
+                            const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
+                                              (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                            gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
+                                              hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
+                        }
+                    } else
+                    // a one-token window keeps its token: it advances the conv history and the state itself (commit)
+                    if (fuse_ab)   // 143-amdk: the conv and the a/b projections in one launch
+                        gdn_conv_ab_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, tb, self_commit,
+                                          xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                          (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                          (int) HV, cs);
+                    else
+                    gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                      self_commit);
+                    stamp(l, 3, grp);
+                    if (br) {   // gate, beta and z, before the recurrence reads them
+                        join(0);
+                        join(1);
+                    } else {
+                    if (!fuse_ab)
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
+                                 n, cs);
+                    stamp(l, 4, grp);
+                    if (!z_paired) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                    stamp(l, 5, grp);
+                    }
+                    // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
+                    if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            while (t < te && brow_[t] == brow_[first]) ++t;
+                            SessionState& sx = slot_ss(first);
+                            float* stx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
+                            gdn_step_norm_multi(stx, hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
+                                                beta + (size_t) first * HV, z_ + (size_t) first * ZV,
+                                                (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
+                                                (int) HK, (int) HV, t - first, nullptr, cs, 0);
+                        }
+                    } else
+                    gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+                                        (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
+                    stamp(l, 6, grp);
+                    // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
+                    // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
+                    if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
+                    il_ready = false;
+                    mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                    if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);   // TP: the half-width partial sums added
+                }
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
