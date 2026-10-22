@@ -376,10 +376,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
+                          src/kernels/cuda/megakernel_gdn.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
+# The persistent kernel: the default (occupancy-first) scheduler serializes the GEMV's activation loads inside the
+# big kernel (one load, s_waitcnt, one dot4 ...); the ILP scheduler issues them together, as the standalone kernels get.
+if(STRATA_ENABLE_HIP)
+  set_source_files_properties(src/kernels/cuda/megakernel_gdn.cu PROPERTIES COMPILE_OPTIONS "-mllvm;-amdgpu-sched-strategy=max-ilp")
+endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  CUDA only: HIP compiles the tensor-core kernel out.
@@ -857,6 +863,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(gr_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME gr_parity COMMAND gr_parity --selftest)
 
+  add_executable(mk_gdn_parity src/kernels/mk_gdn_parity.cpp)
+  target_include_directories(mk_gdn_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(mk_gdn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME mk_gdn_parity COMMAND mk_gdn_parity --selftest)
   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(gdn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
