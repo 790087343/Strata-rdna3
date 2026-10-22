@@ -3441,7 +3441,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-    strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
+    strata::core::Verifier::set_commit_async(!multi_gpu, o.tensor_parallel != 0);   // see Verifier::set_commit_async
     // --pipeline-windows (opt-in): one conversation's windows with the two stages of a layer split overlapped.  Decided
     // here, before any stage sizes its expert cache (the second verifier per stage and the snapshots are allocated
     // after the caches, so their room is kept out of them).  What it does not support turns it off, said once.
@@ -11659,6 +11659,7 @@ int main(int argc, char** argv) {
             };
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
+            double dt_c_launch = 0, dt_c_nf = 0, dt_c_emit = 0, dt_c_adapt = 0;   // commit/emit, split (STRATA_DECODE_TIMING)
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
@@ -12417,7 +12418,7 @@ int main(int argc, char** argv) {
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg.on && p + T + 64 > kvg.cells &&
-                    !kvg_ensure(p + T + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                    !kvg_ensure(p + T + 64, [&] { std::string we; (void) dv.wait_commit(we); cudaDeviceSynchronize(); apply_pending(true); })) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }
@@ -12456,6 +12457,7 @@ int main(int argc, char** argv) {
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
                 const Clock::time_point tw1 = Clock::now();
+                auto msx = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
@@ -12473,7 +12475,11 @@ int main(int argc, char** argv) {
                 std::thread commit_thr;
                 bool commit_ok = true;
                 std::string commit_err;
+                const Clock::time_point tc0 = Clock::now();
+                dt_c_adapt += msx(tw1, tc0);
                 const bool nf_now = nonfinite_hit(dv, first_window ? "first decode" : "decode");   // (reads the window's flags only)
+                const Clock::time_point tc1 = Clock::now();
+                dt_c_nf += msx(tc0, tc1);
                 bool commit_split = false;   // TP: card 0's commit in or beside the draft, card 1's after it
                 std::function<void()> commit0 = [&] { commit_ok = tpv[0].commit_one(a + 1, commit_err); };
                 if (tp_on && use_mtp && !nf_now && (tp_commit_thread || tp_draft_all)) {
@@ -12484,6 +12490,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                const Clock::time_point tc2 = Clock::now();
+                dt_c_launch += msx(tc1, tc2);
                 if (nf_now) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
@@ -12511,6 +12519,7 @@ int main(int argc, char** argv) {
                 ++rounds;
                 if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
                 const Clock::time_point tw2 = Clock::now();
+                dt_c_emit += msx(tc2, tw2);
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
@@ -12608,6 +12617,8 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                std::fprintf(stderr, "strata decode timing: commit/emit = adapt spawn %.3f + nonfinite check %.3f + commit launch %.3f + emit %.3f ms/window\n",
+                             dt_c_adapt / dec_windows, dt_c_nf / dec_windows, dt_c_launch / dec_windows, dt_c_emit / dec_windows);
                 std::fprintf(stderr,"strata expert overlap: CPU_jobs_ms %.3f helper_tail_ms %.3f windows %lld; helper compute overlaps CPU jobs, tail is residual wait\n",
                              d1.cpu_only-ds0.cpu_only,d1.helper_tail-ds0.helper_tail,(long long)dec_windows);
                 if (aov)

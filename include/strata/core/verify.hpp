@@ -249,7 +249,8 @@ public:
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
-    static void set_commit_async(bool on);
+    /// `tp`: the tensor-parallel verifiers commit asynchronously too (each card's window follows its commit on its own stream).
+    static void set_commit_async(bool on, bool tp = false);
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
@@ -329,6 +330,7 @@ public:
     void set_pcie_off(bool off) { pcie_off_ = off; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ct_launch_ = 0, ct_event_ = 0, ct_query_ = 0; long long ct_n_ = 0;   // STRATA_COMMIT_TIMING
     double ms_launch = 0;   ///< TP: the host time of the window graphs' launches (both cards)
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per

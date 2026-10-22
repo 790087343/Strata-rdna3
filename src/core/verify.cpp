@@ -2878,8 +2878,11 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     return true;
 }
 
-namespace { bool g_commit_async = false; }
-void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+namespace { bool g_commit_async = false, g_commit_async_tp = false; }
+void Verifier::set_commit_async(bool on, bool tp) {
+    g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr;
+    g_commit_async_tp = tp && std::getenv("STRATA_COMMIT_SYNC") == nullptr;
+}
 
 bool Verifier::commit(int n_keep, std::string& err) {
     if (!commit_one(n_keep, err)) return false;
@@ -2915,20 +2918,34 @@ bool Verifier::commit_one(int n_keep, std::string& err) {
             ++c_n;
             cudaEventRecord(ce[0], cs_);
         }
+        static const bool cpart = std::getenv("STRATA_COMMIT_TIMING") != nullptr;   // host time of the launch / event / query
+        const Clock::time_point tl0 = Clock::now();
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+        const Clock::time_point tl1 = Clock::now();
         if (ctime) cudaEventRecord(ce[1], cs_);
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!g_commit_async || (next_ != nullptr && !tp_)) {   // (TP: each card's commit stays asynchronous)
+        // TP (set_commit_async's `tp`): each card's commit asynchronous - its next window follows it on the card's own stream,
+        // the drafter reads only the window's final rows; it was synchronous until 2026-10-22 because the global switch
+        // is off on every multi-GPU run (the layer split's stages hand rows over) and that waited ~0.6 ms a card a window
+        const bool async = tp_ ? g_commit_async_tp : (g_commit_async && next_ == nullptr);
+        if (!async) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
             const cudaError_t re = cudaEventRecord(commit_done_, cs_);
             if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
+            const Clock::time_point tl2 = Clock::now();
             (void) cudaStreamQuery(cs_);
             commit_pending_ = true;
+            if (cpart) {
+                ct_launch_ += ms_since(tl0) - ms_since(tl1); ct_event_ += ms_since(tl1) - ms_since(tl2); ct_query_ += ms_since(tl2); ++ct_n_;
+                if (ct_n_ % 200 == 0)
+                    std::fprintf(stderr, "strata verify: card %d commit host ms: launch %.3f event %.3f query %.3f (%lld commits)\n", device_,
+                                 ct_launch_ / ct_n_, ct_event_ / ct_n_, ct_query_ / ct_n_, ct_n_);
+            }
         }
     }
     if (ple_stage())   // stages that share one session must advance it once
