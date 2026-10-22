@@ -128,6 +128,13 @@
 
 
 namespace {
+// [claude] STRATA_SPEC_CUM=S (opt-in; unset or 0 = off; from android-imdad/Strata-7900xtx): a window keeps a draft only
+// while the product of the draft layer's probabilities up to it (the chance that every draft so far holds) is at least
+// S, beside --spec-min-p's per-draft floor.  It only chooses which drafts are verified: the output is unchanged.
+double spec_cum_floor() {
+    static const double v = [] { const char* e = std::getenv("STRATA_SPEC_CUM"); return e ? std::atof(e) : 0.0; }();
+    return v;
+}
 // [claude] DP prompt path tunables: STRATA_DP_MIN (tokens from which a segment reads on both GPUs, default 16384),
 // STRATA_DP_PIPE_CHUNK (the layer pipeline's chunk for shorter segments, default 8192)
 int64_t dp_min_tokens() {
@@ -11055,7 +11062,16 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: %s - the layer pipeline reads it\n", de.c_str());
                     return sp.run(ids.data() + a0 + head, b0 - a0 - head, a0 + head, e);
                 }
-                const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
+                // [claude] STRATA_BATCH_PIECE=<tokens> (opt-in, pipelined groups only): read beside decoding groups in
+                // pieces of that many tokens (the chunk can be the whole prompt, ~10 s at 32K, during which the other
+                // slots stall); between two pieces the groups decode for decode_share of the piece's time, then drain
+                static const int64_t piped_piece = [] {
+                    const char* v = std::getenv("STRATA_BATCH_PIECE");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) / 256 * 256 : (int64_t) 0;
+                }();
+                const bool piped_il = piped && piped_piece > 0 && batch_on();
+                const int64_t piece = piped_il ? piped_piece
+                                    : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
                 if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
@@ -11116,9 +11132,17 @@ int main(int argc, char** argv) {
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     in_prompt_read = true;
-                    do {
-                        if (!batch_step()) { in_prompt_read = false; batch_fatal = true; e = "a batch window failed"; return false; }
-                    } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    if (piped_il) {
+                        // the groups through both cards; the next piece needs every stage, so they drain first
+                        do {
+                            if (!pump(true)) { in_prompt_read = false; batch_fatal = true; e = "a batch window failed"; return false; }
+                        } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                        if (!pipe_drain()) { in_prompt_read = false; batch_fatal = true; e = "a batch window failed"; return false; }
+                    } else {
+                        do {
+                            if (!batch_step()) { in_prompt_read = false; batch_fatal = true; e = "a batch window failed"; return false; }
+                        } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    }
                     in_prompt_read = false;
                     ++il_parts;
                     il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
@@ -11499,7 +11523,12 @@ int main(int argc, char** argv) {
                     int T = S_mtp;
                     if (req_spec_min_p > 0.0) {
                         T = 1;
-                        while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) ++T;
+                        double cum = 1.0;   // STRATA_SPEC_CUM (see the serial loop)
+                        while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) {
+                            cum *= pr[from + T - 1];
+                            if (spec_cum_floor() > 0.0 && cum < spec_cum_floor()) break;
+                            ++T;
+                        }
                     }
                     return std::max(1, std::min(T, 1 + avail - from));
                 };
@@ -12020,7 +12049,12 @@ int main(int argc, char** argv) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    double cum = 1.0;
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) {
+                        cum *= dprob[(size_t) T - 1];
+                        if (spec_cum_floor() > 0.0 && cum < spec_cum_floor()) break;
+                        ++T;
+                    }
                 }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
