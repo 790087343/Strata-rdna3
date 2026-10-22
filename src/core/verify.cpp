@@ -623,6 +623,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
               mapped(64, (void**) &h_mk_stall_, (void**) &m_mk_stall_) &&
+              mapped(T * 4 + 16, (void**) &h_hchk_, (void**) &m_hchk_) &&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
@@ -668,7 +669,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        mk_counters_ = b.take<unsigned>(16);   // STRATA_MEGAKERNEL: the persistent kernel's counters (it re-zeroes them itself)
+        mk_counters_ = b.take<unsigned>(16);
+        hv_own_ = b.take<float>(T * 4); hv_peer_ = b.take<float>(T * 4);   // STRATA_MEGAKERNEL: the persistent kernel's counters (it re-zeroes them itself)
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, 4));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
@@ -939,7 +941,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto tp_xchg = [&](float* buf, int64_t n, int mode) {   // 0: all-reduce, 1: send (the MoE owner), 2: receive
         if (noxchg) return;
         ++tp_k;
-        if (mode != 2) ++tp_pub;
+        if (mode != 2) tp_pub += (uint32_t) tp_exchange_blocks(n);   // the blocks this card's sends have published
         const int par = (int) (tp_k & 1u);
         tp_exchange(buf, tpl_.peer_inbox[par], tpl_.inbox[par], tpl_.peer_flag, tpl_.flag, tp_epoch_d_, tp_k, tp_pub,
                     tp_cnt_, n, tpl_.rank, mode, cs);
@@ -1869,7 +1871,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
-    if (tp_ && !tp_head_) return true;   // TP: the other card runs the head (both hold the same residual)
+    if (tp_ && !tp_head_) {   // TP: the other card runs the head (both hold the same residual)
+        if (tp_head_half_ != nullptr && tp_head_half_->loaded()) {   // STRATA_TP_HEAD_SPLIT: vocabulary rows [row0, V) here
+            const int64_t nq = (int64_t) T * (N / 32) * 36 / 4;
+            tp_xchg((float*) xq_, nq, 2);   // the head card's q8_1 image of the head's input
+            const int rows = tp_head_half_->rows();
+            try {
+                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(tp_head_half_->type(), (int) T, rows)) {
+                    if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
+                    strata::kernels::native_mmvq_il(tp_head_half_->type(), tp_head_half_->weights(), xq_, xil_, head_logits_,
+                                                    (int) N, rows, (int) T, cs);
+                } else
+                native_mmvq(tp_head_half_->type(), tp_head_half_->weights(), xq_, head_logits_, (int) N, rows, T, cs);
+            } catch (const std::exception& e) {
+                err = std::string("verify head (TP split): ") + e.what();
+                return false;
+            }
+            head_argmax_part(head_logits_, T, rows, (int) tp_head_row0_, (int) n_vocab_, hv_own_, cs);
+            tp_xchg(hv_own_, (int64_t) T * 4, 1);
+        }
+        return true;
+    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
@@ -1943,6 +1965,47 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 }
             }
+        }
+        // STRATA_TP_HEAD_SPLIT: this card's rows [0, row0); the other card's arrive as picks (no full logits here)
+        const bool hsplit = tp_ && tp_head_ && tp_head_row0_ > 0 && head_ != nullptr && head_->loaded();
+        const int head_rows = hsplit ? (int) tp_head_row0_ : (int) n_vocab_;
+        if (hsplit) {
+            try {
+                native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+                tp_xchg((float*) xq_, (int64_t) T * (N / 32) * 36 / 4, 1);   // the other card's half reads the same image
+                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, head_rows)) {
+                    if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
+                    strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
+                                                    head_rows, (int) T, cs);
+                } else
+                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, head_rows, T, cs);
+            } catch (const std::exception& e) {
+                err = std::string("verify head: ") + e.what();
+                return false;
+            }
+            if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, head_rows, m_nf_, cs);
+            head_argmax_part(head_logits_, T, head_rows, 0, (int) n_vocab_, hv_own_, cs);
+            tp_xchg(hv_peer_, (int64_t) T * 4, 2);
+            head_argmax_combine(hv_own_, hv_peer_, T, (int32_t*) m_out_, nan_guard_on() ? m_nf_ : nullptr, cs);
+            static const bool hchk = std::getenv("STRATA_TP_HEAD_CHECK") != nullptr;
+            if (hchk) {   // the unsplit head's pick too (its logits over our half's): compared on the host after the window
+                try {
+                    if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
+                        strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
+                                                        (int) n_vocab_, (int) T, cs);
+                    } else
+                    native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                } catch (const std::exception& e) {
+                    err = std::string("verify head check: ") + e.what();
+                    return false;
+                }
+                SamplerParams sp;
+                sp.greedy = true;
+                sp.temperature = 0.0f;
+                sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_hchk_, cs);
+            }
+            stamp(g.n_layers, 1, 0);
+            return true;
         }
         if (head_ != nullptr && head_->loaded()) {
             try {
@@ -2472,8 +2535,34 @@ bool Verifier::serve_rings(int T, PoolMultiFn pool, void* user, bool do_ple, con
 // non-finite check.  The window's graph has finished (synced) by now.
 bool Verifier::finish_head(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err) {
     using namespace strata::kernels;
+    static const bool hchk = std::getenv("STRATA_TP_HEAD_CHECK") != nullptr;
+    if (hchk && tp_ && tp_head_ && tp_head_row0_ > 0 && h_hchk_ != nullptr) {   // the split pick against the full one
+        for (int t = 0; t < T; ++t) {
+            ++hchk_rows_;
+            if (((volatile int32_t*) h_out_)[t] != ((volatile int32_t*) h_hchk_)[t]) ++hchk_bad_;
+        }
+        if (hchk_rows_ % 512 < (long long) T)
+            std::fprintf(stderr, "strata verify: TP head split check: %lld of %lld rows differ from the full head's pick\n",
+                         hchk_bad_, hchk_rows_);
+    }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
+        if (tp_ && tp_head_ && tp_head_row0_ > 0 && head_ != nullptr && head_->loaded()) {
+            // STRATA_TP_HEAD_SPLIT: the window computed rows [0, row0) only - the full logits again from the head's q8_1
+            // image (xq_, the window's last writer), with the kernel the unsplit window uses
+            const OnDevice on_device(device_);
+            try {
+                if (g_mmvq_il() && native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
+                    if (T >= 2) native_q8_1_interleave(xq_, xil_, (int) g_->n_embd, (int) T, cs_);
+                    native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) g_->n_embd, (int) n_vocab_,
+                                   (int) T, cs_);
+                } else
+                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) g_->n_embd, (int) n_vocab_, T, cs_);
+            } catch (const std::exception& e) {
+                err = std::string("verify head (full logits): ") + e.what();
+                return false;
+            }
+        }
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)

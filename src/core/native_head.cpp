@@ -19,6 +19,12 @@ NativeHead::~NativeHead() {
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
+    return load_rows(shards, n_in, n_out, 0, n_out, err);
+}
+
+bool NativeHead::load_rows(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, int64_t row0, int64_t row1,
+                           std::string& err) {
+    if (row0 < 0 || row1 > n_out || row0 >= row1) { err = "native head: an empty or out-of-range row slice"; return false; }
     if (loaded()) { err = "native head is already loaded"; return false; }
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
@@ -38,20 +44,23 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
             return false;
         }
-        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        const uint64_t full = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
-        if (tensor->offset > payload || bytes > payload - tensor->offset) {
+        if (tensor->offset > payload || full > payload - tensor->offset) {
             err = "native head: truncated output.weight payload";
             return false;
         }
+        const uint64_t row_b = full / (uint64_t) n_out;   // GGUF blocks are row-major: a row slice is contiguous
+        const uint64_t bytes = row_b * (uint64_t) (row1 - row0);
+        const uint8_t* src = static_cast<const uint8_t*>(gguf.tensor_data(*tensor)) + row_b * (uint64_t) row0;
         void* weights = nullptr;
         void* scratch = nullptr;
         cudaError_t status = cudaMalloc(&weights, bytes);
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+        strata::platform::advise_willneed(src, bytes);
         if (status == cudaSuccess)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+            status = cudaMemcpy(weights, src, bytes, cudaMemcpyHostToDevice);
         if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
@@ -62,7 +71,8 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         scratch_ = scratch;
         bytes_ = bytes;
         n_in_ = (int) n_in;
-        n_out_ = (int) n_out;
+        n_out_ = (int) (row1 - row0);
+        row0_ = row0;
         type_ = (int) tensor->type;
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");

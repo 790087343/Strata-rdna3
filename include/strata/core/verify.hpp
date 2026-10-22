@@ -243,6 +243,11 @@ public:
     /// device and adds its partial in the layer's second exchange, now a true all-reduce.
     bool set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err,
                 int mode = 1);
+    /// TP head split (STRATA_TP_HEAD_SPLIT=1, greedy windows): the head card computes vocabulary rows [0, row0) and
+    /// the other card (`half`, rows [row0, n_vocab), on its own device) the rest from the head card's q8_1 image;
+    /// the picks are combined on the head card.  Call on both cards (the head card passes half = nullptr) before
+    /// the first capture.  A sampled or penalized request gets the full logits again in finish_head.
+    void set_tp_head_split(const NativeHead* half, int64_t row0) { tp_head_half_ = half; tp_head_row0_ = row0; }
     bool tp() const { return tp_; }
     int tp_rank() const { return tpl_.rank; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
@@ -547,7 +552,12 @@ private:
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     unsigned *h_mk_stall_ = nullptr, *m_mk_stall_ = nullptr;   // STRATA_MEGAKERNEL: a phase that never completed (mapped)
-    unsigned* mk_counters_ = nullptr;                         // STRATA_MEGAKERNEL: the persistent kernel's phase counters
+    unsigned* mk_counters_ = nullptr;
+    const NativeHead* tp_head_half_ = nullptr;   // set_tp_head_split
+    int64_t tp_head_row0_ = 0;
+    float *hv_own_ = nullptr, *hv_peer_ = nullptr;   // the split head's picks (T x 4 floats each)
+    int32_t *h_hchk_ = nullptr, *m_hchk_ = nullptr;   // STRATA_TP_HEAD_CHECK: the full-vocabulary pick beside the split one (mapped)
+    long long hchk_rows_ = 0, hchk_bad_ = 0;                         // STRATA_MEGAKERNEL: the persistent kernel's phase counters
     uint8_t* xil_ = nullptr;                                  // fork F4: the interleaved copy of xq_'s 2-4 columns
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer

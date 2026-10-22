@@ -141,6 +141,14 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 /// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA and HIP.
 inline constexpr int kNonfiniteBlocks = 16;
 void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
+/// TENSOR PARALLEL head split (STRATA_TP_HEAD_SPLIT): row t's greedy pick over a slice of the vocabulary - logits
+/// (n_rows, n), vocabulary ids [base, base + n) - as sampler_greedy_kernel orders it (the larger value, on equality the
+/// lower id; a NaN never wins), into vi[t * 4 .. + 4) = {value, id as int bits (`sentinel` when no candidate), 1 when
+/// the slice holds a non-finite logit, 0}.
+void head_argmax_part(const float* logits, int n_rows, int n, int base, int sentinel, float* vi, void* stream);
+/// The two slices' picks: `own` holds the LOWER ids (it wins a tie, as the full argmax would), `peer` the upper;
+/// out[t] = the id; a peer slice's non-finite flag is ORed into flags[t * kNonfiniteBlocks + kNonfiniteBlocks - 1].
+void head_argmax_combine(const float* own, const float* peer, int n_rows, int32_t* out, uint32_t* flags, void* stream);
 /// True where row_top_prob_split runs as its own kernel (CUDA; AMD keeps the one-block row_top_prob, so it calls
 /// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.
 bool multi_block_head_ops();
@@ -161,9 +169,12 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 void tp_window_begin(uint32_t* epoch_d, unsigned* cnt, const uint32_t* epoch_h, void* stream);
 /// Exchange `k` (1, 2, ...) of the window over the `n` floats at `mine` (a multiple of 4).  mode 0, the all-reduce: the
 /// floats are stored into `peer_inbox`, `peer_flag` is raised to epoch + k once every block has stored (`cnt` counts
-/// the blocks of this card's publishing exchanges: `pub` is this exchange's ordinal among them), the kernel waits for
+/// the blocks of this card's publishing exchanges: `pub` is the sum of tp_exchange_blocks over them, this one's included -
+/// sends of different sizes in one window, e.g. the head split's q8_1 image and picks), the kernel waits for
 /// `my_flag` >= epoch + k and writes mine = partial(rank 0) + partial(rank 1), the same order on both cards.  mode 1
 /// (send): the store and the flag only.  mode 2 (receive): the wait, then mine <- my_inbox.
+/// The grid tp_exchange launches for n floats (a send's share of the publish count).
+int tp_exchange_blocks(int64_t n);
 void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t* peer_flag, const uint32_t* my_flag,
                  const uint32_t* epoch_d, uint32_t k, uint32_t pub, unsigned* cnt, int64_t n, int rank, int mode,
                  void* stream);

@@ -907,6 +907,61 @@ __global__ void logits_nonfinite_kernel(const float* __restrict__ logits, int n,
 }
 }  // namespace
 
+namespace {
+__global__ void __launch_bounds__(256) head_argmax_part_kernel(const float* __restrict__ logits, int n, int base, int sentinel,
+                                                               float* __restrict__ vi) {
+    const int t = (int) blockIdx.x;
+    const float* l = logits + (size_t) t * n;
+    float bv = __int_as_float(0xff800000);   // -inf
+    int best = n;                            // "no candidate": loses every comparison
+    int bad = 0;
+    for (int v = (int) threadIdx.x; v < n; v += (int) blockDim.x) {
+        const float s = l[v];
+        bad |= (__float_as_uint(s) & 0x7f800000u) == 0x7f800000u;
+        if (s > bv) { bv = s; best = v; }
+    }
+    __shared__ float sv[256 / 32];
+    __shared__ int si[256 / 32];
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+        const int oi = __shfl_xor_sync(0xffffffffu, best, off);
+        if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+    }
+    bad = __syncthreads_or(bad);
+    const int w = (int) threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) { sv[w] = bv; si[w] = best; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int k = 1; k < (int) (blockDim.x >> 5); ++k)
+            if (sv[k] > bv || (sv[k] == bv && si[k] < best)) { bv = sv[k]; best = si[k]; }
+        vi[t * 4 + 0] = bv;
+        vi[t * 4 + 1] = __int_as_float(best < n ? best + base : sentinel);
+        vi[t * 4 + 2] = bad ? 1.0f : 0.0f;
+        vi[t * 4 + 3] = 0.0f;
+    }
+}
+__global__ void head_argmax_combine_kernel(const float* __restrict__ own, const float* __restrict__ peer, int n_rows,
+                                           int32_t* __restrict__ out, uint32_t* __restrict__ flags) {
+    const int t = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= n_rows) return;
+    const float v1 = own[t * 4], v0 = peer[t * 4];
+    const int i1 = __float_as_int(own[t * 4 + 1]), i0 = __float_as_int(peer[t * 4 + 1]);
+    out[t] = v0 > v1 ? i0 : i1;   // a tie: the own (lower) slice's id
+    if (flags != nullptr && peer[t * 4 + 2] != 0.0f) flags[t * kNonfiniteBlocks + kNonfiniteBlocks - 1] = 1u;
+}
+}  // namespace
+
+void head_argmax_part(const float* logits, int n_rows, int n, int base, int sentinel, float* vi, void* stream) {
+    if (n_rows <= 0 || n <= 0) return;
+    head_argmax_part_kernel<<<(unsigned) n_rows, 256, 0, (cudaStream_t) stream>>>(logits, n, base, sentinel, vi);
+    check("head_argmax_part");
+}
+void head_argmax_combine(const float* own, const float* peer, int n_rows, int32_t* out, uint32_t* flags, void* stream) {
+    if (n_rows <= 0) return;
+    head_argmax_combine_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(own, peer, n_rows, out, flags);
+    check("head_argmax_combine");
+}
+
 void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream) {
     if (n_rows <= 0 || n <= 0) return;
     const int per_block = (n + kNonfiniteBlocks - 1) / kNonfiniteBlocks;
@@ -1537,7 +1592,7 @@ __global__ void __launch_bounds__(kTpThreads) tp_exchange_kernel(float4* __restr
         __syncthreads();
         if (threadIdx.x == 0) {
             const unsigned done = atomicAdd(cnt, 1u) + 1u;
-            if (done == gridDim.x * pub) {   // the last block of this exchange to have stored: every block's stores are fenced
+            if (done == pub) {   // the last block of this exchange to have stored (pub: the card's sends' blocks so far, this one's included)
                 __threadfence_system();
                 *peer_flag = want;
                 __threadfence_system();
@@ -1573,6 +1628,13 @@ void tp_window_begin(uint32_t* epoch_d, unsigned* cnt, const uint32_t* epoch_h, 
     check("tp_window_begin");
 }
 
+int tp_exchange_blocks(int64_t n) {
+    int blocks = (int) ((n / 4 + kTpThreads - 1) / kTpThreads);
+    if (blocks > 16) blocks = 16;
+    if (blocks < 1) blocks = 1;
+    return blocks;
+}
+
 void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t* peer_flag, const uint32_t* my_flag,
                  const uint32_t* epoch_d, uint32_t k, uint32_t pub, unsigned* cnt, int64_t n, int rank, int mode,
                  void* stream) {
@@ -1582,9 +1644,7 @@ void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t
         std::exit(1);
     }
     const int n4 = (int) (n / 4);
-    int blocks = (n4 + kTpThreads - 1) / kTpThreads;
-    if (blocks > 16) blocks = 16;
-    if (blocks < 1) blocks = 1;
+    const int blocks = tp_exchange_blocks(n);
     const dim3 grid((unsigned) blocks), block(kTpThreads);
     cudaStream_t cs = (cudaStream_t) stream;
     float4* m4 = (float4*) mine;

@@ -20,6 +20,12 @@ public:
     NativeHead& operator=(const NativeHead&) = delete;
 
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    /// Vocabulary rows [row0, row1) only (the TP head split's other card); n_out is the full vocabulary.
+    bool load_rows(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, int64_t row0, int64_t row1,
+                   std::string& err);
+    /// The rows this head holds start at this vocabulary id (load_rows), 0 otherwise; rows() of them.
+    int64_t row0() const { return row0_; }
+    int rows() const { return n_out_; }
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
@@ -34,6 +40,7 @@ private:
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
+    int64_t row0_ = 0;
     int type_ = -1;
 };
 

@@ -4537,6 +4537,25 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: tensor parallel: CUDA%d holds %.0f MiB of sliced dense weights\n", tp_dev[r],
                      (double) tp_w[r].bytes() / 1048576.0);
     }
+    // STRATA_TP_HEAD_SPLIT=1 (opt-in): vocabulary rows [V/2, V) of the head on the other card too - the head card
+    // computes rows [0, V/2) and combines the two picks (greedy windows; Verifier::set_tp_head_split)
+    strata::core::NativeHead tp_head_half;
+    int64_t tp_head_row0 = 0;
+    if (tp_on && std::getenv("STRATA_TP_HEAD_SPLIT") != nullptr && std::atoi(std::getenv("STRATA_TP_HEAD_SPLIT")) != 0 &&
+        stages[0]->head.loaded()) {
+        const strata::core::OnDevice on(tp_dev[0]);
+        const int64_t V = stages[0]->head.rows();
+        const int64_t row0 = V / 2 / 256 * 256;
+        if (!tp_head_half.load_rows(o.native_head_shards, g.n_embd, V, row0, V, err)) {
+            std::fprintf(stderr, "strata generate: --tensor-parallel: CUDA%d's half of the head: %s%s\n", tp_dev[0], err.c_str(),
+                         vram_free_note().c_str());
+            return 1;
+        }
+        tp_head_row0 = row0;
+        std::fprintf(stderr, "strata generate: tensor parallel: the head split - CUDA%d holds vocabulary rows [%lld, %lld) "
+                             "(%.0f MiB), CUDA%d computes [0, %lld) and combines the picks\n", tp_dev[0], (long long) row0,
+                     (long long) V, (double) tp_head_half.weight_bytes() / 1048576.0, tp_dev[1], (long long) row0);
+    }
     mem_mark("the tensor-parallel sessions and weights");
 
     // [claude] DP prompt path (STRATA_DP_PREFILL=1, docs/DP_PREFILL_DESIGN.md): two GPUs, each also holds the state of
@@ -7986,6 +8005,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: --tensor-parallel: %s\n", err.c_str());
                     return 1;
                 }
+                if (tp_head_row0 > 0) tpv[r].set_tp_head_split(r == 0 ? &tp_head_half : nullptr, tp_head_row0);
                 strata::core::VerifyHits hits_r = vh;
                 if (r == 1) {
                     hits_r.d_res = gs.d_res;
