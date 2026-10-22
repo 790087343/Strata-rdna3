@@ -803,7 +803,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             qcnt_ = nullptr;
         }
     }
-    if (all_resident_ || device_plan_) {
+    if (tp_gpu_only_) all_resident_ = false;   // (its own range is empty: the loop above saw nothing)
+    if (all_resident_ || device_plan_ || tp_gpu_only_) {
         bool ok2 = true;
         if (device_plan_)
             ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -1511,7 +1512,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                           && !g_doorbell_store
 #endif
             ;
-        const bool rpub = rpub_base && !always_publish_, rpub_all = rpub_base && always_publish_;
+        const bool rpub = rpub_base && !always_publish_ && !tp_gpu_only_, rpub_all = rpub_base && always_publish_ && !tp_gpu_only_;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -1559,6 +1560,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+        }
+        if (tp_gpu_only_) {   // TP by id: this card's resident experts planned on the device (the rest are the other card's)
+            resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                          hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                          plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, nullptr, true);
+            stamp(l, 17, grp);
+            stamp(l, 18, grp);
+            return true;
         }
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
@@ -1648,9 +1657,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         const uint32_t ring = ringof(l, grp);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
-        if (!tp_own(l)) {   // TP: this layer's block output comes from the card that owns its experts
-            tp_xchg(bo_ + tb * N, (int64_t) n * N, 2);
-        } else {
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
         const int32_t* p_counts = pl;
         const int32_t* p_start = pl + 4;
@@ -1678,6 +1684,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        if (tp_gpu_only_) {   // TP by id: this card's hits into zeroed rows, the combine (no shared expert here), the all-reduce
+            if (cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs) != cudaSuccess) {
+                err = "verify: the TP parts memset failed";
+                return false;
+            }
+            stamp(l, 19, grp);
+            grouped(p_ptr, p_start, p_counts, 0, parts_out);
+            stamp(l, 20, grp);
+            try {
+                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+            tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);
+        } else if (!tp_own(l)) {   // TP: this layer's block output comes from the card that owns its experts
+            tp_xchg(bo_ + tb * N, (int64_t) n * N, 2);
+        } else {
         if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
@@ -1782,7 +1803,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
-        if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 1);   // TP: the block output to the other card
+        if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, tp_mode_ == 2 ? 0 : 1);   // TP: the block output to / with the other card
         }   // tp_own
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
@@ -2549,13 +2570,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 
 // ================================ TENSOR PARALLEL (see verify.hpp set_tp, core/tp.hpp) ================================
 
-bool Verifier::set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err) {
+bool Verifier::set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err,
+                      int mode) {
     if (g_ != nullptr) { err = "verify: set_tp must come before init"; return false; }
-    if (peer == nullptr || peer == this || own_lb < 0 || own_le <= own_lb || (link.rank != 0 && link.rank != 1)) {
+    if (peer == nullptr || peer == this || own_lb < 0 || own_le < own_lb || (link.rank != 0 && link.rank != 1) ||
+        (mode != 1 && mode != 2) || (mode == 1 && own_le == own_lb)) {
         err = "verify: set_tp arguments";
         return false;
     }
     tp_ = true;
+    tp_mode_ = mode;
+    tp_gpu_only_ = mode == 2 && link.rank == 1;   // rank 1 by id: rings nothing (own_lb == own_le)
     tpl_ = link;
     tp_lb_ = own_lb;
     tp_le_ = own_le;

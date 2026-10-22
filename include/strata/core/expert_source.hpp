@@ -410,6 +410,10 @@ struct ExpertDispatch {
     /// of what the device hit path reads.  When set, the pool leaves a resident expert's row at zero (the GPU
     /// computes it) without any `Launch` callback.
     const int32_t* host_res = nullptr;
+    /// Tensor parallel by expert id (core/tp.hpp, M2): the OTHER card's residency table.  An expert it holds is
+    /// computed there, inside that card's own window: its row stays zero here and the CPU does nothing for it (as a
+    /// peer's or a helper's).  Null: no other card.
+    const int32_t* tp_other_res = nullptr;
     /// Plan v0.3 P4: split every expert by rows across the pool's threads (default on; A/B `--no-split-rows`).
     bool split_rows = true;
 

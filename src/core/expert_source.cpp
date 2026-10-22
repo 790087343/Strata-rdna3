@@ -3685,6 +3685,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    !(d.tp_other_res != nullptr && d.tp_other_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) &&
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
@@ -3706,6 +3707,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t e = ids[distinct[q]];
                 if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                if (d.tp_other_res != nullptr && d.tp_other_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // on the other card
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;
@@ -3733,6 +3735,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
+                } else if (d.tp_other_res != nullptr && d.tp_other_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) {
+                    kd = 2;                        // tensor parallel by id: the other card computes it in its own window
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
@@ -3795,6 +3799,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i];
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
+                    : (e >= 0 && e < d.n_expert && d.tp_other_res != nullptr &&
+                       d.tp_other_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 2
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
         }
     }

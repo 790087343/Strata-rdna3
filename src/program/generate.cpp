@@ -332,9 +332,10 @@ struct SwapHome {
     cudaStream_t stream;
     int dev;
 };
-template <class Swap, class Locate>
-bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
-                          int64_t n_expert, std::vector<Swap>& swaps, Locate locate) {
+template <class Swap, class Locate, class SlotOf>
+bool resident_stage_swaps(strata::core::FileExpertSource& src, int64_t n_expert, std::vector<Swap>& swaps, Locate locate,
+                          SlotOf slot_of) {
+    (void) n_expert;
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -345,9 +346,9 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
         const int64_t q = (int64_t) staged.size();
         if (q >= src.exchange_capacity()) continue;
-        const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+        const int32_t slot = slot_of(s);
         if (slot < 0) continue;
-        const SwapHome home = locate(s.layer);
+        const SwapHome home = locate(s);
         const strata::core::OnDevice on(home.dev);
         if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(q), home.cache->device_slot(slot),
                             (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
@@ -712,7 +713,7 @@ struct Options {
     /// --tensor-parallel (core/tp.hpp): with a layer split on two GPUs, the decode windows run tensor-parallel - every
     /// layer on both cards at half the heads, the partial sums exchanged through pinned memory; the routed experts stay
     /// with the layer split's owner card.  The prompt is read layer-split as before and handed over.
-    bool tensor_parallel = false;
+    int tensor_parallel = 0;   ///< 0 off; 1 = M1 (experts with the layer split's owner card); 2 = by expert id (the default of --tensor-parallel)
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -849,8 +850,9 @@ void usage() {
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
                  "                       slot drafters sit on the last stage's GPU; not with --batch-groups); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
-                 "  --tensor-parallel    --serve with a layer split on two GPUs: the decode windows run every layer on both\n"
-                 "                       cards at half the heads (tensor parallel; the experts stay with the layer split)\n"
+                 "  --tensor-parallel [M] --serve with a layer split on two GPUs: the decode windows run every layer on both\n"
+                 "                       cards at half the heads (tensor parallel); M=2 (default) splits every layer's experts\n"
+                 "                       between the two caches by id, M=1 keeps them with the layer split's owner card\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 3+ stages on AMD gfx12;\n"
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
@@ -2045,7 +2047,10 @@ int main(int argc, char** argv) {
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
-        else if (a == "--tensor-parallel") o.tensor_parallel = true;
+        else if (a == "--tensor-parallel") {
+            o.tensor_parallel = 2;
+            if (i + 1 < argc && (std::string(argv[i + 1]) == "1" || std::string(argv[i + 1]) == "2")) o.tensor_parallel = std::atoi(next("--tensor-parallel"));
+        }
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
             o.batch_groups_set = true;
@@ -4268,11 +4273,16 @@ int main(int argc, char** argv) {
     // the experts no GPU holds over ALL the layers (with CUDA0's share alone, a copy that did not fit kept only layers
     // 0..K-1's experts and read every later layer's from the files)
     std::vector<std::pair<int32_t, int32_t>> profile_all;
+    // TENSOR PARALLEL by id (--tensor-parallel 2): both caches hold every layer - the ranking dealt out alternately, so
+    // each card holds half of every layer's hot experts (decided here, before the caches are sized: tp_on follows)
+    const bool tp2_want = o.tensor_parallel == 2 && multi_gpu && stages.size() == 1 && !split_same && o.batch == 0 &&
+                          o.peer_device < 0 && !o.mtp.empty() && o.spec >= 2;
     if (multi_gpu) {
         profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
-        for (const auto& pr : profile) {
-            const int st = stage_of(pr.first);
+        for (size_t i = 0; i < profile.size(); ++i) {
+            const auto& pr = profile[i];
+            const int st = tp2_want ? (int) (i % 2) : stage_of(pr.first);
             (st == 0 ? mine : stages[(size_t) st - 1]->profile).push_back(pr);
         }
         profile.swap(mine);
@@ -4394,8 +4404,9 @@ int main(int argc, char** argv) {
 
     // ---- TENSOR PARALLEL (core/tp.hpp, --tensor-parallel): each card's session for every layer at half the heads.  The
     // stages' sessions stay (the prompt is read layer-split into them, then handed over: tp_state_move).
-    const bool tp_on = o.tensor_parallel && multi_gpu && stages.size() == 1 && !split_same && o.batch == 0 &&
+    const bool tp_on = o.tensor_parallel != 0 && multi_gpu && stages.size() == 1 && !split_same && o.batch == 0 &&
                        o.peer_device < 0 && !o.mtp.empty() && o.spec >= 2;
+    const bool tp2 = tp_on && o.tensor_parallel == 2;   // experts by id: two residency tables (host_res, host_res1)
     if (o.tensor_parallel && !tp_on)
         std::fprintf(stderr, "strata generate: --tensor-parallel is off (needs a layer split on two GPUs, --mtp with "
                              "--spec >= 2, no --batch / --peer-device)\n");
@@ -6364,22 +6375,35 @@ int main(int argc, char** argv) {
     // Plan v0.3 P4: with a PROFILE-filled cache the residency is static, so the hit decision moves onto the
     // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
     std::vector<int32_t> host_res;
+    std::vector<int32_t> host_res1;   // tp2: card 1's table (host_res is card 0's); else empty and host_res serves every card
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
-    auto res_put = [&host_res](int32_t* dst) -> cudaError_t {
-        const cudaError_t e = cudaMemcpy(dst, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    auto res_put_tbl = [](int32_t* dst, const std::vector<int32_t>& tbl) -> cudaError_t {
+        const cudaError_t e = cudaMemcpy(dst, tbl.data(), tbl.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         return e != cudaSuccess ? e : cudaStreamSynchronize(nullptr);
     };
+    auto res_put = [&](int32_t* dst) -> cudaError_t { return res_put_tbl(dst, host_res); };
+    // the table a stage's device reads (tp2: its own)
+    auto res_of_stage = [&](size_t i) -> std::vector<int32_t>& { (void) i; return tp2 ? host_res1 : host_res; };
+    // a GPU holds (layer, expert): on any card
+    auto gpu_held = [&](size_t i) { return host_res[i] != strata::core::kNotResident || (tp2 && host_res1[i] != strata::core::kNotResident); };
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
     strata::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+        if (tp2) host_res1.assign(host_res.size(), strata::core::kNotResident);
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
+                if (tp2) {   // every layer in both caches: each card's own slots in its own table
+                    host_res[(size_t) (l * g.n_expert + e)] = xcache.slot_of(l, e);
+                    host_res1[(size_t) (l * g.n_expert + e)] = stages[0]->cache.slot_of(l, e);
+                    resident += (host_res[(size_t) (l * g.n_expert + e)] >= 0) + (host_res1[(size_t) (l * g.n_expert + e)] >= 0);
+                    continue;
+                }
                 const int st = multi_gpu ? stage_of(l) : 0;
                 const int32_t slot = st > 0 ? stages[(size_t) st - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e);
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
@@ -6403,7 +6427,7 @@ int main(int argc, char** argv) {
             uint64_t released = 0;
             if (!keep)
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] != strata::core::kNotResident)
+                    if (gpu_held(i))
                         released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             if (released > 0)
                 std::fprintf(stderr, "strata generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
@@ -6411,17 +6435,18 @@ int main(int argc, char** argv) {
             rss_probe("after the release");
             int64_t pf = 0;
             for (size_t i = 0; i < host_res.size(); ++i)
-                if (host_res[i] == strata::core::kNotResident) {
+                if (!gpu_held(i)) {
                     srcp->prefetch((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
                     ++pf;
                 }
             (void) pf;
             rss_probe("after the prefetch hints");
         }
-        for (auto& st : stages) {   // layer split across GPUs: the same table on every device
+        for (size_t si = 0; si < stages.size(); ++si) {   // layer split across GPUs: the same table on every device (tp2: its own)
+            auto& st = stages[si];
             const strata::core::OnDevice on(st->dev);
             if (cudaMalloc((void**) &st->d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
-                res_put(st->d_res) !=
+                res_put_tbl(st->d_res, res_of_stage(si)) !=
                     cudaSuccess) {
                 std::fprintf(stderr, "strata generate: layer split: CUDA%d residency table failed\n", st->dev);
                 return 1;
@@ -6437,8 +6462,9 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
-        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device\n",
-                     (long long) resident);
+        if (tp2) drive.d.tp_other_res = host_res1.data();   // card 1's experts: computed there, zero rows here
+        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device%s\n",
+                     (long long) resident, tp2 ? " (tensor parallel by id: both cards' tables)" : "");
     }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
         (hit_fn == nullptr || thits.on()) && !native_pack && !multi_gpu) {   // a split's token graph cannot span stages
@@ -7222,6 +7248,7 @@ int main(int argc, char** argv) {
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
             return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr));
         };
+        auto tbl_of = [&](const PfPart& p) -> std::vector<int32_t>& { return p.dev >= 0 && tp2 ? host_res1 : host_res; };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
             strata::core::ExpertCache& xc = *p.cache;
             return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
@@ -7239,9 +7266,10 @@ int main(int argc, char** argv) {
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
         if (pf_borrow && d_res != nullptr) {
-            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+            // (tp2: every cache holds rows of every layer, and each card's loan marks its own table: tbl_of)
+            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu && !tp2 ? split_at[0] : g.n_layers, -1, -1, 0, {}});
             for (auto& st : stages)
-                pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
+                pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, tp2 ? 0 : st->lb, tp2 ? g.n_layers : st->le, -1, -1, 0, {}});
             // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
             // 128-slot floor.  The percentage cap is an AUTO-chunk rule and only the auto scan applies it - an
             // explicit --prefill is the operator's number, and a loan of it only has to fit.  With one participant
@@ -7480,7 +7508,7 @@ int main(int argc, char** argv) {
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
                 if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
-                if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
+                if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, res_of_stage(i).data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -7623,7 +7651,7 @@ int main(int argc, char** argv) {
                 int64_t n = 0;
                 for (int64_t l = p.lb; l < p.le; ++l)
                     for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                        int32_t& r = host_res[(size_t) (l * g.n_expert + ex)];
+                        int32_t& r = tbl_of(p)[(size_t) (l * g.n_expert + ex)];
                         if (r >= first_s) { r = strata::core::kNotResident; ++n; }
                     }
                 evicted += n;
@@ -7634,9 +7662,9 @@ int main(int argc, char** argv) {
             if (evicted > 0) {
                 if (d_res != nullptr)
                     res_put(d_res);
-                for (auto& st : stages) {
-                    const strata::core::OnDevice on(st->dev);
-                    res_put(st->d_res);
+                for (size_t si = 0; si < stages.size(); ++si) {
+                    const strata::core::OnDevice on(stages[si]->dev);
+                    res_put_tbl(stages[si]->d_res, res_of_stage(si));
                 }
             }
         }
@@ -7907,13 +7935,16 @@ int main(int argc, char** argv) {
                 link.flag = tp_pages.flag_d[r][r];
                 link.flag_h = tp_pages.flag_h[r];
                 link.peer_flag = tp_pages.flag_d[1 - r][r];
-                if (!tpv[r].set_tp(link, r == 0 ? 0 : split_at[0], r == 0 ? split_at[0] : g.n_layers, r == 1, &tpv[1 - r], err)) {
+                const int64_t own_lb = tp2 ? 0 : (r == 0 ? 0 : split_at[0]);
+                const int64_t own_le = tp2 ? (r == 0 ? g.n_layers : 0) : (r == 0 ? split_at[0] : g.n_layers);
+                if (!tpv[r].set_tp(link, own_lb, own_le, r == 1, &tpv[1 - r], err, o.tensor_parallel)) {
                     std::fprintf(stderr, "strata serve: --tensor-parallel: %s\n", err.c_str());
                     return 1;
                 }
                 strata::core::VerifyHits hits_r = vh;
                 if (r == 1) {
                     hits_r.d_res = gs.d_res;
+                    if (tp2) hits_r.h_res = host_res1.empty() ? nullptr : host_res1.data();
                     hits_r.cache_base = gs.cache.device_slot(0);
                     hits_r.slot_off = gs.cache.slot_offsets();
                     hits_r.n_slots = gs.cache.slots();
@@ -7925,16 +7956,42 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 tpv[r].set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
-                std::fprintf(stderr, "strata serve: tensor parallel: CUDA%d verifier: layers %lld-%lld's experts%s\n",
-                             tp_dev[r], (long long) (r == 0 ? 0 : split_at[0]),
-                             (long long) ((r == 0 ? split_at[0] : g.n_layers) - 1), r == 1 ? ", the head" : "");
+                if (tp2) std::fprintf(stderr, "strata serve: tensor parallel by id: CUDA%d verifier holds %lld of every layer's experts in "
+                                              "its cache%s%s\n", tp_dev[r], (long long) (r == 0 ? xcache.slots() : gs.cache.slots()),
+                                      r == 0 ? ", rings the host (CPU rows, shared expert)" : ", plans on the device", r == 1 ? ", the head" : "");
+                else std::fprintf(stderr, "strata serve: tensor parallel: CUDA%d verifier: layers %lld-%lld's experts%s\n",
+                                  tp_dev[r], (long long) own_lb, (long long) (own_le - 1), r == 1 ? ", the head" : "");
             }
             tp_drive = split_drive;
             tp_drive.plan[0] = tpv[0].plan_sink();
             tp_drive.plan[1] = tpv[1].plan_sink();
+            if (tp2) tp_drive.n = 1;   // every layer's rings are card 0's (its cache, its plan sink)
             if (use_mtp) mtp.set_source_R(tpv[0].final_R_all());   // the head card's rows (forwarded to it)
         }
         void* const tp_pool_user = tp_on ? (void*) &tp_drive : win_pool_user;
+        strata::core::Verifier& dv = tp_on ? tpv[0] : ver;   // TENSOR PARALLEL: the pair's verifier runs the windows
+        void* const dv_pool_user = tp_on ? tp_pool_user : win_pool_user;
+        // where the conversation's state is: the stages' sessions (the prompt path), or the TP sessions (the windows);
+        // tp_to moves it when the next step needs it on the other side (tp_state_move)
+        bool tp_state_tp = false;
+        auto tp_to = [&](bool want_tp, int64_t cells, std::string& e) -> bool {
+            if (!tp_on || tp_state_tp == want_tp) return true;
+            strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
+            const int sdev[2] = {0, stages[0]->dev};
+            const int64_t slb[2] = {0, split_at[0]};
+            strata::core::SessionState* tst[2] = {&tp_ss[0], &tp_ss[1]};
+            const Clock::time_point h0 = Clock::now();
+            for (int d : {0, stages[0]->dev}) {
+                const strata::core::OnDevice on(d);
+                if (cudaDeviceSynchronize() != cudaSuccess) { e = "tensor parallel: a device sync failed before the state move"; return false; }
+            }
+            if (!strata::core::tp_state_move(g, tp_g[0], sst, sdev, 2, slb, tst, tp_dev, cells, want_tp, e)) return false;
+            tp_state_tp = want_tp;
+            static const bool tp_say = std::getenv("STRATA_TP_TIMING") != nullptr;
+            if (tp_say) std::fprintf(stderr, "strata tp: state %s in %.1f ms (%lld cells)\n", want_tp ? "to the TP sessions" : "back to the stages",
+                                     std::chrono::duration<double, std::milli>(Clock::now() - h0).count(), (long long) cells);
+            return true;
+        };
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
@@ -8613,6 +8670,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        std::vector<int> pending_card;   // tp2: the card whose cache each pending swap went into (its table takes the slot)
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
@@ -8655,9 +8713,9 @@ int main(int argc, char** argv) {
         auto res_upload = [&]() {
             if (d_res != nullptr)
                 res_put(d_res);
-            for (auto& st : stages) {
-                const strata::core::OnDevice on(st->dev);
-                res_put(st->d_res);
+            for (size_t si = 0; si < stages.size(); ++si) {
+                const strata::core::OnDevice on(stages[si]->dev);
+                res_put_tbl(stages[si]->d_res, res_of_stage(si));
             }
         };
         auto apply_pending = [&](bool wait) {
@@ -8673,11 +8731,13 @@ int main(int argc, char** argv) {
             for (auto& st : stages) st->adapt_live = false;
             unpin_blobs(pin_live);
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
-            for (const auto& [i, slot] : pending) {
-                host_res[(size_t) i] = slot;
+            for (size_t q = 0; q < pending.size(); ++q) {
+                const auto& [i, slot] = pending[q];
+                (tp2 && q < pending_card.size() && pending_card[q] == 1 ? host_res1 : host_res)[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
             }
             pending.clear();
+            pending_card.clear();
             pending_age = 0;
             agate.active.store(false, std::memory_order_release);   // 0.1.43: the copies have landed (STRATA_ADAPT_OVERLAP)
             aflipped = false;
@@ -8689,17 +8749,20 @@ int main(int argc, char** argv) {
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
-            struct Swap { float gain; int32_t layer, in, out; };
+            struct Swap { float gain; int32_t layer, in, out; int card; };   // card: whose cache the victim's slot is (tp2)
             std::vector<Swap> swaps;
-            std::vector<std::pair<float, int32_t>> cand, vict;
+            std::vector<std::pair<float, int32_t>> cand, vict;   // vict: e | card << 16
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
+                const int32_t* r1 = tp2 ? host_res1.data() + l * g.n_expert : nullptr;   // tp2: card 1's table
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] < 0 && (r1 == nullptr || r1[e] < 0)) {
+                        if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e);
+                    } else if (r[e] >= 0) vict.emplace_back(u[e], e);
+                    else vict.emplace_back(u[e], e | (1 << 16));
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -8708,7 +8771,8 @@ int main(int argc, char** argv) {
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
                     if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
-                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second & 0xffff,
+                                     vict[i].second >> 16});
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
@@ -8720,15 +8784,19 @@ int main(int argc, char** argv) {
                 for (const Swap& s : swaps) agate.has[(size_t) s.layer] = 1;
             }
             // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
-            auto home_of = [&](int64_t layer) -> SwapHome {
-                const int stn = multi_gpu ? stage_of(layer) : 0;
-                if (stn > 0) {
-                    GpuStage* gs = stages[(size_t) stn - 1].get();
-                    return {&gs->cache, gs->adapt_stream, gs->dev};
-                }
+            // the table and the cache a swap works on: the layer's owner stage, or under tp2 the victim's card
+            auto tbl_of_swap = [&](const Swap& sw) -> std::vector<int32_t>& { return tp2 && sw.card == 1 ? host_res1 : host_res; };
+            auto stage_of_swap = [&](const Swap& sw) -> GpuStage* {
+                if (tp2) return sw.card == 1 ? stages[0].get() : nullptr;
+                const int stn = multi_gpu ? stage_of(sw.layer) : 0;
+                return stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+            };
+            auto home_of = [&](const Swap& sw) -> SwapHome {
+                if (GpuStage* gs = stage_of_swap(sw)) return {&gs->cache, gs->adapt_stream, gs->dev};
                 return {&xcache, adapt_stream, -1};
             };
-            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+            auto slot_of_swap = [&](const Swap& sw) -> int32_t { return tbl_of_swap(sw)[(size_t) sw.layer * (size_t) g.n_expert + (size_t) sw.out]; };
+            if (!resident_stage_swaps(src, g.n_expert, swaps, home_of, slot_of_swap)) return false;
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)
@@ -8745,8 +8813,8 @@ int main(int argc, char** argv) {
             if (adapt_fence && !swaps.empty()) {
                 for (const Swap& s : swaps) {
                     const size_t out = (size_t) s.layer * g.n_expert + s.out;
-                    fenced_slots.push_back(host_res[out]);
-                    host_res[out] = strata::core::kNotResident;
+                    fenced_slots.push_back(tbl_of_swap(s)[out]);
+                    tbl_of_swap(s)[out] = strata::core::kNotResident;
                 }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 adapt_fence();
@@ -8767,19 +8835,20 @@ int main(int argc, char** argv) {
                         cudaLaunchHostFunc(adapt_stream, [](void* p) { std::this_thread::sleep_for(std::chrono::microseconds(*(int*) p)); }, &slow_arg);
                 }
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
-                const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
+                std::vector<int32_t>& tbl = tbl_of_swap(s);
+                const int32_t slot = fenced_slots.empty() ? tbl[out] : fenced_slots[si];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
-                const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
-                GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+                GpuStage* gs = stage_of_swap(s);   // the swap stays in the layer's own cache (tp2: the victim's card)
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
                 if (dma_mode != 0 && slot >= 0 && b != nullptr) {
                     cp_dst.push_back(xcache.device_slot(slot));
                     cp_src.push_back(b);
                     cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                     main_live = true;
-                    host_res[out] = strata::core::kNotResident;
+                    tbl[out] = strata::core::kNotResident;
                     srcp->prefetch(s.layer, s.out);
                     pending.emplace_back((int32_t) in, slot);
+                    pending_card.push_back(s.card);
                     continue;
                 }
                 if (slot < 0 || b == nullptr ||
@@ -8792,9 +8861,10 @@ int main(int argc, char** argv) {
                 }
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
-                host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                tbl[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                pending_card.push_back(s.card);
                 if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
                     cudaLaunchHostFunc(adapt_stream, [](void* p) {
                         auto* t = (strata::core::AdaptGate::Tick*) p;
@@ -11002,7 +11072,7 @@ int main(int argc, char** argv) {
                     strata::core::Verifier& v;
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
-                } no_head_sampling(ver);
+                } no_head_sampling(dv);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
@@ -11016,11 +11086,11 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
+                    if (!dv.run(T, win.data(), q, win_pool_fn, dv_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
-                    if (nonfinite_hit(ver, "prompt")) {   // (its commit is not needed: the next request reads from 0)
+                    if (nonfinite_hit(dv, "prompt")) {   // (its commit is not needed: the next request reads from 0)
                         e = "non-finite logits (#879)";
                         return false;
                     }
@@ -11036,15 +11106,15 @@ int main(int argc, char** argv) {
                         const char* p = std::getenv("STRATA_LOGPOS_EXTRA");
                         return p != nullptr ? (int32_t) std::atoi(p) : (int32_t) 248046;
                     }();
-                    if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
+                    if (logpos != nullptr && !dv.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    if (!dv.commit(T, e) || (use_mtp && !mtp.prefill(dv.final_R_all(), nxt.data(), T, q, e))) return false;
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
                 }
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
-                if (!ver.wait_commit(e)) return false;
+                if (!dv.wait_commit(e)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
@@ -11069,7 +11139,7 @@ int main(int argc, char** argv) {
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
-                    host_res[(size_t) i] = slot;
+                    tbl_of(p)[(size_t) i] = slot;
                 }
                 return true;
             };
@@ -11156,12 +11226,13 @@ int main(int argc, char** argv) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
-                    for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
+                    std::vector<int32_t>& tbl = tbl_of(p);
+                    for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only (tp2: its own table)
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
-                                p.lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
+                            if (tbl[i] >= first) {
+                                p.lent.emplace_back((int32_t) i, tbl[i]);
+                                tbl[i] = strata::core::kNotResident;
                                 any = true;
                             }
                         }
@@ -11439,6 +11510,10 @@ int main(int argc, char** argv) {
                 }
                 const auto tsp = Clock::now();
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
+                if (tp_on && !tp_to(win, at, err)) {   // TENSOR PARALLEL: the windows read on the pair, the parts on the stages
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
                 if (sp_ok) pp_exact = true;
                 if (trace) {
@@ -11507,8 +11582,6 @@ int main(int argc, char** argv) {
                 extra_sources_reset();
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
-            strata::core::Verifier& dv = tp_on ? tpv[0] : ver;   // TENSOR PARALLEL: the pair's verifier drives the decode
-            void* const dv_pool_user = tp_on ? tp_pool_user : win_pool_user;
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
@@ -12204,24 +12277,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
-            // TENSOR PARALLEL: the prompt's state (read layer-split into the stages' sessions) to the two cards' sessions
-            bool tp_live = false;
-            if (tp_on && !pl_ran && !cancelled && produced_n < max_new) {
-                strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
-                const int sdev[2] = {0, stages[0]->dev};
-                const int64_t slb[2] = {0, split_at[0]};
-                strata::core::SessionState* tst[2] = {&tp_ss[0], &tp_ss[1]};
-                const Clock::time_point h0 = Clock::now();
-                bool ok = true;
-                for (int d : {0, stages[0]->dev}) { const strata::core::OnDevice on(d); ok = ok && cudaDeviceSynchronize() == cudaSuccess; }
-                if (!ok || !strata::core::tp_state_move(g, tp_g[0], sst, sdev, 2, slb, tst, tp_dev, n, true, err)) {
-                    std::printf("ERR tensor parallel: the state hand-over failed: %s\n", err.c_str());
-                    return 1;
-                }
-                tp_live = true;
-                static const bool tp_say = std::getenv("STRATA_TP_TIMING") != nullptr;
-                if (tp_say) std::fprintf(stderr, "strata tp: state hand-over of %lld cells in %.1f ms\n", (long long) n,
-                                         std::chrono::duration<double, std::milli>(Clock::now() - h0).count());
+            if (tp_on && !pl_ran && !cancelled && produced_n < max_new && !tp_to(true, n, err)) {   // TENSOR PARALLEL: the state to the cards
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
@@ -12450,18 +12508,9 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            if (tp_live) {   // TENSOR PARALLEL: the conversation's state back to the stages' sessions (snapshots, the next turn)
-                strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
-                const int sdev[2] = {0, stages[0]->dev};
-                const int64_t slb[2] = {0, split_at[0]};
-                strata::core::SessionState* tst[2] = {&tp_ss[0], &tp_ss[1]};
-                bool ok = true;
-                for (int d : {0, stages[0]->dev}) { const strata::core::OnDevice on(d); ok = ok && cudaDeviceSynchronize() == cudaSuccess; }
-                if (!ok || !strata::core::tp_state_move(g, tp_g[0], sst, sdev, 2, slb, tst, tp_dev,
-                                                        (int64_t) consumed.size() + S + 8, false, err)) {
-                    std::printf("ERR tensor parallel: the state hand-back failed: %s\n", err.c_str());
-                    return 1;
-                }
+            if (tp_on && !tp_to(false, (int64_t) consumed.size() + S + 8, err)) {   // TENSOR PARALLEL: back to the stages (snapshots, the next turn)
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
@@ -13353,8 +13402,8 @@ int main(int argc, char** argv) {
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             // this (non-serve) path refills CUDA0's cache only, so its copies back read CUDA0's cache too
-            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,
-                                      [&](int64_t) -> SwapHome { return {&xcache, adapt_stream, -1}; })) {
+            if (!resident_stage_swaps(src, g.n_expert, swaps, [&](const auto&) -> SwapHome { return {&xcache, adapt_stream, -1}; },
+                                      [&](const auto& sw) -> int32_t { return host_res[(size_t) sw.layer * (size_t) g.n_expert + (size_t) sw.out]; })) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
                 return false;
             }

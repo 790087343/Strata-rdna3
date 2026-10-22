@@ -1114,7 +1114,7 @@ static_assert(kResidentPlanMax < 32768, "resident_plan: the packed entry count m
 __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
                                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
                                      long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
-                                     uint32_t ring, volatile uint32_t* plan_err) {
+                                     uint32_t ring, volatile uint32_t* plan_err, bool partial) {
     __shared__ int32_t s_ids[kResidentPlanMax];
     __shared__ int32_t s_excl[kResidentPlanMax];
     __shared__ int32_t s_wsum[4];
@@ -1129,7 +1129,7 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         eid = ids[tid];
         s_ids[tid] = eid;
         slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
-        if (slot < 0) atomicOr(&s_bad, 1);
+        if (slot < 0 && !(partial && eid >= 0 && eid < n_expert)) atomicOr(&s_bad, 1);
     }
     __syncthreads();
     if (s_bad) {
@@ -1189,7 +1189,7 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
         start[grp_idx] = ent_start;
     }
-    if (tid < n) {
+    if (tid < n && slot >= 0) {   // (partial: an entry of an expert another card holds gets no row)
         const int fj_warp = first_j >> 5;
         int fj_tot = s_excl[first_j];
 #pragma unroll
@@ -1201,11 +1201,12 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         tok[out_idx] = tid / k;
     }
     if (tid == 0) {
-        const int groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;
-        start[groups] = n;
-        start2[0] = n;
+        const int sum = s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3];
+        const int groups = sum & 0xffff, entries = partial ? (sum >> 16) : n;
+        start[groups] = entries;
+        start2[0] = entries;
         counts[0] = groups;
-        counts[1] = n;
+        counts[1] = entries;
         counts[2] = 0;
         if (skip != nullptr) {
             __threadfence();
@@ -1298,9 +1299,9 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err, bool partial) {
     resident_plan_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                              blob, plan, capx, skip, ring, plan_err);
+                                                              blob, plan, capx, skip, ring, plan_err, partial);
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {

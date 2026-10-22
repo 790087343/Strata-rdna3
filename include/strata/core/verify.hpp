@@ -235,7 +235,12 @@ public:
         uint32_t* flag_h = nullptr;  ///< ... its host address (the watchdog releases it)
         uint32_t* peer_flag = nullptr;
     };
-    bool set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err);
+    /// `mode` 1: the routed experts of layers [own_lb, own_le) are this card's (M1); 2 (by id, M2): every layer's
+    /// experts are split between the two cards' caches - rank 0 rings the host for every layer (the CPU rows, the
+    /// shared expert; the other card's experts are "elsewhere" to its pool), rank 1 plans its resident experts on the
+    /// device and adds its partial in the layer's second exchange, now a true all-reduce.
+    bool set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err,
+                int mode = 1);
     bool tp() const { return tp_; }
     int tp_rank() const { return tpl_.rank; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
@@ -332,6 +337,8 @@ private:
     bool capture(int T, std::string& err);
     // tensor parallel (set_tp)
     bool tp_ = false, tp_head_ = false;
+    int tp_mode_ = 1;                            ///< set_tp's mode
+    bool tp_gpu_only_ = false;                   ///< mode 2, rank 1: no doorbells; the resident experts planned on the device
     TpLink tpl_;
     int64_t tp_lb_ = 0, tp_le_ = 0;              ///< the layers whose routed experts are this card's
     Verifier* tp_peer_ = nullptr;
@@ -340,7 +347,7 @@ private:
     uint32_t* tp_epoch_d_ = nullptr;             ///< device: the graph's copy of it (tp_window_begin)
     unsigned* tp_cnt_ = nullptr;                 ///< device: the publishing blocks' counter
     uint32_t* h_ple_flag_ = nullptr; uint32_t* m_ple_flag_ = nullptr;   // the PLE rows are in h_ple_ (raised to epoch + 1)
-    bool tp_own(int64_t l) const { return !tp_ || (l >= tp_lb_ && l < tp_le_); }
+    bool tp_own(int64_t l) const { return !tp_ || tp_gpu_only_ || (l >= tp_lb_ && l < tp_le_); }
     bool run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// run()'s tail on the stage with the head (the window synced): the host-side sampling, the picks, the NaN check.
     bool finish_head(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err);
