@@ -342,6 +342,7 @@ private:
     bool tp_ = false, tp_head_ = false;
     int tp_mode_ = 1;                            ///< set_tp's mode
     bool tp_gpu_only_ = false;                   ///< mode 2, rank 1: no doorbells; the resident experts planned on the device
+    bool tp_dev_plan_ = false;                   ///< mode 2, rank 0: its resident experts planned on the device too (the host's plan unused; only the CPU rows are waited for)
     TpLink tpl_;
     int64_t tp_lb_ = 0, tp_le_ = 0;              ///< the layers whose routed experts are this card's
     Verifier* tp_peer_ = nullptr;

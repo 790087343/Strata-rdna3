@@ -805,7 +805,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
     }
     if (tp_gpu_only_) all_resident_ = false;   // (its own range is empty: the loop above saw nothing)
-    if (all_resident_ || device_plan_ || tp_gpu_only_) {
+    if (all_resident_ || device_plan_ || tp_gpu_only_ || tp_dev_plan_) {
         bool ok2 = true;
         if (device_plan_)
             ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -1602,6 +1602,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
             }
+            if (tp_dev_plan_)   // TP by id: this card's resident experts planned here (the pool's plan is not waited for)
+                resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                              hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                              plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, nullptr, true);
         }
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
@@ -1712,7 +1716,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
         } else {
-            if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+            if (tp_dev_plan_) {
+                // (the plan is this card's own, built in pre(); the CPU rows are waited for below)
+            } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
             } else if (g_wait_fuse) {   // the pool published this group's GPU plan: wait and copy in one launch
@@ -2589,6 +2595,9 @@ bool Verifier::set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool h
     tp_ = true;
     tp_mode_ = mode;
     tp_gpu_only_ = mode == 2 && link.rank == 1;   // rank 1 by id: rings nothing (own_lb == own_le)
+    // STRATA_TP_DEVPLAN=0: card 0 waits for the host's plan as before (~0.3 ms a window of host latency, 2 nodes a layer)
+    static const bool devplan = [] { const char* v = std::getenv("STRATA_TP_DEVPLAN"); return v == nullptr || v[0] != '0'; }();
+    tp_dev_plan_ = mode == 2 && link.rank == 0 && devplan;
     tpl_ = link;
     tp_lb_ = own_lb;
     tp_le_ = own_le;
