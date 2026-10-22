@@ -1180,7 +1180,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 // STRATA_MEGAKERNEL: the whole dense chain as one persistent kernel where it covers the case (one token group
                 // from 0, no self-commit, no side branches/profile, Q8_0 projections, T <= 8); otherwise the six nodes
-                const bool use_mk = g_megakernel() && !br && !batch_rec_ && !self_commit && tb == 0 && n >= 1 &&
+                // (TP verifiers only: they run one window at a time - the pipelined layer split overlaps two windows on a card, the
+                // persistent kernel's blocks are then not all resident and every phase wait times out: 3 tok/s, 2026-10-22)
+                const bool use_mk = g_megakernel() && tp_ && !br && !batch_rec_ && !self_commit && tb == 0 && n >= 1 &&
                                     n <= 8 && wqkv->native_type == 8 && wg->native_type == 8 && wout->native_type == 8;
                 if (use_mk) {
                     strata::kernels::MkGdnArgs a;
@@ -3940,6 +3942,10 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
+    if (h_mk_stall_ != nullptr && *(volatile unsigned*) h_mk_stall_ != 0) {
+        err = "verify: STRATA_MEGAKERNEL: a phase of the persistent kernel never completed";
+        return false;
+    }
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
         cudaError_t q;
