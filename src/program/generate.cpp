@@ -7956,6 +7956,10 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 tpv[r].set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                {   // --pcie-frac 0: no PCIe share path in the TP windows either (as `ver` below)
+                    const char* po = std::getenv("STRATA_PCIE_OFF");
+                    tpv[r].set_pcie_off(o.pcie_frac == 0.0 && !o.pcie_frac_auto && o.peer_device < 0 && !(po != nullptr && po[0] == '0'));
+                }
                 if (tp2) std::fprintf(stderr, "strata serve: tensor parallel by id: CUDA%d verifier holds %lld of every layer's experts in "
                                               "its cache%s%s\n", tp_dev[r], (long long) (r == 0 ? xcache.slots() : gs.cache.slots()),
                                       r == 0 ? ", rings the host (CPU rows, shared expert)" : ", plans on the device", r == 1 ? ", the head" : "");

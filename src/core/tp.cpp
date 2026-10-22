@@ -26,6 +26,11 @@
 
 namespace strata::core {
 
+bool tp_shexp_split() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_TP_SHEXP"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+
 bool tp_geometry(const ModelGeometry& g, int rank, int nranks, ModelGeometry& out, std::string& err) {
     if (nranks < 2 || rank < 0 || rank >= nranks) { err = "tp: rank out of range"; return false; }
     if (g.ssm_k_heads % nranks || g.ssm_v_heads % nranks || g.n_head % nranks || g.n_head_kv % nranks ||
@@ -222,8 +227,11 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
     // kind 0: GDN qkv rows; 1: rows [rank * n / nranks, ...); 2: an n_in slice [rank * n / nranks, ...); 3: the GDN
     // v-head rows (attn_gate); 4: the GDN v-head columns of n_in (ssm_out)
     struct Want { const char* suffix; int kind; };
+    // (the shared expert too: gate / up by ff unit, down over the ff units - each card's partial is added in the
+    // layer's second exchange)
     static const Want wants[] = {{".attn_qkv.weight", 0}, {".attn_gate.weight", 3}, {".ssm_out.weight", 4},
-                                 {".attn_q.weight", 1}, {".attn_k.weight", 1}, {".attn_v.weight", 1}, {".attn_output.weight", 2}};
+                                 {".attn_q.weight", 1}, {".attn_k.weight", 1}, {".attn_v.weight", 1}, {".attn_output.weight", 2},
+                                 {".ffn_gate_shexp.weight", 1}, {".ffn_up_shexp.weight", 1}, {".ffn_down_shexp.weight", 2}};
     std::set<std::string> done;
     uint64_t max_in = 0;
     try {
@@ -234,6 +242,7 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                 int kind = -1;
                 for (const Want& w : wants) if (t.name.ends_with(w.suffix)) kind = w.kind;
                 if (kind < 0) continue;
+                if (!tp_shexp_split() && t.name.find("_shexp.") != std::string::npos) continue;   // whole, card 0's
                 if (!strata::kernels::native_mmvq_supported(t.type)) { err = "tp: " + t.name + ": format not native"; return false; }
                 if (!done.insert(t.name).second) { err = "tp: duplicate tensor " + t.name; return false; }
                 auto it = table_.table_.find(t.name);
@@ -305,7 +314,7 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
         err = std::string("tp: ") + e.what();
         return false;
     }
-    if (done.size() != (size_t) (g.n_gdn_layers() * 3 + g.n_qsa_layers() * 4)) {
+    if (done.size() != (size_t) (g.n_gdn_layers() * 3 + g.n_qsa_layers() * 4 + (tp_shexp_split() ? g.n_layers * 3 : 0))) {
         err = "tp: the shards hold " + std::to_string(done.size()) + " dense projections, not every layer's";
         return false;
     }

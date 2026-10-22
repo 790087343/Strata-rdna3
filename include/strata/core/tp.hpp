@@ -22,6 +22,9 @@
 
 namespace strata::core {
 
+/// STRATA_TP_SHEXP=0: the shared expert stays whole on card 0 (the default splits it by ff unit across the cards).
+bool tp_shexp_split();
+
 /// The geometry card `rank` of `nranks` runs: the GDN / QSA heads split by head, everything else the model's.
 /// False with `err` when the heads do not divide.
 bool tp_geometry(const ModelGeometry& g, int rank, int nranks, ModelGeometry& out, std::string& err);

@@ -5,6 +5,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/core/tp.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -1565,11 +1566,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, nullptr, true);
-            stamp(l, 17, grp);
-            stamp(l, 18, grp);
-            return true;
-        }
-        if (ar_on()) {
+            if (sh_fork_late) {   // the shared expert's fork, as the doorbell path records it after the publish
+                cudaEventRecord(ev_fork_, cs);
+                cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+            }
+        } else if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
@@ -1604,7 +1605,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
-        {
+        if (!(tp_gpu_only_ && !tp_shexp_split())) {   // (STRATA_TP_SHEXP=0: the shared expert is whole on the other card)
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
             if (!wgi || !wsg || !wsu || !wsd) return false;
@@ -1627,7 +1628,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             try {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
-                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
+                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, tp_ && tp_shexp_split() ? g.n_ff / 2 : g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
                                     (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
                 sg_gated_[grp] = sg_ready;
@@ -1684,7 +1685,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
-        if (tp_gpu_only_) {   // TP by id: this card's hits into zeroed rows, the combine (no shared expert here), the all-reduce
+        if (tp_gpu_only_) {   // TP by id: this card's hits into zeroed rows, the combine with its half of the shared expert, the all-reduce
             if (cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs) != cudaSuccess) {
                 err = "verify: the TP parts memset failed";
                 return false;
@@ -1692,8 +1693,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
-            try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+            if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr)
+                cudaStreamWaitEvent(cs, ev_join_, 0);
+            try {   // (STRATA_LFUSE / STRATA_COMBINE_CPU: the shared expert's gate rode in the router GEMV: the combine applies it)
+                if (sg_gated_[grp])
+                    native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+                else
+                    native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
             tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);
         } else if (!tp_own(l)) {   // TP: this layer's block output comes from the card that owns its experts
