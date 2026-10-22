@@ -148,6 +148,14 @@ public:
     const float* chain_prob() const { return chain_prob_; }
 
     double ms_draft = 0, ms_prefill = 0;
+    // STRATA_MTP_PROFILE=1: GPU stamps inside the draft graphs (pass 0 = the catch-up round, pass j = step j; 10 marks
+    // a pass), read after the draft's sync; averages printed every 200 drafts
+    unsigned long long *mprof_h_ = nullptr, *mprof_d_ = nullptr;
+    int mprof_pass_ = 0;
+    double mprof_acc_[2][10] = {};
+    long long mprof_n_[2] = {};
+    void mstamp(int mark, void* cs);
+    void mprof_collect(int n_steps);
     int64_t rounds = 0;
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V

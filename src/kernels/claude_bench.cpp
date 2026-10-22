@@ -49,6 +49,7 @@ int main(int argc, char** argv) {
     const size_t WS = 384ull << 20;   // rotating working set > 96 MiB infinity cache
     if (which == "all" || which == "gr" || which == "grq8") {
         constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
+        K::rdna_r8_scratch_init((long long) D * LR);   // the STRATA_GR_FUSED grid-barrier words (as the engine at load)
         const size_t wb = D * 4 + 2 * (size_t) D * LR * 2 + (size_t) HC * D * 2;
         const int reps = (int) (WS / wb) + 1;
         std::vector<uint8_t*> w(reps);

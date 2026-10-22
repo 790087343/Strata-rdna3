@@ -51,6 +51,10 @@
 #include "ggml.h"   // --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load
 #endif
 
+namespace {
+bool mprof_on() { static const bool on = std::getenv("STRATA_MTP_PROFILE") != nullptr; return on; }
+}  // namespace
+
 namespace strata::core {
 namespace {
 
@@ -367,6 +371,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped(64, (void**) &h_row_, (void**) &m_row_) &&
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
+              (!mprof_on() || mapped(16 * 10 * sizeof(unsigned long long), (void**) &mprof_h_, (void**) &mprof_d_)) &&
               mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
               (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_)) &&
               (!top2_env() || mapped(T * 4 + 64, (void**) &h_top2_, (void**) &m_top2_));
@@ -668,6 +673,35 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
 }
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
+void MtpDrafter::mstamp(int mark, void* cs) {
+    if (!mprof_on()) return;
+    if (mprof_d_ == nullptr) return;   // (allocated in init: a capture cannot allocate)
+    strata::kernels::gpu_stamp(mprof_d_, mprof_pass_ * 10 + mark, cs);
+}
+void MtpDrafter::mprof_collect(int n_steps) {
+    if (!mprof_on() || mprof_h_ == nullptr) return;
+    static const char* names[9] = {"inputs", "front(emb+kv)", "q+attn+o", "mlp-hc-read", "moe", "final-mixer", "head-gemv", "sample+rest", "select"};
+    for (int pass = 0; pass < n_steps && pass < 16; ++pass) {
+        const int k = pass == 0 ? 0 : 1;
+        const volatile unsigned long long* t = mprof_h_ + pass * 10;
+        bool ok = true;
+        for (int m = 0; m < 10; ++m) ok = ok && t[m] != 0;
+        if (!ok) continue;
+        for (int m = 0; m < 9; ++m) mprof_acc_[k][m] += (double) (t[m + 1] - t[m]) * 1e-6;   // ns -> ms
+        ++mprof_n_[k];
+    }
+    for (int i = 0; i < 160; ++i) mprof_h_[i] = 0;
+    if (mprof_n_[0] > 0 && mprof_n_[0] % 200 == 0) {
+        for (int k = 0; k < 2; ++k) {
+            if (mprof_n_[k] == 0) continue;
+            double tot = 0; for (int m = 0; m < 9; ++m) tot += mprof_acc_[k][m];
+            std::fprintf(stderr, "strata mtp profile (%s, %lld, card %d): total %.3f ms =", k == 0 ? "round" : "step", mprof_n_[k], device_, tot / mprof_n_[k]);
+            for (int m = 0; m < 9; ++m) std::fprintf(stderr, " %s %.3f", names[m], mprof_acc_[k][m] / mprof_n_[k]);
+            std::fprintf(stderr, "\n");
+        }
+    }
+}
+
 bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
@@ -807,6 +841,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
     const void* wp_o_proj = wq("self_attn.o_proj.weight", wt_o_proj);
     const bool fuse_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);   // #783 PR-f
     try {
+        mstamp(2, cs);
         // ---- dense attention over every cell
         native_mmvq(wt_q_proj, wp_q_proj, xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         // all T tokens' q rows at once (the rows of token t sit at pos[t * NH ..], so row r reads pos[r])
@@ -829,6 +864,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
         native_mmvq(wt_o_proj, wp_o_proj, xq_, bo_, (int) (NH * HD), (int) N, T, cs);
+        mstamp(3, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -844,6 +880,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         }
+        mstamp(4, cs);
         // ---- MoE: router, the 512 resident experts, the shared expert (on a branch beside them on CUDA), the
         // combine, the write
         NativeSharedWeights nsw;
@@ -943,6 +980,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         // its own, so doing them after the loop changes nothing)
         if (!fuse_head_gr && !no_multi_gr)
             gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
+        mstamp(5, cs);
         // ---- the final mixer and the main model's head
         if (fuse_head_gr) {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -978,8 +1016,10 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
+        mstamp(6, cs);
         native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
                     (int) nv, T, cs);
+        mstamp(7, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
@@ -1003,6 +1043,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (multi_block_head_ops()) row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
         else row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
+        mstamp(8, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
         return false;
@@ -1104,6 +1145,8 @@ bool MtpDrafter::record_round_graph(int T, bool coupled, std::string& err) {
     // one graph per step (`capture_step`) so the host can stop it when a draft is unlikely
     const int ra = 2 * max_t_ - 1;
     const int64_t N = g_->n_embd, NH = g_->n_head;
+    mprof_pass_ = 0;
+    mstamp(0, cs_);
 #if defined(STRATA_USE_HIP)   // AMD keeps its separate copies
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
@@ -1118,6 +1161,7 @@ bool MtpDrafter::record_round_graph(int T, bool coupled, std::string& err) {
                               {pos_ + ra * NH, m_pos_ + ra * NH, NH}};
     copy_from_mapped_multi(in, 7, cs_);
 #endif
+    mstamp(1, cs_);
     ok = record_front(T, 0, cs_, err);
     if (ok) {
         if (T > 1) {
@@ -1130,6 +1174,7 @@ bool MtpDrafter::record_round_graph(int T, bool coupled, std::string& err) {
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok) mstamp(9, cs_);
     if (ok && m_top2_ != nullptr && !coupled)
         mtp_top2(head_logits_, dhead_ != nullptr ? n_dvocab_ : n_vocab_, row_ + 1, dhead_ != nullptr ? dvocab_ : nullptr, m_top2_, 0, cs_);
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
@@ -1150,6 +1195,8 @@ bool MtpDrafter::record_step_graph(int j, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
+    mprof_pass_ = j;
+    mstamp(0, cs_);
 #if defined(STRATA_USE_HIP)
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
@@ -1160,9 +1207,11 @@ bool MtpDrafter::record_step_graph(int j, bool coupled, std::string& err) {
 #endif
     coupled_rec_ = coupled;
     coupled_j_ = j;
+    mstamp(1, cs_);
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok) mstamp(9, cs_);
     if (ok && m_top2_ != nullptr && !coupled)
         mtp_top2(head_logits_, dhead_ != nullptr ? n_dvocab_ : n_vocab_, row_ + 1, dhead_ != nullptr ? dvocab_ : nullptr, m_top2_, j, cs_);
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
@@ -1401,6 +1450,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
+        mprof_collect(max_steps);
         const int last = max_steps - 1;
         drafts[last] = ((volatile int32_t*) h_out_)[last];
         if (probs) probs[last] = ((volatile float*) h_prob_)[last];
