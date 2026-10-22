@@ -236,6 +236,10 @@ private:
     cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
     cudaEvent_t sh_fork_ = nullptr, sh_join_ = nullptr;
     cudaGraphExec_t round_exec_[9] = {};
+    cudaGraphExec_t all_exec_[2][9][9] = {};   ///< STRATA_MTP_DRAFT_ALL: [coupled][T][max_steps] the round and its steps as one graph
+    bool capture_all(int T, int max_steps, bool coupled, std::string& err);
+    bool record_round_graph(int T, bool coupled, std::string& err);
+    bool record_step_graph(int j, bool coupled, std::string& err);
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

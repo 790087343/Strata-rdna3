@@ -4475,8 +4475,9 @@ int main(int argc, char** argv) {
             }
             strata::core::session_zero(tp_ss[r], tp_g[r], nullptr, r == 0 ? main_cs : (void*) stages[0]->stream);
             if (cudaDeviceSynchronize() != cudaSuccess) { std::fprintf(stderr, "strata generate: --tensor-parallel: zeroing failed\n"); return 1; }
-            std::fprintf(stderr, "strata generate: tensor parallel: CUDA%d session for every layer at half the heads, %llu MiB\n",
-                         tp_dev[r], (unsigned long long) (bytes >> 20));
+            std::fprintf(stderr, "strata generate: tensor parallel: CUDA%d session for every layer at %lld of %lld GDN k-heads and "
+                                 "%lld of %lld kv-heads, %llu MiB\n", tp_dev[r], (long long) tp_g[r].ssm_k_heads, (long long) g.ssm_k_heads,
+                         (long long) tp_g[r].n_head_kv, (long long) g.n_head_kv, (unsigned long long) (bytes >> 20));
         }
         if (ss.ple.ready()) {   // both cards run layer 1's PLE block: each session its own run (card 1's from its table)
             tp_ss[0].ple = ss.ple;
@@ -8033,7 +8034,7 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(d);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "tensor parallel: a device sync failed before the state move"; return false; }
             }
-            if (!strata::core::tp_state_move(g, tp_g[0], sst, sdev, 2, slb, tst, tp_dev, cells, want_tp, e)) return false;
+            if (!strata::core::tp_state_move(g, tp_g, sst, sdev, 2, slb, tst, tp_dev, cells, want_tp, e)) return false;
             tp_state_tp = want_tp;
             static const bool tp_say = std::getenv("STRATA_TP_TIMING") != nullptr;
             if (tp_say) std::fprintf(stderr, "strata tp: state %s in %.1f ms (%lld cells)\n", want_tp ? "to the TP sessions" : "back to the stages",

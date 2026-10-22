@@ -36,9 +36,23 @@ int tp_shexp_mode() {
     return mode;
 }
 
+int tp_kheads0(const ModelGeometry& g) {
+    static const int k = [] { const char* v = std::getenv("STRATA_TP_KHEADS"); return v ? std::atoi(v) : -1; }();
+    if (k > 0 && k < g.ssm_k_heads) return k;
+    return (int) (g.ssm_k_heads / 2);
+}
+namespace {
+// card `rank`'s GDN k-heads [kb, ke)
+void k_range(const ModelGeometry& g, int rank, int& kb, int& ke) {
+    const int k0 = tp_kheads0(g);
+    kb = rank == 0 ? 0 : k0;
+    ke = rank == 0 ? k0 : (int) g.ssm_k_heads;
+}
+}  // namespace
+
 bool tp_geometry(const ModelGeometry& g, int rank, int nranks, ModelGeometry& out, std::string& err) {
-    if (nranks < 2 || rank < 0 || rank >= nranks) { err = "tp: rank out of range"; return false; }
-    if (g.ssm_k_heads % nranks || g.ssm_v_heads % nranks || g.n_head % nranks || g.n_head_kv % nranks ||
+    if (nranks != 2 || rank < 0 || rank >= nranks) { err = "tp: two cards"; return false; }
+    if (g.ssm_v_heads % g.ssm_k_heads || g.n_head % nranks || g.n_head_kv % nranks ||
         (g.n_head / g.n_head_kv) * (g.n_head_kv / nranks) != g.n_head / nranks) {
         err = "tp: the heads do not divide by the cards (GDN " + std::to_string(g.ssm_k_heads) + "/" +
               std::to_string(g.ssm_v_heads) + ", QSA " + std::to_string(g.n_head) + "/" + std::to_string(g.n_head_kv) + ")";
@@ -50,8 +64,10 @@ bool tp_geometry(const ModelGeometry& g, int rank, int nranks, ModelGeometry& ou
         return false;
     }
     out = g;
-    out.ssm_k_heads = g.ssm_k_heads / nranks;
-    out.ssm_v_heads = g.ssm_v_heads / nranks;
+    int kb = 0, ke = 0;
+    k_range(g, rank, kb, ke);
+    out.ssm_k_heads = ke - kb;
+    out.ssm_v_heads = (ke - kb) * (g.ssm_v_heads / g.ssm_k_heads);
     out.ssm_conv_channels = 2 * out.ssm_k_heads * g.ssm_state_size + out.ssm_v_heads * g.ssm_state_size;
     out.ssm_value_dim = out.ssm_v_heads * g.ssm_state_size;
     out.n_head = g.n_head / nranks;
@@ -132,9 +148,12 @@ struct Range { uint64_t begin, count; };   // rows [begin, begin + count)
 // holds k-heads [r * hk, (r + 1) * hk), must hold the v-heads whose H % h_k falls there: the h_v / h_k ranges
 // j * h_k + r * hk + [0, hk), in that (local) order - local v-head h then reads local k-head h % hk, as the kernel does.
 std::vector<Range> v_heads(const ModelGeometry& g, int rank, int nranks) {
-    const uint64_t HK = (uint64_t) g.ssm_k_heads, hk = HK / nranks;
+    (void) nranks;
+    int kb = 0, ke = 0;
+    k_range(g, rank, kb, ke);
+    const uint64_t HK = (uint64_t) g.ssm_k_heads;
     std::vector<Range> v;
-    for (uint64_t j = 0; j < (uint64_t) g.ssm_v_heads / HK; ++j) v.push_back({j * HK + rank * hk, hk});
+    for (uint64_t j = 0; j < (uint64_t) g.ssm_v_heads / HK; ++j) v.push_back({j * HK + (uint64_t) kb, (uint64_t) (ke - kb)});
     return v;
 }
 std::vector<Range> scaled(const std::vector<Range>& r, uint64_t per, uint64_t base = 0) {
@@ -144,9 +163,11 @@ std::vector<Range> scaled(const std::vector<Range>& r, uint64_t per, uint64_t ba
 }
 // the GDN qkv / conv channel order: q heads, k heads, v heads - card r's slices of each
 std::vector<Range> qkv_rows(const ModelGeometry& g, int rank, int nranks, uint64_t per_head) {
-    const uint64_t hk = (uint64_t) g.ssm_k_heads / nranks;
+    int kb = 0, ke = 0;
+    k_range(g, rank, kb, ke);
+    const uint64_t hk = (uint64_t) (ke - kb), kbh = (uint64_t) kb;
     const uint64_t k0 = (uint64_t) g.ssm_k_heads * per_head, v0 = 2 * (uint64_t) g.ssm_k_heads * per_head;
-    std::vector<Range> r{{rank * hk * per_head, hk * per_head}, {k0 + rank * hk * per_head, hk * per_head}};
+    std::vector<Range> r{{kbh * per_head, hk * per_head}, {k0 + kbh * per_head, hk * per_head}};
     for (const Range& x : scaled(v_heads(g, rank, nranks), per_head, v0)) r.push_back(x);
     return r;
 }
@@ -157,7 +178,9 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
     if (!owned_.empty()) { err = "tp: weights already built"; return false; }
     table_ = full;   // the map of references: the small tensors keep their (device) pointers
     const uint64_t S = (uint64_t) g.ssm_state_size, HD = (uint64_t) g.head_dim;
-    const uint64_t hk = (uint64_t) g.ssm_k_heads / nranks, hv = (uint64_t) g.ssm_v_heads / nranks;
+    int kb0 = 0, ke0 = 0;
+    k_range(g, rank, kb0, ke0);
+    const uint64_t hk = (uint64_t) (ke0 - kb0), hv = hk * ((uint64_t) g.ssm_v_heads / (uint64_t) g.ssm_k_heads);
     const uint64_t nh = (uint64_t) g.n_head / nranks, nkv = (uint64_t) g.n_head_kv / nranks;
     // ---- the small tensors (pack arena, f32 / bf16 bits): row slices by head
     auto slice_rows = [&](const std::string& name, const std::vector<Range>& rows, int64_t want_ne1) -> bool {
@@ -381,16 +404,20 @@ bool copy2d(Stager& st, int ddev, void* dst, size_t dpitch, int sdev, const void
 }
 }  // namespace
 
-bool tp_state_move(const ModelGeometry& g, const ModelGeometry& tg, SessionState* const* stage_ss, const int* stage_dev,
+bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState* const* stage_ss, const int* stage_dev,
                    int n_stages, const int64_t* stage_lb, SessionState* const* tp_ss, const int* tp_dev, int64_t cells,
                    bool to_tp, std::string& err) {
     using strata::kernels::QsaShapes;
     Stager stg;
     const int R = 2;
     const uint64_t S = (uint64_t) g.ssm_state_size;
-    const uint64_t HV = (uint64_t) g.ssm_v_heads, hv = (uint64_t) tg.ssm_v_heads;
+    const uint64_t HV = (uint64_t) g.ssm_v_heads;
     const uint64_t gfull = S * HV * S + (uint64_t) g.ssm_conv_channels * (uint64_t) (g.ssm_d_conv - 1);
-    const uint64_t ghalf = S * hv * S + (uint64_t) tg.ssm_conv_channels * (uint64_t) (tg.ssm_d_conv - 1);
+    uint64_t hvr[2], ghalfr[2];
+    for (int r = 0; r < R; ++r) {
+        hvr[r] = (uint64_t) tg[r].ssm_v_heads;
+        ghalfr[r] = S * hvr[r] * S + (uint64_t) tg[r].ssm_conv_channels * (uint64_t) (tg[r].ssm_d_conv - 1);
+    }
     const QsaShapes sf = [&] { QsaShapes s = strata::kernels::qsa_real_shapes(); s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim; return s; }();
     auto stage_of = [&](int64_t l) { int st = 0; while (st + 1 < n_stages && l >= stage_lb[st + 1]) ++st; return st; };
     int64_t gi = 0, qi = 0;
@@ -401,7 +428,8 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry& tg, SessionState
         if (!is_qsa_layer(g, l)) {
             float* full = S0.gdn_state + (size_t) (gi - S0.gdn_ord0) * gfull;
             for (int r = 0; r < R; ++r) {
-                float* half = tp_ss[r]->gdn_state + (size_t) gi * ghalf;
+                const uint64_t hv = hvr[r];
+                float* half = tp_ss[r]->gdn_state + (size_t) gi * ghalfr[r];
                 // the recurrence [S][HV][S]: this card's v-head ranges (v_heads), in local order
                 uint64_t lh = 0;
                 for (const Range& vr : v_heads(g, r, R)) {
@@ -426,7 +454,7 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry& tg, SessionState
             ++gi;
         } else {
             const QsaState& F = S0.qsa_states[qi];
-            const uint64_t NKV = (uint64_t) g.n_head_kv, nkv = (uint64_t) tg.n_head_kv, PS = (uint64_t) sf.page_size, HD = (uint64_t) g.head_dim;
+            const uint64_t NKV = (uint64_t) g.n_head_kv, nkv = (uint64_t) tg[0].n_head_kv, PS = (uint64_t) sf.page_size, HD = (uint64_t) g.head_dim;
             const uint64_t pages_used = std::min<uint64_t>((uint64_t) F.n_pages, (uint64_t) ((cells + PS - 1) / PS) + 1);
             const uint64_t scale_row = HD / (uint64_t) strata::kernels::KV_Q8_GROUP * 2, q4_row = strata::kernels::kv_q4_bytes_per_head((int) HD);
             for (int r = 0; r < R; ++r) {

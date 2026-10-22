@@ -28,6 +28,10 @@ namespace strata::core {
 int tp_shexp_mode();
 inline bool tp_shexp_split() { return tp_shexp_mode() == 0; }
 
+/// STRATA_TP_KHEADS: card 0's GDN k-heads (default 8 of 16; card 1 takes the rest, with the v-heads that read them).
+/// Fewer on card 0 moves dense work to card 1, which otherwise waits for card 0's longer MoE path at the layer's second
+/// exchange.  The QSA split stays 1 kv-head a card.
+int tp_kheads0(const ModelGeometry& g);
 /// The geometry card `rank` of `nranks` runs: the GDN / QSA heads split by head, everything else the model's.
 /// False with `err` when the heads do not divide.
 bool tp_geometry(const ModelGeometry& g, int rank, int nranks, ModelGeometry& out, std::string& err);
@@ -79,7 +83,7 @@ private:
 /// and, when streamed, the host copy and the slot map - by kv-head, the indexer / PLE history / token window
 /// replicated); `to_tp == false` copies it back (before a snapshot or the next prompt read).  `stage_of(l)` names the
 /// stage session that holds layer l.  Every stream of both sides must be idle.
-bool tp_state_move(const ModelGeometry& g, const ModelGeometry& tg, SessionState* const* stage_ss, const int* stage_dev,
+bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState* const* stage_ss, const int* stage_dev,
                    int n_stages, const int64_t* stage_lb, SessionState* const* tp_ss, const int* tp_dev, int64_t cells,
                    bool to_tp, std::string& err);
 

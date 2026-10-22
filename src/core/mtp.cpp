@@ -1077,9 +1077,25 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    const bool ok = record_round_graph(T, coupled, err);
+    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+}
+
+// STRATA_MTP_DRAFT_ALL: the round and its `max_steps - 1` steps as ONE graph (one launch a draft instead of four)
+bool MtpDrafter::capture_all(int T, int max_steps, bool coupled, std::string& err) {
+    if (T < 1 || T > 8 || max_steps < 1 || max_steps > 8) { err = "mtp: capture_all arguments"; return false; }
+    cudaGraphExec_t& exec = all_exec_[coupled ? 1 : 0][T][max_steps];
+    if (exec) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    bool ok = record_round_graph(T, coupled, err);
+    for (int j = 1; ok && j < max_steps; ++j) ok = record_step_graph(j, coupled, err);
+    return finish_capture(cs_, ok, exec, coupled ? "round+steps (coupled)" : "round+steps", err);
+}
+
+bool MtpDrafter::record_round_graph(int T, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
@@ -1117,7 +1133,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     if (ok && m_top2_ != nullptr && !coupled)
         mtp_top2(head_logits_, dhead_ != nullptr ? n_dvocab_ : n_vocab_, row_ + 1, dhead_ != nullptr ? dvocab_ : nullptr, m_top2_, 0, cs_);
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
-    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+    return ok;
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
@@ -1125,10 +1141,15 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    const bool ok = record_step_graph(j, coupled, err);
+    return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+}
+
+bool MtpDrafter::record_step_graph(int j, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
 #if defined(STRATA_USE_HIP)
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
@@ -1145,7 +1166,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     if (ok && m_top2_ != nullptr && !coupled)
         mtp_top2(head_logits_, dhead_ != nullptr ? n_dvocab_ : n_vocab_, row_ + 1, dhead_ != nullptr ? dvocab_ : nullptr, m_top2_, j, cs_);
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
-    return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+    return ok;
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {
@@ -1343,6 +1364,13 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     // step, each a host round trip (~0.3 ms) - the extra drafts cost GPU time the window overlaps nothing with
     static const bool draft_all = [] { const char* v = std::getenv("STRATA_MTP_DRAFT_ALL"); return v != nullptr && v[0] == '1'; }();
     if ((min_p <= 0.0f || draft_all) && max_steps > 0) {
+        if (draft_all) {   // one graph: the round and every step
+            if (!capture_all(T, max_steps, cp, err)) return false;
+            if (cudaGraphLaunch(all_exec_[cp ? 1 : 0][T][max_steps], cs_) != cudaSuccess) {
+                err = std::string("mtp draft (round+steps): ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        } else {
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1352,6 +1380,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+        }
         }
         (void) cudaStreamQuery(cs_);
         if (between != nullptr && *between) (*between)();   // the caller's host work, under the round's GPU time
