@@ -218,7 +218,26 @@ public:
         if (next_) next_->set_slot_sampling(slot, sp);
     }
     const int32_t* batch_out() const { return b_out_; }
-    bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
+    bool last_stage() const { return g_ != nullptr && (tp_ ? tp_head_ : le_ == g_->n_layers); }
+
+    // ---- TENSOR PARALLEL (core/tp.hpp, docs/STRATA_TP_DESIGN_20261022.txt): two cards, every layer on both at half
+    // the heads.  This verifier's geometry, session and weight table are the half's (tp_geometry / TpWeights); after
+    // each out-projection and after each layer's MoE the two cards exchange the block output through the pinned pages
+    // of `TpLink` inside the window graph (tp_exchange).  The routed experts of layers [own_lb, own_le) are this card's
+    // (its expert cache, its doorbells); the other card receives those layers' block output.  `head`: this card runs
+    // the head (the other ends after the last layer's write).  run() / commit() on rank 0 drive both cards (the peer is
+    // `next_`, so the head-side accessors forward to it as a layer split's do).  Before init.
+    struct TpLink {
+        int rank = 0;
+        float* inbox[2] = {};        ///< this card's inboxes (device addresses of pinned pages), by exchange parity
+        float* peer_inbox[2] = {};   ///< the peer card's inboxes, as this device addresses them
+        uint32_t* flag = nullptr;    ///< this card's flag: the peer raises it when its partial is in my inbox
+        uint32_t* flag_h = nullptr;  ///< ... its host address (the watchdog releases it)
+        uint32_t* peer_flag = nullptr;
+    };
+    bool set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err);
+    bool tp() const { return tp_; }
+    int tp_rank() const { return tpl_.rank; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
@@ -311,6 +330,24 @@ public:
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
+    // tensor parallel (set_tp)
+    bool tp_ = false, tp_head_ = false;
+    TpLink tpl_;
+    int64_t tp_lb_ = 0, tp_le_ = 0;              ///< the layers whose routed experts are this card's
+    Verifier* tp_peer_ = nullptr;
+    uint32_t tp_epoch_ = 0;                      ///< the window's epoch (rank 0's value, written to both cards' words)
+    uint32_t* h_tp_epoch_ = nullptr; uint32_t* m_tp_epoch_ = nullptr;   // mapped: the host's epoch word
+    uint32_t* tp_epoch_d_ = nullptr;             ///< device: the graph's copy of it (tp_window_begin)
+    unsigned* tp_cnt_ = nullptr;                 ///< device: the publishing blocks' counter
+    uint32_t* h_ple_flag_ = nullptr; uint32_t* m_ple_flag_ = nullptr;   // the PLE rows are in h_ple_ (raised to epoch + 1)
+    bool tp_own(int64_t l) const { return !tp_ || (l >= tp_lb_ && l < tp_le_); }
+    bool run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// run()'s tail on the stage with the head (the window synced): the host-side sampling, the picks, the NaN check.
+    bool finish_head(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err);
+    /// run()'s per-layer service loop over this verifier's rings (the CPU experts, the plan, the flags); with
+    /// `ple_peer` the PLE rows gathered at the first ring are copied to it and both PLE flags raised.
+    bool serve_rings(int T, PoolMultiFn pool, void* user, bool do_ple, const uint32_t* ple_rows, Verifier* ple_peer,
+                     std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window

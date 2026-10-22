@@ -384,7 +384,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, tpl_.flag_h, h_ple_flag_})   // the TP exchange and PLE flags too
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -776,7 +776,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* v_ar = std::getenv("STRATA_VERIFY_ALL_RESIDENT");
         if (v_ar == nullptr || std::atoi(v_ar) != 0) {
             bool all_ok = true;
-            for (int64_t l = lb_; l < le_ && all_ok; ++l) {
+            for (int64_t l = tp_ ? tp_lb_ : lb_; l < (tp_ ? tp_le_ : le_) && all_ok; ++l) {   // TP: this card's layers
                 for (int64_t e = 0; e < g.n_expert; ++e) {
                     if (hits.h_res[l * g.n_expert + e] < 0) {
                         all_ok = false;
@@ -813,6 +813,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+    }
+    if (tp_) {   // the exchange epoch (host word, its device copy), the publish counter, the PLE flag
+        if (!mapped(64, (void**) &h_tp_epoch_, (void**) &m_tp_epoch_) || !mapped(64, (void**) &h_ple_flag_, (void**) &m_ple_flag_) ||
+            cudaMalloc((void**) &tp_epoch_d_, 64) != cudaSuccess || cudaMalloc((void**) &tp_cnt_, 64) != cudaSuccess ||
+            cudaMemset(tp_epoch_d_, 0, 64) != cudaSuccess || cudaMemset(tp_cnt_, 0, 64) != cudaSuccess) {
+            err = "verify: the tensor-parallel words could not be allocated";
+            return false;
+        }
+        split_ = false;   // one token group: the exchanges are in window order on both cards
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
@@ -912,6 +921,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    // TENSOR PARALLEL: the window's epoch and the publish counter; the exchanges below are numbered in window order
+    // (tp_k), the publishing ones separately (tp_pub: the counter's target) - the same sequence on both cards
+    if (tp_) tp_window_begin(tp_epoch_d_, tp_cnt_, m_tp_epoch_, cs);
+    uint32_t tp_k = 0, tp_pub = 0;
+    auto tp_xchg = [&](float* buf, int64_t n, int mode) {   // 0: all-reduce, 1: send (the MoE owner), 2: receive
+        ++tp_k;
+        if (mode != 2) ++tp_pub;
+        const int par = (int) (tp_k & 1u);
+        tp_exchange(buf, tpl_.peer_inbox[par], tpl_.inbox[par], tpl_.peer_flag, tpl_.flag, tp_epoch_d_, tp_k, tp_pub,
+                    tp_cnt_, n, tpl_.rank, mode, cs);
+    };
+    // the ring a layer's group rings on the host: counted from this card's first OWNED layer under TP
+    auto ringof = [&](int64_t l, int grp) { return (uint32_t) ((l - (tp_ ? tp_lb_ : lb_)) * G + grp + 1); };
     bool inputs_pending = false;
     cudaStream_t in_s = cs;
     if (br) {
@@ -981,7 +1003,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             if (grp == 0) {
-                if (ar_on()) wait_flag_ge(m_flag_, 1, cs);
+                if (tp_) tp_wait_epoch(m_ple_flag_, tp_epoch_d_, 1, cs);   // the rows gathered once, for both cards
+                else if (ar_on()) wait_flag_ge(m_flag_, 1, cs);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
@@ -1218,6 +1241,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);   // TP: the half-width partial sums added
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1445,6 +1469,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 il_ready = false;
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);   // TP: the half-width partial sums added
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -1453,6 +1478,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 16, grp);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
+        if (!tp_own(l)) {   // TP: the other card routes and computes this layer's experts; post() receives its output
+            stamp(l, 18, grp);
+            return true;
+        }
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
         static const bool sh_fork_late_env = [] {
@@ -1540,11 +1569,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                              (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                              ringof(l, grp), cs);
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                                       m_ids_ + tb * K, m_w_ + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                                       m_ids_ + tb * K, m_w_ + tb * K, m_seq_, ringof(l, grp), cs);
             else
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
@@ -1617,8 +1646,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
-        const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
+        const uint32_t ring = ringof(l, grp);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
+        if (!tp_own(l)) {   // TP: this layer's block output comes from the card that owns its experts
+            tp_xchg(bo_ + tb * N, (int64_t) n * N, 2);
+        } else {
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
         const int32_t* p_counts = pl;
         const int32_t* p_start = pl + 4;
@@ -1750,6 +1782,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+        if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 1);   // TP: the block output to the other card
+        }   // tp_own
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
@@ -1770,6 +1804,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
+    if (tp_ && !tp_head_) return true;   // TP: the other card runs the head (both hold the same residual)
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
@@ -2241,59 +2276,39 @@ bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
     return true;
 }
 
-bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
-                   std::string& err) {
+
+// run()'s service of this verifier's rings (the layers whose experts are its own: every layer, or under TP the owned
+// ones), step for step; see run() for the words.
+bool Verifier::serve_rings(int T, PoolMultiFn pool, void* user, bool do_ple, const uint32_t* ple_rows, Verifier* ple_peer,
+                           std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    last_batch_ = false;
-    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
-    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    refresh_ar();
-    if (!capture(T, err) || !capture_commit(err)) return false;
-    VDBG("captured; staging\n");
-    const Clock::time_point t0 = Clock::now();
-    if (!staged_) stage_inputs(T, tokens, pos0);
-    staged_ = false;
-    const bool do_ple = ss.ple.ready() && ple_stage();
-    uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
-    if (do_ple) {
-        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-        for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
-            prev[0] = prev[1];
-            prev[1] = tokens[t];
-            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
-        }
-    }
-    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
-    ms_host += ms_since(t0);
-    VDBG("staged; launching\n");
-    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
-    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
-        !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
-    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
-    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    const int64_t steps = (le_ - lb_) * G;
+    const int64_t rb = tp_ ? tp_lb_ : lb_, re = tp_ ? tp_le_ : le_;
+    const int64_t steps = (re - rb) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+    // TP: the PLE rows gathered here serve both cards - copied into the peer's page, both PLE flags raised
+    auto tp_ple_ready = [&](Verifier* peer) {
+        std::memcpy(peer->h_ple_, h_ple_, (size_t) T * (size_t) g.n_embd * sizeof(float));
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        *(volatile uint32_t*) h_ple_flag_ = tp_epoch_ + 1;
+        *(volatile uint32_t*) peer->h_ple_flag_ = tp_epoch_ + 1;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+    };
     if (ar_on() && !test_stall) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
+            if (ple_peer != nullptr) tp_ple_ready(ple_peer);
             *flag = 1;
             ms_host += ms_since(tp);
         } else {
@@ -2301,7 +2316,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     } else
     for (int64_t k = 0; k < steps; ++k) {
-        const int64_t l = lb_ + k / G;
+        const int64_t l = rb + k / G;
         const int grp = (int) (k % G);
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
@@ -2377,43 +2392,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
+            if (ple_peer != nullptr) tp_ple_ready(ple_peer);
             ms_host += ms_since(tp);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
-    // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
-    progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
-    // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
-    // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
-    // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
-    // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
-    // beside the expert workers).
-    trace_ev("SYNC", -1, -1, 0);
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    trace_ev("SYNCED", -1, -1, (int64_t) se);
-    if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
-        *(volatile uint32_t*) h_plan_err_ = 0;
-        err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
-        return false;
-    }
-    commit_pending_ = false;
-    progress_at("verify window: waiting for the expert copies", (int64_t) T);
-    if (copy_used_) {
-        cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
-        copy_used_ = false;
-    }
-    if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
-    // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
-    // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
-    // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
-    // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
-        ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
-    }
+    return true;
+}
+
+
+// run()'s tail on the stage with the head: a sampled or penalized request's host-side sampling, the picks, the
+// non-finite check.  The window's graph has finished (synced) by now.
+bool Verifier::finish_head(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err) {
+    using namespace strata::kernels;
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
@@ -2465,8 +2458,214 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
     }
+    return true;
+}
+
+bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err) {
+    using namespace strata::kernels;
+    if (tp_) {
+        if (tp_peer_ == nullptr || tpl_.rank != 0) { err = "verify: run() drives a tensor-parallel pair from rank 0"; return false; }
+        return run_tp(T, tokens, pos0, pool, user, out, err);
+    }
+    const OnDevice on_device(device_);
+    last_batch_ = false;
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    refresh_ar();
+    if (!capture(T, err) || !capture_commit(err)) return false;
+    VDBG("captured; staging\n");
+    const Clock::time_point t0 = Clock::now();
+    if (!staged_) stage_inputs(T, tokens, pos0);
+    staged_ = false;
+    const bool do_ple = ss.ple.ready() && ple_stage();
+    uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
+    if (do_ple) {
+        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+        for (int t = 0; t < T; ++t) {
+            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = tokens[t];
+            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+        }
+    }
+    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+    ms_host += ms_since(t0);
+    VDBG("staged; launching\n");
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
+    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+        !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    VDBG("launched\n");
+    const bool do_ple_rows = do_ple;
+    if (!serve_rings(T, pool, user, do_ple_rows, ple_rows, nullptr, err)) return false;
+    // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
+    progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+    // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
+    // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
+    // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
+    // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
+    // beside the expert workers).
+    trace_ev("SYNC", -1, -1, 0);
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    trace_ev("SYNCED", -1, -1, (int64_t) se);
+    if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
+        *(volatile uint32_t*) h_plan_err_ = 0;
+        err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
+        return false;
+    }
+    commit_pending_ = false;
+    progress_at("verify window: waiting for the expert copies", (int64_t) T);
+    if (copy_used_) {
+        cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+        copy_used_ = false;
+    }
+    if (prof_on_ && (groups_[T] > 0 ? groups_[T] : 1) == 1) collect_profile();   // the window's GPU stage stamps
+    // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
+    // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
+    // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
+    // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
+    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
+        ++windows;
+        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+    }
+    if (!finish_head(T, tokens, pos0, out, err)) return false;
     VDBG("window done\n");
     ++windows;
+    progress_at("decode");
+    progress_beat();
+    return true;
+}
+
+// ================================ TENSOR PARALLEL (see verify.hpp set_tp, core/tp.hpp) ================================
+
+bool Verifier::set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err) {
+    if (g_ != nullptr) { err = "verify: set_tp must come before init"; return false; }
+    if (peer == nullptr || peer == this || own_lb < 0 || own_le <= own_lb || (link.rank != 0 && link.rank != 1)) {
+        err = "verify: set_tp arguments";
+        return false;
+    }
+    tp_ = true;
+    tpl_ = link;
+    tp_lb_ = own_lb;
+    tp_le_ = own_le;
+    tp_head_ = head;
+    tp_peer_ = peer;
+    next_ = head ? nullptr : peer;   // the head-side accessors (final_R, logits, sampling) forward to the head card
+    next_user_ = nullptr;
+    split_ = false;
+    return true;
+}
+
+// Both cards' windows at once: each graph is launched, then the host serves the rings of the card that owns the first
+// layers and then the other's (a card's exchanges with its peer are inside its graph), then both are synced and the
+// head card's picks are read.  The epoch that the exchanges and the PLE flag wait on advances by 256 a window (a
+// window exchanges at most 2 x 48 + 1 times), and starts over (with the flags reset while nothing runs) before it
+// could wrap.
+bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                      std::string& err) {
+    using namespace strata::kernels;
+    Verifier* v[2] = {this, tp_peer_};
+    if (T < 1 || T > max_t_ || T > tp_peer_->max_t_) { err = "verify: window size out of range"; return false; }
+    for (Verifier* x : v) {
+        x->last_batch_ = false;
+        if (x->released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+        if (x->g_ == nullptr || !x->tp_) { err = "verify: the tensor-parallel peer is not initialized"; return false; }
+        if (pos0 + T > x->ss_->qsa_states[x->ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    }
+    if (tp_head_ == tp_peer_->tp_head_) { err = "verify: exactly one tensor-parallel card runs the head"; return false; }
+    for (Verifier* x : v) {
+        const OnDevice on(x->device_);
+        x->refresh_ar();
+        if (!x->capture(T, err) || !x->capture_commit(err)) return false;
+    }
+    const Clock::time_point t0 = Clock::now();
+    for (Verifier* x : v) {
+        if (!x->staged_) x->stage_inputs(T, tokens, pos0);
+        x->staged_ = false;
+    }
+    SessionState& ss = *ss_;
+    const ModelGeometry& g = *g_;
+    const bool do_ple = ss.ple.ready() && ple_stage();
+    uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
+    if (do_ple) {
+        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+        for (int t = 0; t < T; ++t) {
+            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = tokens[t];
+            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+        }
+    }
+    // the epoch (both graphs are idle here: the previous window was synced)
+    if (tp_epoch_ > 0xF0000000u) {
+        for (Verifier* x : v) {
+            if (x->tpl_.flag_h != nullptr) *(volatile uint32_t*) x->tpl_.flag_h = 0;
+            *(volatile uint32_t*) x->h_ple_flag_ = 0;
+        }
+        tp_epoch_ = 0;
+    }
+    tp_epoch_ += 256;
+    for (Verifier* x : v) {
+        x->tp_epoch_ = tp_epoch_;
+        *(volatile uint32_t*) x->h_tp_epoch_ = tp_epoch_;
+        if (x->trace_h_ != nullptr) std::memset(x->trace_h_, 0, x->trace_n_ * 8);
+        if (x->ar_on() && x->h_plan_err_ != nullptr) *(volatile uint32_t*) x->h_plan_err_ = 0;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+    ms_host += ms_since(t0);
+    for (Verifier* x : v)
+        if (x->adapt_gate_ != nullptr && x->adapt_gate_->active.load(std::memory_order_acquire) && x->ar_on() &&
+            !x->adapt_gate_wait((int32_t) g.n_layers, err))
+            return false;
+    for (Verifier* x : v) {
+        const OnDevice on(x->device_);
+        const cudaError_t le = cudaGraphLaunch(x->ar_off_ ? x->exec_nr_[T] : x->exec_[T], x->cs_);
+        x->trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+        (void) cudaStreamQuery(x->cs_);
+    }
+    // the card whose layers come first is served first (its layer 0 gathers the PLE rows for both)
+    Verifier* first = tp_lb_ <= tp_peer_->tp_lb_ ? this : tp_peer_;
+    Verifier* second = first == this ? tp_peer_ : this;
+    if (!first->serve_rings(T, pool, user, do_ple, ple_rows, second, err)) return false;
+    if (!second->serve_rings(T, pool, user, false, nullptr, nullptr, err)) return false;
+    progress_at("verify window: waiting for the GPUs to finish the window", (int64_t) T);
+    for (Verifier* x : v) {
+        const OnDevice on(x->device_);
+        x->trace_ev("SYNC", -1, -1, 0);
+        const cudaError_t se = cudaStreamSynchronize(x->cs_);
+        x->trace_ev("SYNCED", -1, -1, (int64_t) se);
+        if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+        if (x->ar_on() && x->h_plan_err_ != nullptr && *(volatile uint32_t*) x->h_plan_err_ != 0) {
+            *(volatile uint32_t*) x->h_plan_err_ = 0;
+            err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
+            return false;
+        }
+        x->commit_pending_ = false;
+        if (x->copy_used_) {
+            cudaStreamSynchronize(x->copy_);
+            x->copy_used_ = false;
+        }
+        if (x->prof_on_) x->collect_profile();
+        ++x->windows;
+    }
+    Verifier* h = tp_head_ ? this : tp_peer_;
+    const OnDevice on_h(h->device_);
+    if (!h->finish_head(T, tokens, pos0, out, err)) return false;
+    VDBG("window done\n");
     progress_at("decode");
     progress_beat();
     return true;
@@ -2635,7 +2834,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!g_commit_async || next_ != nullptr) {
+        if (!g_commit_async || (next_ != nullptr && !tp_)) {   // (TP: each card's commit stays asynchronous)
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
@@ -2651,7 +2850,8 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err);
+    Verifier* nx = tp_ ? (tpl_.rank == 0 ? tp_peer_ : nullptr) : next_;   // TP: rank 0 commits both cards
+    return nx == nullptr || nx->commit(n_keep, err);
 }
 
 bool Verifier::wait_commit(std::string& err) {
@@ -2661,7 +2861,8 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
-    return next_ == nullptr || next_->wait_commit(err);
+    Verifier* nx = tp_ ? (tpl_.rank == 0 ? tp_peer_ : nullptr) : next_;
+    return nx == nullptr || nx->wait_commit(err);
 }
 
 

@@ -150,4 +150,21 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
 
+// ---- TENSOR PARALLEL (docs/STRATA_TP_DESIGN_20261022.txt): two cards run every layer at half the heads and exchange
+// their partial sums through coherent pinned host memory, inside the window graph.  A card's exchange `k` of the window
+// waits for flag >= *epoch + k, where `epoch` is a DEVICE word tp_window_begin filled from the host's per-window value:
+// a captured graph then never repeats a flag value, so no flag needs a reset between windows.
+/// The window's first TP node: epoch_d <- *epoch_h (mapped host memory), *cnt <- 0.
+void tp_window_begin(uint32_t* epoch_d, unsigned* cnt, const uint32_t* epoch_h, void* stream);
+/// Exchange `k` (1, 2, ...) of the window over the `n` floats at `mine` (a multiple of 4).  mode 0, the all-reduce: the
+/// floats are stored into `peer_inbox`, `peer_flag` is raised to epoch + k once every block has stored (`cnt` counts
+/// the blocks of this card's publishing exchanges: `pub` is this exchange's ordinal among them), the kernel waits for
+/// `my_flag` >= epoch + k and writes mine = partial(rank 0) + partial(rank 1), the same order on both cards.  mode 1
+/// (send): the store and the flag only.  mode 2 (receive): the wait, then mine <- my_inbox.
+void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t* peer_flag, const uint32_t* my_flag,
+                 const uint32_t* epoch_d, uint32_t k, uint32_t pub, unsigned* cnt, int64_t n, int rank, int mode,
+                 void* stream);
+/// Spin until *flag >= *epoch_d + k (a mapped host flag the host raises: the TP PLE rows, gathered once for both cards).
+void tp_wait_epoch(const uint32_t* flag, const uint32_t* epoch_d, uint32_t k, void* stream);
+
 }  // namespace strata::kernels

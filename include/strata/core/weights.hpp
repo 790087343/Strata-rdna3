@@ -140,6 +140,7 @@ public:
 
 private:
     friend class NativeDense;
+    friend class TpWeights;   // tensor parallel: a copy of the table with sliced tensors (tp.hpp)
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
 };
