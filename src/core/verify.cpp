@@ -927,7 +927,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // (tp_k), the publishing ones separately (tp_pub: the counter's target) - the same sequence on both cards
     if (tp_) tp_window_begin(tp_epoch_d_, tp_cnt_, m_tp_epoch_, cs);
     uint32_t tp_k = 0, tp_pub = 0;
+    // STRATA_TP_NOXCHG=1 (timing only, the output is wrong): no exchange kernels - the upper bound of what fusing them saves
+    static const bool noxchg = [] { const char* v = std::getenv("STRATA_TP_NOXCHG"); return v != nullptr && v[0] == '1'; }();
     auto tp_xchg = [&](float* buf, int64_t n, int mode) {   // 0: all-reduce, 1: send (the MoE owner), 2: receive
+        if (noxchg) return;
         ++tp_k;
         if (mode != 2) ++tp_pub;
         const int par = (int) (tp_k & 1u);
