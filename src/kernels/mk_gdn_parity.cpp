@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
         a.x = d_x; a.xq = mk.xq; a.w_qkv = lay[l].qkv; a.w_z = lay[l].z; a.w_out = lay[l].out; a.qkv = mk.qkv; a.z = mk.z;
         a.hist = lay[l].hist; a.w_conv = lay[l].conv; a.h = mk.h; a.w_alpha = lay[l].wa; a.w_beta = lay[l].wb; a.dt = lay[l].dt;
         a.ssm_a = lay[l].a; a.gate = mk.gate; a.beta = mk.beta; a.state = lay[l].state; a.gamma = lay[l].gamma; a.y = mk.y; a.yq = mk.yq;
-        a.bo = mk.bo; a.phases = std::getenv("STRATA_MK_PHASES") ? std::atoi(std::getenv("STRATA_MK_PHASES")) : 5; a.diag = std::getenv("STRATA_MK_DIAG") ? std::atoi(std::getenv("STRATA_MK_DIAG")) : 0; a.grid = std::getenv("STRATA_MK_GRID") ? std::atoi(std::getenv("STRATA_MK_GRID")) : 0; a.n_embd = N; a.conv_channels = C; a.value_dim = ZV; a.h_k = HK; a.h_v = HV; a.eps = eps; a.counters = counters;
+        a.bo = mk.bo; a.phases = std::getenv("STRATA_MK_PHASES") ? std::atoi(std::getenv("STRATA_MK_PHASES")) : 5; a.diag = std::getenv("STRATA_MK_DIAG") ? std::atoi(std::getenv("STRATA_MK_DIAG")) : 0; a.grid = std::getenv("STRATA_MK_GRID") ? std::atoi(std::getenv("STRATA_MK_GRID")) : 0; a.chunk = std::getenv("STRATA_MK_CHUNK") ? std::atoi(std::getenv("STRATA_MK_CHUNK")) : 0; a.n_embd = N; a.conv_channels = C; a.value_dim = ZV; a.h_k = HK; a.h_v = HV; a.eps = eps; a.counters = counters;
         mk_gdn_dense(a, T, s);
     };
     // ---- parity
@@ -145,11 +145,22 @@ int main(int argc, char** argv) {
             CK(cudaMemcpy(c, counters, 64, cudaMemcpyDeviceToHost));
             if (c[15] != 0 || l == 0)
                 std::printf("counters: done %u %u %u %u %u  next %u %u %u %u %u  block0-reached %u entered %u max-item %u stalled-phase %u (grid %d)\n", c[0], c[1], c[2], c[3], c[4],
-                            c[8], c[9], c[10], c[11], c[12], c[5], c[6], c[7], c[15], mk_gdn_grid());
+                            c[8], c[9], c[10], c[11], c[12], c[5], c[6], c[7], c[15], mk_gdn_grid(T));
         }
         const size_t d_qkv = ndiff(down(ref.qkv, (size_t) T * C), down(mk.qkv, (size_t) T * C));
         const size_t d_z = ndiff(down(ref.z, (size_t) T * ZV), down(mk.z, (size_t) T * ZV));
         const size_t d_h = ndiff(down(ref.h, (size_t) T * C), down(mk.h, (size_t) T * C));
+        if (d_h) {   // which (token, channel block) differ
+            const std::vector<float> rh = down(ref.h, (size_t) T * C), mh = down(mk.h, (size_t) T * C);
+            std::printf("  h diffs at (t, cb):");
+            int shown = 0;
+            for (size_t i = 0; i < rh.size() && shown < 24; i += 128) {
+                bool d = false;
+                for (size_t k = i; k < i + 128; ++k) if (std::memcmp(&rh[k], &mh[k], 4) != 0) { d = true; break; }
+                if (d) { std::printf(" (%zu,%zu)", i / C, (i % C) / 128); ++shown; }
+            }
+            std::printf("\n");
+        }
         const size_t d_g = ndiff(down(ref.gate, (size_t) T * HV), down(mk.gate, (size_t) T * HV));
         const size_t d_b = ndiff(down(ref.beta, (size_t) T * HV), down(mk.beta, (size_t) T * HV));
         const size_t d_y = ndiff(down(ref.y, (size_t) T * ZV), down(mk.y, (size_t) T * ZV));
@@ -160,7 +171,7 @@ int main(int argc, char** argv) {
         if (l < 2 || d_qkv + d_z + d_h + d_g + d_b + d_y + d_yq + d_bo + d_xq)
             std::printf("layer %d: diffs xq %zu qkv %zu z %zu h %zu gate %zu beta %zu y %zu yq %zu bo %zu\n", l, d_xq, d_qkv, d_z, d_h, d_g, d_b, d_y, d_yq, d_bo);
     }
-    std::printf("parity: %s (%zu differing values over %d layers, T=%d, grid %d)\n", bad == 0 ? "BITWISE EQUAL" : "DIFFERENT", bad, L, T, mk_gdn_grid());
+    std::printf("parity: %s (%zu differing values over %d layers, T=%d, grid %d)\n", bad == 0 ? "BITWISE EQUAL" : "DIFFERENT", bad, L, T, mk_gdn_grid(T));
     if (selftest) return bad == 0 ? 0 : 1;
     // ---- timing: graphs of L layers, replayed
     auto timed = [&](const char* name, auto&& body) {
@@ -195,7 +206,7 @@ int main(int argc, char** argv) {
                 a.x = d_x; a.xq = mk.xq; a.w_qkv = lay[l].qkv; a.w_z = lay[l].z; a.w_out = lay[l].out; a.qkv = mk.qkv; a.z = mk.z;
                 a.hist = lay[l].hist; a.w_conv = lay[l].conv; a.h = mk.h; a.w_alpha = lay[l].wa; a.w_beta = lay[l].wb; a.dt = lay[l].dt;
                 a.ssm_a = lay[l].a; a.gate = mk.gate; a.beta = mk.beta; a.state = lay[l].state; a.gamma = lay[l].gamma; a.y = mk.y; a.yq = mk.yq;
-                a.bo = mk.bo; a.phases = ph; a.n_embd = N; a.conv_channels = C; a.value_dim = ZV; a.h_k = HK; a.h_v = HV; a.eps = eps; a.counters = counters;
+                a.bo = mk.bo; a.phases = ph; a.diag = std::getenv("STRATA_MK_DIAG") ? std::atoi(std::getenv("STRATA_MK_DIAG")) : 0; a.chunk = std::getenv("STRATA_MK_CHUNK") ? std::atoi(std::getenv("STRATA_MK_CHUNK")) : 0; a.n_embd = N; a.conv_channels = C; a.value_dim = ZV; a.h_k = HK; a.h_v = HV; a.eps = eps; a.counters = counters;
                 mk_gdn_dense(a, T, s); });
     }
     const double a = timed("six kernels (the window's)", run_ref);

@@ -622,6 +622,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
+              mapped(64, (void**) &h_mk_stall_, (void**) &m_mk_stall_) &&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
@@ -1187,7 +1188,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     a.ssm_a = (const float*) wsa->data; a.gate = gate; a.beta = beta; a.state = state; a.gamma = (const float*) wnm->data;
                     a.y = y_; a.yq = xq_;   // the out projection's q8_1 input reuses xq_ (its last reader, the qkv/z phase, is done)
                     a.bo = bo_; a.n_embd = (int) N; a.conv_channels = (int) C; a.value_dim = (int) ZV; a.h_k = (int) HK; a.h_v = (int) HV;
-                    a.eps = EPS; a.counters = mk_counters_;
+                    a.eps = EPS; a.counters = mk_counters_; a.stall = m_mk_stall_;
                     if (q8_attn) a.diag |= 32;   // STRATA_QFUSE: xq_ already holds the input's q8_1 image - no quantize phase
                     mk_gdn_dense(a, n, cs);
                     stamp(l, 2, grp); stamp(l, 3, grp); stamp(l, 4, grp); stamp(l, 5, grp); stamp(l, 6, grp);   // (profile: the kernel lands in stage 2)
@@ -2889,6 +2890,11 @@ bool Verifier::commit(int n_keep, std::string& err) {
 bool Verifier::commit_one(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (h_mk_stall_ != nullptr && *(volatile unsigned*) h_mk_stall_ != 0) {   // the window just read is wrong: never commit it
+        err = "verify: STRATA_MEGAKERNEL: phase " + std::to_string(*(volatile unsigned*) h_mk_stall_ - 1) +
+              " of the persistent kernel never completed (not every block was resident: another kernel held CUs)";
+        return false;
+    }
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;

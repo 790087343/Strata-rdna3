@@ -40,15 +40,17 @@ struct MkGdnArgs {
     int n_embd = 0, conv_channels = 0, value_dim = 0, h_k = 0, h_v = 0;
     float eps = 1e-6f;
     unsigned* counters = nullptr;    ///< device, >= 16 uints, zeroed by mk_gdn_dense before the launch
+    unsigned* stall = nullptr;       ///< optional mapped host word: a phase wait that timed out writes its phase + 1 (sticky)
     int phases = 5;                  ///< diagnostics: run only the first `phases` phases
+    int chunk = 0;                   ///< diagnostics: items per scheduler grab in every phase (0 = the per-phase defaults)
     int grid = 0;                    ///< diagnostics: force the grid (0 = the co-resident count)
-    int diag = 0;                    ///< diagnostics bits: 1 static item assignment in phase 0, 2 skip the quantize body
+    int diag = 0;                    ///< diagnostics bits: 1 dynamic chunks of 1, 2 skip the quantize body, 4 barrier between GEMV items, 8 qkv rows only, 16 x_stride 0, 32 no quantize phase (STRATA_QFUSE), 128 no all-wave fence, 256 the dynamic scheduler
 };
 
 /// Device scratch for the counters (16 uints); the caller keeps it alive for every launch.
 unsigned* mk_counters_alloc();
 /// The persistent grid the kernel uses on this device (every block co-resident), for information.
-int mk_gdn_grid();
+int mk_gdn_grid(int n_tok);
 /// The six-node chain as one launch (plus a memset of the counters) on `stream`.  n_tok 1..8.
 void mk_gdn_dense(const MkGdnArgs& a, int n_tok, void* stream);
 

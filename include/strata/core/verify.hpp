@@ -544,6 +544,7 @@ private:
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
+    unsigned *h_mk_stall_ = nullptr, *m_mk_stall_ = nullptr;   // STRATA_MEGAKERNEL: a phase that never completed (mapped)
     unsigned* mk_counters_ = nullptr;                         // STRATA_MEGAKERNEL: the persistent kernel's phase counters
     uint8_t* xil_ = nullptr;                                  // fork F4: the interleaved copy of xq_'s 2-4 columns
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
