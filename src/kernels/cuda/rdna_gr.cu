@@ -28,7 +28,7 @@ constexpr int UC = 16;                    // up: columns per block (x 4 streams 
 constexpr int UB = N / UC;                // 160 blocks
 
 unsigned* g_gr_bar[64] = {};   // STRATA_GR_FUSED: per device {arrived, generation}, zeroed at load (rdna_r8_scratch_init)
-struct RdnaGr { FusedGrArgs a[kFusedGrMaxT]; float* part; float* ss; unsigned* bar = nullptr; bool uppre = true; };   // bar: STRATA_GR_FUSED grid barrier   // part [T][2*HC][PR], ss [T][2*HC]
+struct RdnaGr { FusedGrArgs a[kFusedGrMaxT]; float* part; float* ss; unsigned* bar = nullptr; };   // bar: STRATA_GR_FUSED grid barrier   // part [T][2*HC][PR], ss [T][2*HC]
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ uint4 ntload(const uint4* p) {
@@ -465,53 +465,36 @@ __device__ __forceinline__ void q8_tail(const RdnaGr& m, int d0) {
     if (lane == 0) y->ds = q8_1_ds(d, sum);
 }
 
-// The up pass's per-thread inputs that do not depend on the down pass (its weight quarter-rows, R and w_norm at its
-// element): rdna_gr_fused issues them BEFORE the down pass, so their DRAM latency hides under it instead of following
-// the grid barrier.  The values (and so every product) are the ones up_body loaded itself.
-template <int T, bool Q8>
-struct UpPre {
-    uint4 w[Q8 ? 1 : 10];
-    uint2 w8[Q8 ? 10 : 1];
-    float d8[Q8 ? 10 : 1];
-    float rv[T];
-    float wn;
-};
-template <int T, bool Q8>
-__device__ __forceinline__ void up_pre(const RdnaGr& m, const int bx, UpPre<T, Q8>& P) {
-    const int t = threadIdx.x;
-    // four lanes per row: quarter q reads uint4 q, q+4, ..., q+36 (10 of the row's 40)
-    const int rr = t >> 2, q = t & 3;          // 64 rows: stream c = rr / UC, column dd = rr % UC
-    const int c = rr / UC, dd = rr - c * UC, d = bx * UC + dd, i = c * N + d;
-    if constexpr (Q8) {
-        const int8_t* qu = m.a[0].r8_up;
-        const uint16_t* su = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(qu) + r8_soff((size_t) D * LR));
-        const uint2* w2 = reinterpret_cast<const uint2*>(qu + (size_t) i * LR);
-#pragma unroll
-        for (int u = 0; u < 10; ++u) { P.w8[u] = ntload2(w2 + q + 4 * u); P.d8[u] = h2f(su[(size_t) i * (LR / 32) + ((q + 4 * u) >> 2)]); }
-    } else {
-        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
-#pragma unroll
-        for (int u = 0; u < 10; ++u) P.w[u] = ntload(w4 + q + 4 * u);
-    }
-    P.wn = m.a[0].w_norm[i];
-#pragma unroll
-    for (int k = 0; k < T; ++k) P.rv[k] = m.a[k].R[i];
-}
 template <int T, bool Q8 = false, bool A8 = false>
-__device__ __forceinline__ void up_main(const RdnaGr& m, const int bx, const UpPre<T, Q8>& P) {
+__device__ __forceinline__ void up_body(const RdnaGr& m, const int bx) {
+
     __shared__ __align__(16) uint32_t loq[A8 ? T : 1][LR / 4];
     __shared__ float lod[A8 ? T : 1][LR / 32];
     __shared__ __align__(16) float lo[T][LR];
     __shared__ float rs[T][HC];
     __shared__ float g[T][HC][UC];
     const int t = threadIdx.x;
-    const int rr = t >> 2, q = t & 3;
+    // four lanes per row: quarter q reads uint4 q, q+4, ..., q+36 (10 of the row's 40) - issued first, so the DRAM
+    // latency overlaps the partial folding below
+    const int rr = t >> 2, q = t & 3;          // 64 rows: stream c = rr / UC, column dd = rr % UC
     const int c = rr / UC, dd = rr - c * UC, d = bx * UC + dd, i = c * N + d;
-    const auto& w = P.w;
-    const auto& w8 = P.w8;
-    const auto& d8 = P.d8;
-    const auto& rv = P.rv;
-    const float wn = P.wn;
+    uint4 w[10];
+    uint2 w8[10];
+    float d8[10];
+    if constexpr (Q8) {
+        const int8_t* qu = m.a[0].r8_up;
+        const uint16_t* su = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(qu) + r8_soff((size_t) D * LR));
+        const uint2* w2 = reinterpret_cast<const uint2*>(qu + (size_t) i * LR);
+#pragma unroll
+        for (int u = 0; u < 10; ++u) { w8[u] = ntload2(w2 + q + 4 * u); d8[u] = h2f(su[(size_t) i * (LR / 32) + ((q + 4 * u) >> 2)]); }
+    } else {
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+#pragma unroll
+        for (int u = 0; u < 10; ++u) w[u] = ntload(w4 + q + 4 * u);
+    }
+    float rv[T], wn = m.a[0].w_norm[i];
+#pragma unroll
+    for (int k = 0; k < T; ++k) rv[k] = m.a[k].R[i];
     if (t < T * HC) {
         const int k = t / HC, cs = t - k * HC;
         const float s = m.ss[k * 2 * HC + 2 * cs] + m.ss[k * 2 * HC + 2 * cs + 1];
@@ -581,13 +564,6 @@ __device__ __forceinline__ void up_main(const RdnaGr& m, const int bx, const UpP
 }
 
 template <int T, bool Q8 = false, bool A8 = false>
-__device__ __forceinline__ void up_body(const RdnaGr& m, const int bx) {
-    UpPre<T, Q8> P;
-    up_pre<T, Q8>(m, bx, P);
-    up_main<T, Q8, A8>(m, bx, P);
-}
-
-template <int T, bool Q8 = false, bool A8 = false>
 __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
     up_body<T, Q8, A8>(m, blockIdx.x);
 }
@@ -616,15 +592,9 @@ template <int T>
 __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_fused(RdnaGr m) {
     constexpr int NBX = LR / (2 * WV) + 1;   // the down grid's x extent (row groups + the inject group)
     const int b = (int) blockIdx.x;
-    // STRATA_GR_UPPRE (default on; =0 the earlier order): the up pass's weights are in flight during the down pass
-    UpPre<T, true> P;
-    if (m.uppre && b < UB) up_pre<T, true>(m, b, P);
     down_a8_body<T, 2, false>(m, b % NBX, b / NBX);
     grid_barrier(m.bar, gridDim.x);
-    if (b < UB) {
-        if (!m.uppre) up_pre<T, true>(m, b, P);
-        up_main<T, true, true>(m, b, P);
-    }
+    if (b < UB) up_body<T, true, true>(m, b);
 }
 
 __global__ void inj_check(const float* a, const float* b, const float* sa, const float* sb, int T, int apply, int inj, volatile float* rec) {
@@ -768,8 +738,6 @@ void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* s
     m.ss = scratch + (size_t) n_tok * 2 * HC * PR;
     int dev = 0;
     if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) m.bar = g_gr_bar[dev];
-    static const bool uppre = [] { const char* v = std::getenv("STRATA_GR_UPPRE"); return v == nullptr || v[0] != '0'; }();
-    m.uppre = uppre;
     cudaStream_t st = (cudaStream_t) stream;
     switch (n_tok) {
         case 1: launch<1>(m, st, sb, si); break;
