@@ -132,6 +132,13 @@ namespace {
 // [claude] STRATA_SPEC_CUM=S (opt-in; unset or 0 = off; from android-imdad/Strata-7900xtx): a window keeps a draft only
 // while the product of the draft layer's probabilities up to it (the chance that every draft so far holds) is at least
 // S, beside --spec-min-p's per-draft floor.  It only chooses which drafts are verified: the output is unchanged.
+// [claude] STRATA_ADAPT_MIN_USE (default 2): the decayed routing count a missing expert needs to be a swap candidate.
+// One GPU, a replay of the suite's routing (results/decode-20261022/tp-m1/g1-suite-trace): 2 -> 1 with --adapt-decay
+// 0.95 raised the simulated hit rate 81.4 -> 83.3% at 48 swaps a window (fewer candidates than swaps before).
+float adapt_min_use() {
+    static const float v = [] { const char* e = std::getenv("STRATA_ADAPT_MIN_USE"); return e ? (float) std::atof(e) : 2.0f; }();
+    return v;
+}
 double spec_cum_floor() {
     static const double v = [] { const char* e = std::getenv("STRATA_SPEC_CUM"); return e ? std::atof(e) : 0.0; }();
     return v;
@@ -8891,7 +8898,7 @@ int main(int argc, char** argv) {
                 const int32_t* r1 = tp2 ? host_res1.data() + l * g.n_expert : nullptr;   // tp2: card 1's table
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0 && (r1 == nullptr || r1[e] < 0)) {
-                        if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e);
+                        if (u[e] >= adapt_min_use() && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e);
                     } else if (r[e] >= 0) vict.emplace_back(u[e], e);
                     else vict.emplace_back(u[e], e | (1 << 16));
                 }
@@ -9121,7 +9128,7 @@ int main(int argc, char** argv) {
                 const float* u = a_usage.data() + l * g.n_expert;
                 const int32_t* r = a_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= adapt_min_use() && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -13688,7 +13695,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= adapt_min_use() && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
