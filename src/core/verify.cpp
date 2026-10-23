@@ -1180,10 +1180,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 // STRATA_MEGAKERNEL: the whole dense chain as one persistent kernel where it covers the case (one token group
                 // from 0, no self-commit, no side branches/profile, Q8_0 projections, T <= 8); otherwise the six nodes
-                // (TP verifiers only: they run one window at a time - the pipelined layer split overlaps two windows on a card, the
+                // (TP verifiers or a single verifier over the whole model - one window at a time; the pipelined layer split overlaps two windows on a card, the
                 // persistent kernel's blocks are then not all resident and every phase wait times out: 3 tok/s, 2026-10-22)
-                const bool use_mk = g_megakernel() && tp_ && !br && !batch_rec_ && !self_commit && tb == 0 && n >= 1 &&
+                const bool use_mk = g_megakernel() && (tp_ || (lb_ == 0 && le_ == g.n_layers && next_ == nullptr)) && !br && !batch_rec_ && !self_commit && tb == 0 && n >= 1 &&
                                     n <= 8 && wqkv->native_type == 8 && wg->native_type == 8 && wout->native_type == 8;
+                if (g_megakernel()) {   // once a verifier: whether the persistent kernel covers this window's layers, and why not
+                    static int said = 0;
+                    if (said < 4 && l == lb_ && grp == 0) {
+                        ++said;
+                        std::fprintf(stderr, "strata verify: STRATA_MEGAKERNEL %s (tp %d, layers [%lld, %lld), next %d, branch %d, batch %d, self-commit %d, tb %d, n %d, types %d/%d/%d)\n",
+                                     use_mk ? "on" : "off", (int) tp_, (long long) lb_, (long long) le_, next_ != nullptr, (int) br,
+                                     (int) batch_rec_, (int) self_commit, (int) tb, (int) n, wqkv->native_type, wg->native_type, wout->native_type);
+                    }
+                }
                 if (use_mk) {
                     strata::kernels::MkGdnArgs a;
                     a.x = xm; a.xq = xq_; a.w_qkv = wqkv->native_data; a.w_z = wg->native_data; a.w_out = wout->native_data;
