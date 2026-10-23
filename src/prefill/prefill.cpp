@@ -2253,6 +2253,17 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
                                         "gdn recurrence", "gdn out proj", "after combine", "qsa idx proj",
                                         "qsa k norm+rope", "qsa q proj", "qsa gate+out proj",
                                         "qsa kv append+q prep"};
+// [claude] STRATA_PREFILL_TIMING=2: a pinned host buffer allocated inside a prompt read says how long it took
+static cudaError_t pf_host_alloc(void** p, size_t bytes, const char* what) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const cudaError_t e = cudaHostAlloc(p, bytes, cudaHostAllocDefault);
+    static const bool say = [] { const char* v = std::getenv("STRATA_PREFILL_TIMING"); return v && std::atoi(v) == 2; }();
+    if (say)
+        std::fprintf(stderr, "strata prefill: host alloc %s %.0f MiB in %.0f ms\n", what, bytes / 1048576.0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return e;
+}
+
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     // [claude] STRATA_PREFILL_TIMING=2: also name every single phase interval over 200 ms (device, chunk, layer)
@@ -2285,7 +2296,8 @@ struct PfTimer {
             float t = 0.0f;
             if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) {
                 ms[ph[i]] += t;
-                if (slow && t > 200.0f)
+                static const float slow_ms = [] { const char* e = std::getenv("STRATA_PREFILL_SLOW_MS"); return e ? (float) std::atof(e) : 200.0f; }();
+                if (slow && t > slow_ms)
                     std::fprintf(stderr, "strata prefill slow phase: device %d, chunk from %lld, layer %lld, %s %.0f ms\n", dev,
                                  (long long) p0, (long long) lay[i], kPfNames[ph[i]], t);
             }
@@ -2961,8 +2973,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
+        auto host_l0 = Clock::now();   // [claude] STRATA_PREFILL_TIMING=2: a layer whose host side took long
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            if (pt.slow && l > LB) {
+                static const double slow_h = [] { const char* e = std::getenv("STRATA_PREFILL_SLOW_MS"); return e ? std::atof(e) : 200.0; }();
+                const double hm = ms_since(host_l0);
+                if (hm > slow_h)
+                    std::fprintf(stderr, "strata prefill slow host layer: device %d, chunk from %lld, layer %lld: %.0f ms\n",
+                                 m.device, (long long) p0, (long long) (l - 1), hm);
+            }
+            host_l0 = Clock::now();
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
@@ -3703,7 +3724,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.cpu_x) cudaFreeHost(m.cpu_x);
                                 m.cpu_x = nullptr;
                                 m.cpu_x_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                if (pf_host_alloc((void**) &m.cpu_x, want * sizeof(float), "m.cpu_x") != cudaSuccess) {
                                     (void) cudaGetLastError();
                                     m.cpu_x = nullptr;
                                     cpu_share_off("the activation buffer");
@@ -3725,7 +3746,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
                                 m.cpu_rows = nullptr;
                                 m.cpu_rows_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_rows, cap * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                if (pf_host_alloc((void**) &m.cpu_rows, cap * sizeof(float), "m.cpu_rows") != cudaSuccess) {
                                     (void) cudaGetLastError();
                                     m.cpu_rows = nullptr;
                                     cpu_share_off("the rows buffer");
@@ -3915,7 +3936,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.cpu_rows = nullptr;
                                 m.cpu_rows_n = 0;
                                 const size_t cap_rows = (size_t) rows_cpu * 2;   // headroom: few reallocations
-                                if (cudaHostAlloc((void**) &m.cpu_rows, cap_rows * N * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                if (pf_host_alloc((void**) &m.cpu_rows, cap_rows * N * sizeof(float), "m.cpu_rows") != cudaSuccess) {
                                     err = "prefill: cannot allocate the CPU experts' rows";
                                     return false;
                                 }
