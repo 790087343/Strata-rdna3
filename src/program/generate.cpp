@@ -11483,9 +11483,10 @@ int main(int argc, char** argv) {
                     PfPart* early = nullptr;
                     for (PfPart& p : pf_parts)
                         if (p.sp == &sp && !p.lent.empty() && !p.issued) early = &p;
-                    if (early_refill && early != nullptr)
+                    // (not under --batch: slots may decode between the read and the refill's wait)
+                    if (early_refill && early != nullptr && o.batch == 0)
                         sp.on_dp_done = [&, early](std::string& ee) {
-                            return late_w > 0 && !batch_on() ? late_issue(*early, ee) : refill_issue(*early, ee);
+                            return late_w > 0 ? late_issue(*early, ee) : refill_issue(*early, ee);
                         };
                     const bool dp_ok = strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head,
                                                                         b0 - a0 - head, a0 + head, o.prefill_chunk,
@@ -11712,7 +11713,7 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                const bool late_now = win && late_w > 0 && !batch_on();
+                const bool late_now = win && late_w > 0 && o.batch == 0;
                 tr("part next", at, to);
                 // the state to the pair before the late copies go out: the hand-over syncs both devices, and would
                 // wait for the whole refill
