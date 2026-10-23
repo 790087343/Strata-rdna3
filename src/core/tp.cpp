@@ -371,6 +371,11 @@ namespace {
 struct Stager {
     uint8_t* h = nullptr;
     size_t cap = 0;
+    // the direct path: every piece an asynchronous device-to-device copy (on the destination card's stream 0; a peer copy
+    // when the cards differ), waited for once at the end (finish).  Was: each piece through pinned host memory with two
+    // synchronous copies - 94 ms a hand-over at 2K cells, 150 ms at 32K (2026-10-22)
+    bool direct = false;
+    bool used[64] = {};
     ~Stager() { if (h) cudaFreeHost(h); }
     bool ensure(size_t n) {
         if (n <= cap) return true;
@@ -381,10 +386,50 @@ struct Stager {
         cap = n;
         return true;
     }
+    bool finish(std::string& err) {
+        for (int d = 0; d < 64; ++d) {
+            if (!used[d]) continue;
+            const OnDevice on(d);
+            if (cudaDeviceSynchronize() != cudaSuccess) { err = "tp: the hand-over copies failed"; return false; }
+            used[d] = false;
+        }
+        return true;
+    }
 };
+// The two cards can read each other's memory (the hand-over then copies device to device); STRATA_TP_MOVE_STAGED=1 keeps
+// the host-staged copies.
+bool peer_ready(int a, int b) {
+    if (a == b) return true;
+    static int ok[64][64] = {};   // 0 unknown, 1 yes, -1 no
+    if (a < 0 || b < 0 || a >= 64 || b >= 64) return false;
+    if (ok[a][b] == 0) {
+        int can_ab = 0, can_ba = 0;
+        cudaDeviceCanAccessPeer(&can_ab, a, b);
+        cudaDeviceCanAccessPeer(&can_ba, b, a);
+        bool good = can_ab && can_ba;
+        for (int k = 0; good && k < 2; ++k) {
+            const OnDevice on(k == 0 ? a : b);
+            const cudaError_t e = cudaDeviceEnablePeerAccess(k == 0 ? b : a, 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) good = false;
+            (void) cudaGetLastError();
+        }
+        ok[a][b] = ok[b][a] = good ? 1 : -1;
+    }
+    return ok[a][b] > 0;
+}
 bool copy2d(Stager& st, int ddev, void* dst, size_t dpitch, int sdev, const void* src, size_t spitch, size_t width,
             size_t height, std::string& err) {
     if (height == 0 || width == 0) return true;
+    if (st.direct) {
+        const OnDevice on(ddev);
+        if (cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDefault, 0) != cudaSuccess) {
+            err = "tp: a hand-over copy failed to start";
+            return false;
+        }
+        if (ddev >= 0 && ddev < 64) st.used[ddev] = true;
+        if (sdev >= 0 && sdev < 64) st.used[sdev] = true;
+        return true;
+    }
     if (!st.ensure(width * height)) { err = "tp: the hand-over staging buffer"; return false; }
     {
         const OnDevice on(sdev);
@@ -410,6 +455,13 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
     using strata::kernels::QsaShapes;
     Stager stg;
     const int R = 2;
+    {
+        static const bool staged = [] { const char* v = std::getenv("STRATA_TP_MOVE_STAGED"); return v != nullptr && v[0] == '1'; }();
+        bool direct = !staged;
+        for (int st = 0; direct && st < n_stages; ++st)
+            for (int r = 0; direct && r < R; ++r) direct = peer_ready(stage_dev[st], tp_dev[r]);
+        stg.direct = direct;
+    }
     const uint64_t S = (uint64_t) g.ssm_state_size;
     const uint64_t HV = (uint64_t) g.ssm_v_heads;
     const uint64_t gfull = S * HV * S + (uint64_t) g.ssm_conv_channels * (uint64_t) (g.ssm_d_conv - 1);
@@ -530,7 +582,7 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
             }
         }
     }
-    return true;
+    return stg.finish(err);
 }
 
 }  // namespace strata::core
