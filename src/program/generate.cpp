@@ -7681,6 +7681,12 @@ int main(int argc, char** argv) {
             } else {
                 sp.set_dp(&stages[0]->sp, &dp_ss[0], 0, split_at[0], link, 0);
                 stages[0]->sp.set_dp(&sp, &dp_ss[1], split_at[0], g.n_layers, link, 1);
+                // TP by id: each card's table covers every layer of its own cache (STRATA_DP_FULL_RES=0: own half only)
+                static const bool full_res = [] { const char* v = std::getenv("STRATA_DP_FULL_RES"); return v == nullptr || v[0] != '0'; }();
+                if (tp2 && full_res) {
+                    sp.set_dp_full_residency(true);
+                    stages[0]->sp.set_dp_full_residency(true);
+                }
                 std::fprintf(stderr, "strata serve: DP prompt path linked (chunk up to %lld tokens)\n",
                              (long long) o.prefill_chunk);
             }

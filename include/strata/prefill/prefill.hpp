@@ -199,6 +199,10 @@ public:
     /// `own_lb`/`own_le`: the layers whose experts this GPU's cache holds (the others are streamed).  Both paths must
     /// have run `init` with chunk >= the DP chunk.  `index` 0 / 1.
     struct DpLink;
+    /// [claude] TP by id (--tensor-parallel 2): this path's residency table maps its own card's cache for EVERY layer
+    /// (each card holds half of every layer's hot experts), so a DP prompt reads every layer's resident experts from
+    /// it instead of only its layer-split half's (32K: ~2,500 fewer experts streamed a card).
+    void set_dp_full_residency(bool on) { dp_full_res_ = on; }
     void set_dp(Prefill* peer, core::SessionState* foreign, int64_t own_lb, int64_t own_le, std::shared_ptr<DpLink> link,
                 int index);
     bool dp_ready() const { return dp_link_ != nullptr; }
@@ -222,6 +226,7 @@ private:
     Prefill* dp_peer_ = nullptr;
     core::SessionState* dp_foreign_ = nullptr;
     int64_t dp_own_lb_ = 0, dp_own_le_ = 0;
+    bool dp_full_res_ = false;   // [claude] this card's table maps its own cache for every layer (TP by id)
     std::shared_ptr<DpLink> dp_link_;
     int dp_index_ = 0;
     struct DpChunk { int64_t c0, T, k; int who; };

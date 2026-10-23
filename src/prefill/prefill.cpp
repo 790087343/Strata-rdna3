@@ -4815,6 +4815,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        // [claude] what this run's experts came from (a TP card holds half of every layer's hot experts)
+        std::fprintf(stderr, "strata prefill timing: device %d experts: %lld streamed (%lld straight from the pinned arena), "
+                             "%lld resident, %lld on the CPU\n", m.device, (long long) stats_.experts_streamed,
+                     (long long) stats_.experts_dma, (long long) stats_.experts_resident, (long long) stats_.experts_cpu);
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;
@@ -5048,7 +5052,7 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         sv[i] = {X.stage_lb_, X.stage_le_, X.next_, xm.host_res, X.on_stage_chunk};
         X.dp_res_.assign((size_t) (NL * E), -1);
         if (xm.host_res != nullptr)
-            for (int64_t l = X.dp_own_lb_; l < X.dp_own_le_; ++l)
+            for (int64_t l = X.dp_full_res_ ? 0 : X.dp_own_lb_; l < (X.dp_full_res_ ? NL : X.dp_own_le_); ++l)
                 std::copy(xm.host_res + l * E, xm.host_res + (l + 1) * E, X.dp_res_.begin() + l * E);
         xm.host_res = X.dp_res_.data();
         X.stage_lb_ = 0;
