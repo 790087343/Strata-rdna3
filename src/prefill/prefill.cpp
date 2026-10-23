@@ -5127,7 +5127,14 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
     std::string err_a;
     std::future<bool> fa = std::async(std::launch::async, [&] {
         strata::aux_cpus::pin_current_thread();
-        const bool r = a.run_impl(tokens, n, pos0, err_a);
+        bool r = a.run_impl(tokens, n, pos0, err_a);
+        if (r && a.on_dp_done) {   // its device idle first: nothing of this prompt reads its buffers after this
+            const core::OnDevice on(a.impl_->device);
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                err_a = std::string("prefill DP: syncing the first path: ") + cudaGetErrorString(cudaGetLastError());
+                r = false;
+            } else r = a.on_dp_done(err_a);
+        }
         if (!r) { std::lock_guard<std::mutex> lk(a.dp_link_->mu); a.dp_link_->abort = true; }
         a.dp_link_->cv.notify_all();
         return r;

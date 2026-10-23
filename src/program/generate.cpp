@@ -7312,6 +7312,7 @@ int main(int argc, char** argv) {
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
+            bool issued = false;           // its refill copies are queued (DP: early, while the other GPU reads)
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
@@ -8822,11 +8823,56 @@ int main(int argc, char** argv) {
             aflipped = false;
             res_upload();
         };
+        // [claude] STRATA_REFILL_OVERLAP=<W> (opt-in; 0 = off): the slots a long prompt lent are refilled beside the
+        // first decode windows instead of before them (a 32K prompt's 6,800 slots took 604 ms, ~10% of its time to the
+        // first token).  The copies go out at once on the adaptive tier's streams, the most used experts first, in
+        // STRATA_REFILL_TRANCHES (default 4) parts; part t joins the tables after decode window (t + 1) * W, waited for
+        // there - so which window an expert first runs on the GPU in does not depend on the copies' timing (#463).
+        // Until then those experts run where any miss does.  The adaptive tier waits until every part has joined.
+        struct LateRow { int32_t i, slot; };
+        struct LateTranche { cudaEvent_t ev = nullptr; int dev = -1; std::vector<int32_t>* tbl = nullptr;
+                             std::vector<LateRow> rows; int64_t due = 0; };
+        std::vector<LateTranche> late;
+        int64_t late_windows = 0;   // the decode windows run since this request's prompt was read
+        // STRATA_REFILL_DEFER=1 (with STRATA_REFILL_OVERLAP): the loans read last go out only once the first token is
+        // out - their copies fill that card's link, and the prompt's last windows and the first decode window wait
+        // on it (TP: 6 tokens 24 -> 100 ms, the first window 12 -> 78 ms)
+        std::function<bool(std::string&)> late_go;
+        auto late_defer_w = [] {   // STRATA_REFILL_DEFER=<k windows> (1: once the first window is done)
+            static const int64_t v = [] { const char* e = std::getenv("STRATA_REFILL_DEFER"); return e ? (int64_t) std::max(0, std::atoi(e)) : (int64_t) 0; }();
+            return v;
+        };
+        auto late_launch = [&]() {
+            if (!late_go) return;
+            auto f = std::move(late_go);
+            late_go = nullptr;
+            std::string e;
+            if (!f(e)) std::fprintf(stderr, "strata serve: %s\n", e.c_str());
+        };
+        auto late_apply = [&](bool all) {
+            if (all) late_launch();
+            if (late.empty()) return;
+            size_t k = 0;
+            for (; k < late.size(); ++k) {
+                LateTranche& t = late[k];
+                if (!all && t.due > late_windows) break;
+                {
+                    const strata::core::OnDevice on(t.dev);
+                    cudaEventSynchronize(t.ev);
+                    cudaEventDestroy(t.ev);
+                }
+                for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
+            }
+            if (k == 0) return;
+            late.erase(late.begin(), late.begin() + (ptrdiff_t) k);
+            res_upload();
+        };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            if (!late.empty()) return true;      // a prompt's refill is still joining (STRATA_REFILL_OVERLAP)
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; int card; };   // card: whose cache the victim's slot is (tp2)
             std::vector<Swap> swaps;
@@ -9409,7 +9455,9 @@ int main(int argc, char** argv) {
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
-            std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
+            static const Clock::time_point tr0 = Clock::now();
+            std::fprintf(stderr, "strata trace: %s %lld %lld @%.1f ms\n", what, a, b,
+                         std::chrono::duration<double, std::milli>(Clock::now() - tr0).count());
             std::fflush(stderr);
         };
         {
@@ -9607,6 +9655,7 @@ int main(int argc, char** argv) {
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
             apply_pending(true);                     // the adaptive tier's swaps in flight land first
+            late_apply(true);
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -10451,7 +10500,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
-                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); late_apply(true); })) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
@@ -10708,7 +10757,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            auto kv_quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
+            auto kv_quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); late_apply(true); };
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
                 if (!kvg_ensure(n + 256, kv_quiesce)) {
@@ -11220,6 +11269,7 @@ int main(int argc, char** argv) {
                     if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
                     tbl_of(p)[(size_t) i] = slot;
                 }
+                p.issued = true;
                 return true;
             };
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
@@ -11232,11 +11282,77 @@ int main(int argc, char** argv) {
 #endif
                 p.lent.clear();
                 p.lent_chunk = 0;
+                p.issued = false;
                 return true;
             };
             auto refill_one = [&](PfPart& p, std::string& e) -> bool {
                 if (p.lent.empty()) return true;
-                return refill_issue(p, e) && refill_wait(p, e);
+                return (p.issued || refill_issue(p, e)) && refill_wait(p, e);
+            };
+            // STRATA_REFILL_OVERLAP (see late_apply): a loan's copies go out now on its device's adaptive-tier stream,
+            // the most used experts first, and join the tables in parts beside the decode windows
+            static const int64_t late_w = [] { const char* v = std::getenv("STRATA_REFILL_OVERLAP"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+            static const int64_t late_nt = [] { const char* v = std::getenv("STRATA_REFILL_TRANCHES"); return v ? (int64_t) std::max(1, std::atoi(v)) : (int64_t) 4; }();
+            auto late_stream_of = [&](const PfPart& p) -> cudaStream_t {
+                if (p.dev < 0) return adapt_stream;
+                for (auto& st : stages)
+                    if (st->dev == p.dev) return st->adapt_stream;
+                return nullptr;
+            };
+            auto late_issue = [&](PfPart& p, std::string& e) -> bool {
+                if (p.lent.empty()) return true;
+                const cudaStream_t ls = late_stream_of(p);
+                if (ls == nullptr || p.issued) return refill_one(p, e);
+                tr("late refill", (long long) p.lent.size());
+                const strata::core::OnDevice on(p.dev);
+                std::vector<std::pair<int32_t, int32_t>> rows = std::move(p.lent);
+                p.lent.clear();
+                if (drive.d.usage.size() >= (size_t) (g.n_layers * g.n_expert))
+                    std::stable_sort(rows.begin(), rows.end(), [&](const auto& x, const auto& y) {
+                        return drive.d.usage[(size_t) x.first] > drive.d.usage[(size_t) y.first];
+                    });
+                const size_t per = (rows.size() + (size_t) late_nt - 1) / (size_t) late_nt;
+                for (size_t t0 = 0, t = 0; t0 < rows.size(); t0 += per, ++t) {
+                    LateTranche lt;
+                    lt.dev = p.dev;
+                    lt.tbl = &tbl_of(p);
+                    lt.due = late_windows + (int64_t) (t + 1) * late_w;
+                    for (size_t j = t0; j < std::min(rows.size(), t0 + per); ++j) {
+                        const auto [i, slot] = rows[j];
+                        const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                        uint8_t* dst = p.cache->device_slot(slot);
+                        if (b == nullptr || dst == nullptr ||
+                            cudaMemcpyAsync(dst, b, (size_t) nb, cudaMemcpyHostToDevice, ls) != cudaSuccess) {
+                            e = std::string("prefill: a late refill copy failed: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                        srcp->note_async_read(b, nullptr);   // #1237
+                        lt.rows.push_back({i, slot});
+                    }
+                    if (cudaEventCreateWithFlags(&lt.ev, cudaEventDisableTiming) != cudaSuccess ||
+                        cudaEventRecord(lt.ev, ls) != cudaSuccess) {
+                        e = std::string("prefill: a late refill event failed: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    late.push_back(std::move(lt));
+                }
+                p.lent_chunk = 0;
+                return true;
+            };
+            const bool late_defer = late_defer_w() > 0;
+            auto refill_late = [&](std::string& e) -> bool {
+                if (late_defer) {
+                    late_go = [&](std::string& ee) -> bool {
+                        for (PfPart& p : pf_parts)
+                            if (!p.lent.empty() && !late_issue(p, ee)) return false;
+                        return true;
+                    };
+                    return true;
+                }
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !late_issue(p, e)) return false;
+                return true;
             };
             // #340: with several stages every stage's copies go out first (each card on its own link), then each is
             // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
@@ -11249,7 +11365,7 @@ int main(int argc, char** argv) {
                     if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
                 if (n_parts > 1 && !refill_serial) {
                     for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_issue(p, e)) return false;
+                        if (!p.lent.empty() && !p.issued && !refill_issue(p, e)) return false;
                     for (PfPart& p : pf_parts)
                         if (!p.lent.empty() && !refill_wait(p, e)) return false;
                 } else {
@@ -11270,6 +11386,7 @@ int main(int argc, char** argv) {
             // participant's own cache, and marking only that participant's own layers
             auto lend = [&](int64_t a0, int64_t tokens, std::string& e) -> bool {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+                late_apply(true);   // a refill still joining: its slots are in the tables before any is lent again
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
@@ -11359,9 +11476,23 @@ int main(int argc, char** argv) {
                     const int64_t head = dp_head(a0);
                     if (head > 0 && !sp.run(ids.data() + a0, head, a0, e)) return false;
                     std::string de;
-                    if (strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head, b0 - a0 - head,
-                                                         a0 + head, o.prefill_chunk, kDpMinLast, de))
-                        return true;
+                    // STRATA_DP_EARLY_REFILL (default on; 0 = off): the first path's GPU finishes its chunk first (the
+                    // second attends to the whole prompt) and refills the slots it lent while the second still reads -
+                    // 32K: the 604 ms refill after the read was ~10% of the time to the first token
+                    static const bool early_refill = [] { const char* v = std::getenv("STRATA_DP_EARLY_REFILL"); return v == nullptr || v[0] != '0'; }();
+                    PfPart* early = nullptr;
+                    for (PfPart& p : pf_parts)
+                        if (p.sp == &sp && !p.lent.empty() && !p.issued) early = &p;
+                    if (early_refill && early != nullptr)
+                        sp.on_dp_done = [&, early](std::string& ee) {
+                            return late_w > 0 && !batch_on() ? late_issue(*early, ee) : refill_issue(*early, ee);
+                        };
+                    const bool dp_ok = strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head,
+                                                                        b0 - a0 - head, a0 + head, o.prefill_chunk,
+                                                                        kDpMinLast, de);
+                    sp.on_dp_done = nullptr;
+                    if (dp_ok) return true;
+                    if (early != nullptr && (early->issued || early->lent.empty())) { e = de; return false; }   // its loan is half given back
                     if (de.rfind("prefill DP: the p", 0) != 0) { e = de; return false; }
                     std::fprintf(stderr, "strata serve: %s - the layer pipeline reads it\n", de.c_str());
                     return sp.run(ids.data() + a0 + head, b0 - a0 - head, a0 + head, e);
@@ -11459,6 +11590,8 @@ int main(int argc, char** argv) {
                 return true;
             };
             apply_pending(true);
+            late_apply(true);
+            late_windows = 0;   // STRATA_REFILL_OVERLAP: the parts' windows count from this request's first decode window
             if (!adapt_tick(true)) {   // --adapt-async: the round in flight lands before the prompt lends any slot
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
@@ -11579,7 +11712,15 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
+                const bool late_now = win && late_w > 0 && !batch_on();
+                tr("part next", at, to);
+                // the state to the pair before the late copies go out: the hand-over syncs both devices, and would
+                // wait for the whole refill
+                if (late_now && tp_on && !tp_to(true, at, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                if (win && !(late_now ? refill_late(err) : refill(err))) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -11593,6 +11734,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                tr(win ? "part start (windows)" : "part start (batched)", at, to);
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
                 if (sp_ok) pp_exact = true;
                 if (trace) {
@@ -11622,6 +11764,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                tr("part done", at, to);
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
@@ -11633,7 +11776,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (!refill(err)) {
+            tr("parts read", n);
+            if (!late_go && !refill(err)) {   // (STRATA_REFILL_DEFER: the loans go out after the first window)
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
@@ -11709,6 +11853,9 @@ int main(int argc, char** argv) {
             // (with STRATA_IQ_MT_MIN=1 bit for bit; sampled requests with the same Philox draw per position).
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
+            // STRATA_REFILL_OVERLAP: the pipelined loop joins the parts as they land (pl_apply), as it does the swaps;
+            // with --adapt-async it has no such point: the whole refill first
+            if (pl_want && o.adapt_async) late_apply(true);
             const char* pl_serial = !pl_want ? nullptr
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
@@ -11903,6 +12050,21 @@ int main(int argc, char** argv) {
                 auto pl_apply = [&]() {
                     if (exch_wait) {
                         if (stage_passed(exch_ev)) pl_release();
+                        return;
+                    }
+                    late_launch();   // STRATA_REFILL_DEFER: the first verdict is in
+                    if (!late.empty()) {   // STRATA_REFILL_OVERLAP: a landed part joins as a swap round does here
+                        LateTranche& t = late.front();
+                        {
+                            const strata::core::OnDevice on(t.dev);
+                            if (cudaEventQuery(t.ev) != cudaSuccess) return;
+                            cudaEventDestroy(t.ev);
+                        }
+                        for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
+                        late.erase(late.begin());
+                        res_upload();
+                        stage_record(exch_ev);
+                        exch_wait = true;
                         return;
                     }
                     if (pending.empty() || cudaEventQuery(adapt_ev) != cudaSuccess) return;
@@ -12357,10 +12519,12 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+            tr("decode start", n);
             if (tp_on && !pl_ran && !cancelled && produced_n < max_new && !tp_to(true, n, err)) {   // TENSOR PARALLEL: the state to the cards
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            if (tp_on) tr("tp state moved", n);
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
@@ -12411,6 +12575,9 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                if (late_defer_w() > 0 && late_windows >= late_defer_w()) late_launch();   // STRATA_REFILL_DEFER=<k>: after k windows
+                late_apply(false);   // STRATA_REFILL_OVERLAP: the parts due by this window join (waited for)
+                ++late_windows;
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
@@ -12448,7 +12615,7 @@ int main(int argc, char** argv) {
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg.on && p + T + 64 > kvg.cells &&
-                    !kvg_ensure(p + T + 64, [&] { std::string we; (void) dv.wait_commit(we); cudaDeviceSynchronize(); apply_pending(true); })) {
+                    !kvg_ensure(p + T + 64, [&] { std::string we; (void) dv.wait_commit(we); cudaDeviceSynchronize(); apply_pending(true); late_apply(true); })) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }
@@ -12535,6 +12702,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;
+                if (first_window) tr("first window done", p, T);
                 first_window = false;
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
@@ -12625,6 +12793,7 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            late_apply(true);   // a short answer: the rest of the refill joins before the session is parked
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!dv.wait_commit(err)) {

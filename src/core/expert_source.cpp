@@ -3654,6 +3654,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
+    // STRATA_ROUTE_TRACE=<file> (diagnostics): every layer-window's routing as int32 records {layer, n_tok, k, ids[n_tok*k]},
+    // appended - the input of a cache-policy simulation (which experts a policy with the same slots would have held)
+    static std::FILE* rtrace = [] { const char* v = std::getenv("STRATA_ROUTE_TRACE"); return v != nullptr ? std::fopen(v, "ab") : nullptr; }();
+    if (rtrace != nullptr) {
+        const int32_t hdr[3] = {(int32_t) d.layers, (int32_t) n_tok, (int32_t) k};
+        std::fwrite(hdr, 4, 3, rtrace);
+        std::fwrite(ids, 4, (size_t) (n_tok * k), rtrace);
+    }
     const auto c0 = std::chrono::steady_clock::now();
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);

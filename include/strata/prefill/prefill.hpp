@@ -145,6 +145,11 @@ public:
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
 
+    /// [claude] DP (run_dp): called on this path's thread once its share of the prompt is read and its device is
+    /// idle - the other path still reading.  Its prompt buffers are free from here (the hand-off pushes, the other
+    /// path never reads them), so the caller can give their slots back while the other GPU finishes.
+    std::function<bool(std::string& err)> on_dp_done;
+
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
 
