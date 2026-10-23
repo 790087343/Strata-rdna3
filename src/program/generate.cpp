@@ -4457,6 +4457,13 @@ int main(int argc, char** argv) {
     strata::core::ModelGeometry tp_g[2];
     strata::core::SessionState tp_ss[2];
     int tp_dev[2] = {0, 0};
+    // each card's TP (and DP foreign) session borrows the RoPE table of the stage session on its card: no second and
+    // third 64 MiB copy of the same table (+~50 expert slots a card)
+    auto stage_rope = [&](int dev) -> const strata::core::QsaState* {
+        strata::core::SessionState& S = dev == stages[0]->dev ? stages[0]->ss : ss;
+        if (g.n_qsa_layers() == 0 || S.qsa_states == nullptr || S.qsa_alloc == 0) return nullptr;
+        return &S.qsa_states[S.qsa_primary()];
+    };
     if (tp_on) {
         tp_dev[1] = stages[0]->dev;
         for (int r = 0; r < 2; ++r) {
@@ -4466,9 +4473,10 @@ int main(int argc, char** argv) {
             }
             const strata::core::OnDevice on(tp_dev[r]);
             void* buf = nullptr;
-            const uint64_t bytes = strata::core::session_bytes(tp_g[r], o.max_context, K, 0, g.n_layers);
+            const strata::core::QsaState* rope = stage_rope(tp_dev[r]);
+            const uint64_t bytes = strata::core::session_bytes(tp_g[r], o.max_context, K, 0, g.n_layers, rope);
             if (cudaMalloc(&buf, bytes) != cudaSuccess ||
-                strata::core::session_init(tp_g[r], o.max_context, K, buf, tp_ss[r], 0, g.n_layers) == 0) {
+                strata::core::session_init(tp_g[r], o.max_context, K, buf, tp_ss[r], 0, g.n_layers, rope) == 0) {
                 std::fprintf(stderr, "strata generate: --tensor-parallel: CUDA%d's session (%llu MiB) failed%s\n", tp_dev[r],
                              (unsigned long long) (bytes >> 20), vram_free_note().c_str());
                 return 1;
@@ -4580,8 +4588,10 @@ int main(int argc, char** argv) {
             const int64_t lo = i == 0 ? split_at[0] : 0, hi = i == 0 ? g.n_layers : split_at[0];
             const strata::core::OnDevice on(dev);
             void* buf = nullptr;
-            if (cudaMalloc(&buf, strata::core::session_bytes(g, o.max_context, K, lo, hi)) != cudaSuccess ||
-                strata::core::session_init(g, o.max_context, K, buf, dp_ss[i], lo, hi) == 0) {
+            const strata::core::QsaState* rope = tp_on ? stage_rope(dev) : nullptr;
+            const uint64_t dbytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, rope);
+            if (cudaMalloc(&buf, dbytes) != cudaSuccess ||
+                strata::core::session_init(g, o.max_context, K, buf, dp_ss[i], lo, hi, rope) == 0) {
                 std::fprintf(stderr, "strata generate: DP prompt path: CUDA%d's session for layers [%lld, %lld) failed; "
                                      "DP off\n", dev, (long long) lo, (long long) hi);
                 cudaGetLastError();

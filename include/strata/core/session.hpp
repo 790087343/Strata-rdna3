@@ -95,11 +95,13 @@ struct SessionState {
 /// [layer_lo, layer_hi) carves only that range's per-layer state (a split stage runs a slice of the model);
 /// the default full range is byte-identical to the old whole-model carve.  Pure arithmetic - safe to call for
 /// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
+/// `share_rope` (session_bytes / session_init): every QSA state borrows that state's RoPE table (another session on the
+/// same device that outlives this one) - one table a card instead of one a session.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
-                       int64_t layer_hi = -1);
+                       int64_t layer_hi = -1, const QsaState* share_rope = nullptr);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1, const QsaState* share_rope = nullptr);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
