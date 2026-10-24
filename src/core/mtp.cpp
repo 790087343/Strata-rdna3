@@ -436,6 +436,19 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
     cudaGetLastError();
 #endif
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // [claude] from upstream 1d21b9cd / 65514542: STRATA_MTP_HIP_PRIO=1 (opt-in here; upstream's default on gfx12) - the draft
+    // stream at the highest priority.  ROCm hands out hardware queues per priority (GPU_MAX_HW_QUEUES per level), so the
+    // drafter gets a queue of its own: its round no longer waits behind the commit graph the verifier's stream launched just
+    // before it.  Upstream, R9700 UD-Q4_K_XL: draft wall 5.8 -> 3.5 ms a window.
+    {
+        static const bool hip_prio = [] { const char* v = std::getenv("STRATA_MTP_HIP_PRIO"); return v != nullptr && std::atoi(v) != 0; }();
+        int lo = 0, hi = 0;
+        if (hip_prio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
+            prio = hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi) == hipSuccess;
+        (void) cudaGetLastError();
+    }
+#endif
     if (!prio && cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
 #if !defined(STRATA_USE_HIP)
     // HIP keeps the shared expert on cs_; only CUDA needs this branch stream.
@@ -656,7 +669,34 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
             dvocab_host_.resize((size_t) n_dvocab_);
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
-            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+            const int head_dev = head->device();
+            if (head_dev >= 0 && head_dev != device_) {
+                // [claude] (upstream 24d972e5) the main head is on another card (the drafter on the first stage of a layer
+                // split, STRATA_MTP_STAGE0=1): the rows are gathered where the head is and the subset copied over once
+                void* tmp = nullptr;
+                int32_t* dv = nullptr;
+                bool ok_x = true;
+                {
+                    const OnDevice on_head(head_dev);
+                    ok_x = cudaMalloc((void**) &tmp, (size_t) (n_dvocab_ * row_bytes)) == cudaSuccess &&
+                           cudaMalloc((void**) &dv, raw.size()) == cudaSuccess &&
+                           cudaMemcpy(dv, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (ok_x) {
+                        strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
+                                                     (uint8_t*) tmp, nullptr);
+                        ok_x = cudaDeviceSynchronize() == cudaSuccess;
+                    }
+                }
+                ok_x = ok_x && cudaMemcpy(dhead_, tmp, (size_t) (n_dvocab_ * row_bytes), cudaMemcpyDeviceToDevice) == cudaSuccess;
+                {
+                    const OnDevice on_head(head_dev);
+                    if (tmp) cudaFree(tmp);
+                    if (dv) cudaFree(dv);
+                }
+                if (!ok_x) { err = "mtp: the draft head's rows could not be copied from the head's card"; return false; }
+            } else {
+                strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+            }
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,

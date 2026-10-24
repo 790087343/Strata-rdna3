@@ -68,6 +68,7 @@ bool NativeHead::load_rows(const std::vector<std::string>& shards, int64_t n_in,
             return false;
         }
         weights_ = weights;
+        { int d = -1; if (cudaGetDevice(&d) == cudaSuccess) device_ = d; }
         scratch_ = scratch;
         bytes_ = bytes;
         n_in_ = (int) n_in;

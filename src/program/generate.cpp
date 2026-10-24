@@ -3595,6 +3595,20 @@ int main(int argc, char** argv) {
         }
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
+    // [claude] from upstream 24d972e5 (0.1.44): the drafter on the FIRST stage's card for a two-stage pipelined decode
+    // (STRATA_MTP_STAGE0=1, opt-in here; upstream's default on gfx12).  Its chain then runs while that card is idle (stage 0
+    // has finished the window the chain follows), not beside the last stage's window on the last card, where the two streams
+    // share the card (upstream, 2x R9700: stage-1 window 11 -> 25 ms, chain 7 -> 21 ms).  Needs the draft head's subset
+    // file (the main head stays on the last card; the subset's rows are copied over once).
+    const bool mtp_first = [&] {
+        if (o.mtp.empty() || o.spec < 2 || o.pipeline_windows < 2 || stages.empty() || o.batch != 0) return false;
+        if (const char* fh = std::getenv("STRATA_MTP_FULL_HEAD"); fh != nullptr && fh[0] == '1') return false;
+        std::error_code ec;
+        const bool subset = o.mtp_draft_vocab.empty() ? std::filesystem::exists(std::filesystem::path(o.mtp) / "draft_vocab.bin", ec)
+                                                      : std::filesystem::exists(o.mtp_draft_vocab, ec);
+        const char* e = std::getenv("STRATA_MTP_STAGE0");
+        return subset && e != nullptr && std::atoi(e) != 0;
+    }();
 
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
@@ -3766,7 +3780,7 @@ int main(int argc, char** argv) {
         std::vector<double> layer_ms((size_t) ns);
         for (int i = 0; i < ns; ++i) {
             const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
-            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i + 1 == ns, true);
+            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, mtp_first ? i == 0 : i + 1 == ns, true);
             int sms = 0, khz = 0;
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) != cudaSuccess || khz <= 0) khz = 1800000;
@@ -4811,12 +4825,12 @@ int main(int argc, char** argv) {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
-        const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
+        const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
@@ -5197,7 +5211,8 @@ int main(int argc, char** argv) {
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
-                               ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+                               ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab)
+                               : (mtp_first && last_st->head.loaded()) ? (int64_t) mtp.bind_bytes(last_st->head.row_bytes(), n_vocab) : 0;
         // (with a layer split the slot drafters bind on the last stage, whose cache is sized from what is free there)
         if (stages.empty())
             for (const auto& d : slot_mtp)
@@ -7923,8 +7938,16 @@ int main(int argc, char** argv) {
                                  gs.dev, st + 1, err.c_str());
                     return 1;
                 }
-                if (last && cudaMalloc((void**) &pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT * (size_t) (g.hc * g.n_embd) *
+                if (last && !mtp_first && cudaMalloc((void**) &pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT * (size_t) (g.hc * g.n_embd) *
                                                                sizeof(float)) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
+                    return 1;
+                }
+            }
+            if (mtp_first) {   // the drafter's row buffer on its own card (the first)
+                const strata::core::OnDevice on_m(mtp.device());
+                if (cudaMalloc((void**) &pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT * (size_t) (g.hc * g.n_embd) *
+                                                       sizeof(float)) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
                 }
@@ -7941,7 +7964,7 @@ int main(int argc, char** argv) {
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
-            (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+            (use_mtp && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
@@ -8331,8 +8354,8 @@ int main(int argc, char** argv) {
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            const strata::core::QsaState* draft0 = (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && !mtp_first && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
             struct MergeBack {
@@ -8597,7 +8620,7 @@ int main(int argc, char** argv) {
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
-                use_mtp, multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
+                use_mtp, multi_gpu, split_mtp_batch && !mtp_first, strata::core::native_embed() != nullptr);
             if (dkv.try_batched || dkv.why != nullptr) {
                 strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
                 const char* why = dkv.why;
@@ -10852,7 +10875,7 @@ int main(int argc, char** argv) {
             if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
                 const strata::core::OnDevice on(stages[i]->dev);
                 if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
-                        use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
+                        use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
                     std::fprintf(stderr, "strata serve: conversation cache: discard invalid stage snapshot (%s)\n",
                                  err.c_str());
                     incoming.reset();
@@ -10861,7 +10884,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
-                    use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err)) {
+                    use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
                 err.clear();
@@ -10926,7 +10949,7 @@ int main(int argc, char** argv) {
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err) !=
+                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
@@ -10936,7 +10959,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
                         strata::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
@@ -10946,8 +10969,8 @@ int main(int argc, char** argv) {
                 }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
-                    const auto& draft_kv = stages.empty() ? incoming->kv.back() : incoming->stage_images.back().kv.back();
-                    const strata::core::OnDevice on_d(stages.empty() ? 0 : stages.back()->dev);
+                    const auto& draft_kv = stages.empty() || mtp_first ? incoming->kv.back() : incoming->stage_images.back().kv.back();
+                    const strata::core::OnDevice on_d(stages.empty() || mtp_first ? 0 : stages.back()->dev);
                     if (!strata::core::conversation_kv_verify(draft_kv, mtp.kv_state(), g,
                             int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
                         std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
