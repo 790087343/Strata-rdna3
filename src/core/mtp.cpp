@@ -1317,7 +1317,6 @@ bool MtpDrafter::capture_all(int T, int max_steps, bool coupled, std::string& er
 bool MtpDrafter::record_round_graph(int T, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     g_mp.base = 0;
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
@@ -1374,7 +1373,6 @@ bool MtpDrafter::record_step_graph(int j, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
 #if defined(STRATA_USE_HIP)
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
