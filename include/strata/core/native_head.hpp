@@ -26,13 +26,14 @@ public:
     /// The rows this head holds start at this vocabulary id (load_rows), 0 otherwise; rows() of them.
     int64_t row0() const { return row0_; }
     int rows() const { return n_out_; }
+    void unload();
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
-    /// [claude] (upstream 24d972e5) the device whose memory holds the weights (the one current when `load` ran; -1 before)
+    /// The device whose memory holds the weights (the one current when `load` ran; -1 before).
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }

@@ -1,7 +1,9 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
 
+#include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -131,6 +133,7 @@ void PeerExperts::close() {
     d_x_ = d_out_ = h_x_ = h_out_ = nullptr;
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
     d_q8_ = nullptr;
+    d_sx_ = d_sh_ = nullptr;
     stream_ = refill_ = nullptr;
     refill_ev_ = nullptr;
     device_ = -1;
@@ -154,16 +157,16 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
         int a = 0, b = 0;
-        cudaDeviceCanAccessPeer(&a, 0, device);
-        cudaDeviceCanAccessPeer(&b, device, 0);
+        cudaDeviceCanAccessPeer(&a, primary_device(), device);
+        cudaDeviceCanAccessPeer(&b, device, primary_device());
         if (const char* np = std::getenv("STRATA_PEER_NO_P2P"); np != nullptr && std::atoi(np) != 0) a = 0;   // test knob: pretend the pair has no P2P
         p2p_ = a && b;
         if (p2p_) {
-            On on0(0);
+            On on0(primary_device());
             cudaError_t e0 = cudaDeviceEnablePeerAccess(device, 0);
             if (e0 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e0 = cudaSuccess; }
             On on1(device);
-            cudaError_t e1 = cudaDeviceEnablePeerAccess(0, 0);
+            cudaError_t e1 = cudaDeviceEnablePeerAccess(primary_device(), 0);
             if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
             p2p_ = e0 == cudaSuccess && e1 == cudaSuccess;
             // recommend, never force: the direct path is used only if a test copy each way arrives exact (#2666)
@@ -198,6 +201,10 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
+    if (strata::kernels::cpu::hadamard_spec().any()) {   // APR: this device's copies of the sign vectors
+        d_sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) H), (int) H);
+        d_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) ff), (int) ff);
+    }
 
     profile_on_ = std::getenv("STRATA_HELPER_PROFILE") != nullptr;
     if(profile_on_)for(auto& e:profile_ev_)if(!ck(cudaEventCreate(&e),"profile event",err)){close();return false;}
@@ -330,10 +337,13 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     Meta* dm = (Meta*) d_meta_;
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
+        const auto& f = lay.fmt[(size_t) layer];
+        // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
+        if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
         strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
         if(profile_on_ && !ck(cudaEventRecord(profile_ev_[2],s),"profile quant",err))return false;
-        const auto& f = lay.fmt[(size_t) layer];
-        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
         strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                                d_scratch_, d_out_, s);
     } else {

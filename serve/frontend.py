@@ -135,15 +135,36 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
+# DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
+# Effort: N" line of its prompt).  use_family("deepseek41") switches the table; the other families keep the one above.
+EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+                   "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+_EFFORT_QWEN = dict(EFFORT)
+_NUMERIC_EFFORT = False
+
+
+def use_family(family: str | None) -> None:
+    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
+    global _NUMERIC_EFFORT
+    EFFORT.clear()
+    EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
+    _NUMERIC_EFFORT = family == "deepseek41"
+
+
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
+    if _NUMERIC_EFFORT and isinstance(value, int) and not isinstance(value, bool):
+        if not 1 <= value <= 100:
+            raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
+        return {"reasoning_effort": value}
     key = str(value).strip().lower()
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
+                         + (", max or 1..100" if _NUMERIC_EFFORT else ""))
     level = EFFORT[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
@@ -154,7 +175,7 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
 
 
 def _has_image(content) -> bool:
@@ -242,7 +263,15 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+# #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
+# (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
+# message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
+# 0.1.44: `<tool_call>`, `<tool_response>` and `</tool_response>` are type 4 too (ids 248058, 248066, 248070), so a quoted
+# one handed the model the real call / tool-result marker in the same way (found by 47Hunter47 in #2026).  The template
+# writes the tool-result markers around a tool message itself; only the text inside a message is marked.
+TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<tool_response>": "\U000F0E09",
+                     "</tool_response>": "\U000F0E0A"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 
@@ -283,6 +312,44 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     return False
 
 
+_TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE = "<tool_response>", "</tool_response>"
+
+
+def _keep_tool_result_wrap(content, tags: dict[str, str]):
+    """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the way
+    the template does for a tool message) keeps that outer pair as the markers - the template tells such a turn from a
+    real question by exactly that pair - and only the text inside is marked.  None: not such a message."""
+    o, c = _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE
+
+    def wrap(text: str, first: bool, last: bool) -> str:
+        i = text.index(o) + len(o) if first else 0
+        j = text.rindex(c) if last else len(text)
+        head = _mark(text[:i - len(o)], tags) + o if first else ""
+        tail = c + _mark(text[j + len(c):], tags) if last else ""
+        return head + _mark(text[i:j], tags) + tail
+
+    if isinstance(content, str):
+        body = content.strip()
+        if len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c):
+            return wrap(content, True, True)
+        return None
+    if not (isinstance(content, list) and content and all(isinstance(x, dict) and "text" in x for x in content)):
+        return None
+    texts = [x["text"] for x in content]
+    if not all(isinstance(t, str) for t in texts):
+        return None
+    body = "".join(texts).strip()
+    if not (len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c)):
+        return None
+    if not (texts[0].lstrip().startswith(o) and texts[-1].rstrip().endswith(c)):
+        return None          # the pair is split across parts: mark it all, as before
+    if len(content) == 1:
+        return [{**content[0], "text": wrap(texts[0], True, True)}]
+    return ([{**content[0], "text": wrap(texts[0], True, False)}] +
+            [_mark_deep(x, tags) for x in content[1:-1]] +
+            [{**content[-1], "text": wrap(texts[-1], False, True)}])
+
+
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
     LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
@@ -292,17 +359,23 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
+    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
     for m in messages:
         m = dict(m)
         content = m.get("content")
+        mine = own if m.get("role") == "assistant" else tags
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, tags)
+                m[k] = _mark_deep(v, mine)
+        if m.get("role") == "user":
+            kept = _keep_tool_result_wrap(content, tags)
+            if kept is not None:
+                m["content"] = kept
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
-                            _mark(content[j + len("</think>"):], tags))
+            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
+                            _mark(content[j + len("</think>"):], own))
         out.append(m)
     return out, _mark_deep(tools, tags), True
 
@@ -326,6 +399,42 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
         pos = m.end()
     out.append(prompt[pos:])
     return "".join(out), spans
+
+
+# Config "env_to_user" (opt-in): opencode writes its <env> block (working directory, today's date) near the START of
+# the system message, before ~40K characters of instructions and tool definitions that are the same in every session.
+# The prefix cache only reuses a prompt's start, so a new folder or a new day read all of it again (~14K tokens, 8-11 s).
+# Moved to the front of the first user message, the system turn (and the tools the template writes into it) is the same
+# for every session and the disk prefix cache restores it.  The model still sees the same lines, one turn later.
+ENV_TO_USER = False
+_ENV_BLOCK = re.compile(r"(?:[^\n]*environment you are running in:\n)?<env>\n.*?\n</env>\n?", re.S)
+
+
+def _env_to_user(messages: list[dict]) -> list[dict]:
+    if not ENV_TO_USER or not messages or messages[0].get("role") != "system":
+        return messages
+    sys_text = messages[0].get("content")
+    if not isinstance(sys_text, str):
+        return messages
+    m = _ENV_BLOCK.search(sys_text)
+    if m is None:
+        return messages
+    for i in range(1, len(messages)):
+        if messages[i].get("role") != "user":
+            continue
+        block = m.group(0).rstrip("\n")
+        c = messages[i].get("content")
+        if isinstance(c, str):
+            nc = block + "\n\n" + c
+        elif isinstance(c, list):
+            nc = [{"type": "text", "text": block + "\n\n"}] + c
+        else:
+            return messages
+        out = list(messages)
+        out[0] = dict(messages[0], content=sys_text[:m.start()] + sys_text[m.end():])
+        out[i] = dict(messages[i], content=nc)
+        return out
+    return messages
 
 
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
@@ -458,14 +567,16 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
+    given = req.get("reasoning_effort")
+    # `false` is a level (thinking off, effort_kwargs): an `or` between the two fields dropped it
+    kwargs.update(effort_kwargs(given if given is not None and given != "" else reasoning.get("effort")))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return _late_system_to_user(messages), tools, kwargs
+    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
 BILLING_HEADER = "x-anthropic-billing-header:"
@@ -547,6 +658,11 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
+    # 0.1.45: Anthropic's budget_tokens is a real budget, not only a level: the thinking is closed (wrap-up, </think>,
+    # the answer) after that many tokens.  A reasoning_budget_tokens of the request's own wins.
+    bt = thinking.get("budget_tokens") if isinstance(thinking, dict) and thinking.get("type") != "disabled" else None
+    if isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
+        req["reasoning_budget_tokens"] = bt
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
     elif effort:
@@ -561,7 +677,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _late_system_to_user(messages), tools, kwargs
+    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser
@@ -587,6 +703,10 @@ CALL_END = "</tool_call>"
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
+# #3441: the opener a model writes when it drifts by a token inside the envelope the template documents:
+# `<=NAME>` (the word `function` dropped), `<function:NAME>`, `<function =NAME>`, or the bare `<NAME>`
+_LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*>")
+_LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
 
 
 def param_end(text: str, final: bool = False) -> int:
@@ -716,9 +836,17 @@ def function_end(text: str) -> int:
             return -1
 
 
+_JSON_FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n\s*", re.I)
+
+
 def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     """`{"name": N, "arguments": {...}}` (or "parameters", or the arguments as a JSON string) of a declared tool -> its
-    call; anything else -> None."""
+    call; anything else -> None.  #2037: the object may sit in a Markdown fence (```json ... ```)."""
+    body = body.strip()
+    m = _JSON_FENCE.match(body)
+    if m:
+        body = body[m.end():].rstrip()
+        body = body[:-3] if body.endswith("```") else body
     try:
         obj = json.loads(body)
     except ValueError:
@@ -777,11 +905,29 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False):
+                 recover: bool = False, declared_only: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
+        # #804/#3075: in the answer too, a call counts only for a tool the request declared.  With tools declared a
+        # call for another name stays text (the Responses spelling `namespace__tool` of a `namespace.tool` counts as
+        # that tool); `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
+        # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
+        # conversation's tools in the prompt only, and its calls come back as before.
+        self.declared_only = declared_only
+        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted without advertising a
+        # duplicate tool.  Only an unambiguous alias counts (two namespaces can end in the same member), and an exactly declared
+        # name always wins over an alias.
+        aliases = {}
+        for name in self.schemas:
+            if isinstance(name, str) and "." in name:
+                namespace, member = name.rsplit(".", 1)
+                aliases.setdefault(f"{namespace}__{member}", set()).add(name)
+        self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
+                        if len(names) == 1 and alias not in self.schemas}
+        self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
+        self.unread_names: list[str] = []   # the names (first few) of those that named a tool the request did not declare
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -802,6 +948,12 @@ class OutputParser:
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
 
+    @property
+    def clean(self) -> bool:
+        """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text, as
+        serve/dsml.py's does, also counts what it holds)."""
+        return not self.buf
+
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
         snap = (self.fence, self.line, self.ticks)
@@ -809,6 +961,30 @@ class OutputParser:
         ok = self._opener_ok()
         self.fence, self.line, self.ticks = snap
         return ok
+
+    def _callable(self, name: str) -> bool:
+        """#3075: may a call for `name` be a call?  A tool the request declared (or its Responses spelling); with
+        none declared, only where `declared_only` is off."""
+        if not self.schemas:
+            return not self.declared_only
+        return name in self.schemas or name in self.aliases
+
+    def _loose_open(self, after: str):
+        """#3441: `after` (text after a `<tool_call>`, whitespace dropped) opens a call in a drifted form that names a
+        declared tool -> (name, length of the opener); "wait" while it may still become one; None otherwise."""
+        m = _LOOSE_OPEN.match(after)
+        if m:
+            name = m.group(1)
+            return (name, m.end()) if self._callable(name) else None
+        if ">" in after or "\n" in after or not after.startswith("<"):
+            return None
+        if _LOOSE_PART.match(after):
+            bare = after[1:].strip().lstrip("=").strip()
+            if after[1:].lstrip().startswith(("=", "function")):
+                return "wait"
+            if any(k.startswith(bare) for k in list(self.schemas) + list(self.aliases) if isinstance(k, str)):
+                return "wait"
+        return None
 
     def _follower(self, after: str) -> str:
         """recover: what a `<tool_call>` followed (after whitespace) by `after` opens: "call" (`<function=`), "param"
@@ -822,6 +998,15 @@ class OutputParser:
             return "param" if after[len(PARAM_START):gt] in self.schemas else "text"
         if after.startswith("{"):
             return "json" if self.schemas else "text"
+        if after.startswith("```") or (after and "```".startswith(after)):
+            # #2037: the JSON call inside a Markdown fence (```json ... ```) in the explicit wrapper
+            m = _JSON_FENCE.match(after)
+            if m:
+                rest = after[m.end():]
+                if rest.startswith("{"):
+                    return "json" if self.schemas else "text"
+                return "wait" if not rest else "text"
+            return "wait" if "\n" not in after else "text"
         if not after or FUNC_START.startswith(after) or PARAM_START.startswith(after):
             return "wait"
         return "text"
@@ -833,8 +1018,10 @@ class OutputParser:
         while p >= 0:
             if self._ok_at(p):
                 gt = self.buf.find(">", p)
-                name = self.buf[p + len(FUNC_START):gt if gt >= 0 else len(self.buf)]
-                if gt < 0 and not any(c.isspace() for c in name):
+                raw_name = self.buf[p + len(FUNC_START):gt if gt >= 0 else len(self.buf)]
+                name = raw_name.strip()
+                name = self.aliases.get(name, name)
+                if gt < 0 and re.fullmatch(r"\s*[^<>\s]*\s*", raw_name):
                     return p, False
                 if gt >= 0 and name in self.schemas:
                     return p, True
@@ -932,12 +1119,27 @@ class OutputParser:
         return out
 
     def _reset_scan(self):
+        self._call_end_checked = 0   # closing-tag search progress for the current wrapped call
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
-        self.ss = "name"             # name -> between -> str|raw -> ... -> done
+        self.ss = "name"             # name -> between -> str|raw -> ... -> function_done -> done
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+
+    def _wrapped_call_end(self) -> int:
+        # Without a closing tag the structural walk cannot finish. Search only
+        # newly appended text plus enough overlap for a tag split across feeds.
+        # A literal closing tag inside a value needs structural disambiguation:
+        # once any candidate appears, keep the original full walk for this call.
+        # Recovery can rewrite the buffer, so it always uses the full walk.
+        if not self.recover and self._call_end_checked >= 0:
+            start = max(0, self._call_end_checked - len(CALL_END) + 1)
+            if self.buf.find(CALL_END, start) < 0:
+                self._call_end_checked = len(self.buf)
+                return -1
+            self._call_end_checked = -1
+        return call_end(self.buf)
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -953,7 +1155,11 @@ class OutputParser:
                 b = rest.find(">", a + 10) if a >= 0 else -1
                 if b < 0:
                     return out
-                name = rest[a + 10:b]
+                raw_name = rest[a + 10:b]
+                name = raw_name.strip()
+                name = self.aliases.get(name, name)
+                if raw_name != raw_name.strip() and name not in self.schemas:
+                    return out
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
@@ -978,9 +1184,8 @@ class OutputParser:
                     else:
                         self.ss = "raw"
                 elif stripped.startswith("</function>"):
-                    args("}")
                     self.sp += len("</function>")
-                    self.ss = "done"
+                    self.ss = "function_done"
                 else:
                     return out          # a tag still arriving (or trailing text): wait
             elif self.ss == "str":
@@ -1028,7 +1233,7 @@ class OutputParser:
                 return out
 
     def _close_scan(self) -> list[Event]:
-        """A streamed call that ended without a clean </function>: close its JSON so clients can still parse it."""
+        """Close streamed JSON only after its call boundary has been confirmed."""
         out = []
         if self.scall is None or self.ss == "done":
             return out
@@ -1045,10 +1250,19 @@ class OutputParser:
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
         best = 0
+        size = len(text)
         for tag in tags:
-            for n in range(1, len(tag)):
-                if text.endswith(tag[:n]):
-                    best = max(best, n)
+            if len(tag) <= 1:
+                continue
+            # Only a suffix beginning with the tag's first character can match.
+            # Ordinary token deltas contain no '<': one C-level search replaces
+            # checking every possible prefix. Earliest candidate is the longest.
+            start = text.find(tag[0], max(0, size - len(tag) + 1))
+            while start >= 0 and size - start > best:
+                if tag.startswith(text[start:]):
+                    best = size - start
+                    break
+                start = text.find(tag[0], start + 1)
         return best
 
     def feed(self, delta: str) -> list[Event]:
@@ -1064,8 +1278,10 @@ class OutputParser:
                     call = None
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
+                        name = self.aliases.get(name, name)
                         if name in self.schemas:
                             call = parse_tool_call(body[:end], self.schemas.get(name))
+                            call.name = name
                     except ValueError:
                         pass
                     raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
@@ -1191,7 +1407,24 @@ class OutputParser:
                 # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
                 # that ends the request.  Until its follower has arrived it is held, like a partial tag.
                 after = self.buf[i + len(CALL_START):].lstrip()
+                if self.schemas and not after.startswith(FUNC_START):
+                    loose = self._loose_open(after)
+                    if loose == "wait":                  # may still become one: held like a partial tag
+                        j = i
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
+                        if j > 0:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                            self.buf = self.buf[j:]
+                        return out
+                    if loose:                            # #3441: `<=NAME>` etc. is `<function=NAME>`
+                        at = len(self.buf) - len(after)
+                        self.buf = self.buf[:at] + FUNC_START + loose[0] + ">" + after[loose[1]:]
+                        continue
                 kind = self._follower(after) if self.recover else None
+                if (after.startswith("<") and kind is None and not FUNC_START.startswith(after)
+                        and not after.startswith(FUNC_START)):
+                    self.unread += 1
                 if kind in ("param", "json"):
                     if i and self.buf[:i].strip():
                         out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
@@ -1204,11 +1437,19 @@ class OutputParser:
                     continue
                 if kind == "wait":
                     after = ""
-                if after and not after.startswith(FUNC_START) and not FUNC_START.startswith(after):
+                is_call = re.match(r"<function=(\s*[^<>\s]+\s*)>", after)
+                if is_call:
+                    raw_name = is_call.group(1)
+                    name = raw_name.strip()
+                    name = self.aliases.get(name, name)
+                    if raw_name != raw_name.strip() and name not in self.schemas:
+                        is_call = None     # only declared names gain whitespace normalization
+                is_partial = FUNC_START.startswith(after) or re.fullmatch(r"<function=\s*[^<>\s]*\s*", after)
+                if not is_call and not is_partial:
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
                     continue
-                if not after.startswith(FUNC_START):
+                if not is_call:
                     j = i
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
@@ -1216,6 +1457,25 @@ class OutputParser:
                         out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
+                if self.schemas or self.declared_only:
+                    # #3075: a call counts only for a declared tool; the name must be complete to tell
+                    gt = after.find(">")
+                    nl = after.find("\n")
+                    if gt < 0 and nl < 0:
+                        j = i
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
+                        if j > 0:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                            self.buf = self.buf[j:]
+                        return out
+                    if gt >= 0 and (nl < 0 or gt < nl) and not self._callable(after[len(FUNC_START):gt].strip()):
+                        self.unread += 1                 # logged by the server: otherwise "the model ignored my tool" is the only clue
+                        if len(self.unread_names) < 5:
+                            self.unread_names.append(after[len(FUNC_START):gt].strip()[:80])
+                        out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                        self.buf = self.buf[i + len(CALL_START):]
+                        continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
@@ -1244,12 +1504,15 @@ class OutputParser:
                         elif after and not CALL_END.startswith(after):
                             drop = 0
                 else:
-                    i = call_end(self.buf)
+                    i = self._wrapped_call_end()
                     if i >= 0:
                         drop = len(CALL_END)
-                    if self.recover:                # a batch in one wrapper: the next call follows this one's
-                        f = function_end(self.buf)  # </function> (or opens as <parameter=NAME>)
-                        nxt = self.buf[f:].lstrip() if f >= 0 else ""
+                    # Only a following call opener confirms an omitted wrapper closer.
+                    f = function_end(self.buf)
+                    nxt = self.buf[f:].lstrip() if f >= 0 else ""
+                    if re.match(r"<tool_call>\s*<function=\s*[^<>\s]+\s*>", nxt):
+                        i, drop = f, 0
+                    if self.recover:                # a batch in one wrapper: the next call follows </function>
                         if nxt.startswith(PARAM_START) and self._follower(nxt) == "param":
                             at = len(self.buf) - len(nxt)
                             self.buf = self.buf[:at] + FUNC_START + nxt[len(PARAM_START):]
@@ -1291,8 +1554,12 @@ class OutputParser:
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
-            if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
+            if self.ss == "function_done" and not self.buf[self.sp:].strip() and reason in (None, "stop"):
+                # A natural end immediately after </function> retains native streaming recovery.
+                out += self._close_scan()
                 out.append(Event("tool_call", call=self.scall))
+            elif self.ss == "function_done":
+                out.append(Event("content", self._track(CALL_START + self.buf)))
             self.buf = ""
             self._reset_scan()
             return out
@@ -1309,10 +1576,15 @@ class OutputParser:
     def _finish_call(self, body: str) -> list[Event]:
         """A whole call body in the template's form -> its tool_call event.  With recover, one that still does not
         parse is the text it is instead of an error that ends the request."""
-        name = body.strip()[len(FUNC_START):].split(">", 1)[0].strip()
+        raw_name = body.strip()[len(FUNC_START):].split(">", 1)[0]
+        name = raw_name.strip()
+        name = self.aliases.get(name, name)
         bare, self.bare = self.bare, False
         try:
+            if raw_name != raw_name.strip() and name not in self.schemas:
+                raise ValueError("whitespace tool name is not declared")
             call = parse_tool_call(body, self.schemas.get(name))
+            call.name = name
         except ValueError:
             if not self.recover:
                 raise

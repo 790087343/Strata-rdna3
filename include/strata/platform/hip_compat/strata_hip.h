@@ -166,6 +166,7 @@ inline hipError_t cudaFuncSetAttribute(Kernel kernel, hipFuncAttribute attribute
     return hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), attribute, value);
 }
 #define cudaMemcpyToSymbol(sym, src, ...) hipMemcpyToSymbol(HIP_SYMBOL(sym), src, __VA_ARGS__)
+#define cudaMemcpyFromSymbol(dst, sym, ...) hipMemcpyFromSymbol(dst, HIP_SYMBOL(sym), __VA_ARGS__)
 
 // CUDA 12 has a 3-argument cudaGraphInstantiate(exec, graph, flags) and the older 5-argument one; HIP spells
 // the first hipGraphInstantiateWithFlags.  Both are used in the tree.
