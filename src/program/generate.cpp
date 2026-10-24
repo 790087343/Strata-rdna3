@@ -10938,7 +10938,9 @@ int main(int argc, char** argv) {
         //   before it overwrites a slot (adapt_fence).  --adapt-async uploads at each of its steps.
         // STRATA_ADAPT_CHECKRES=1 reads the tables back at each launch and compares them with the host's.
         const bool piped_groups = o.batch > 0 && o.batch_groups > 1 && !stages.empty();
-        const bool serial_windows = !pipe && !piped_groups;
+        // ([claude] tensor parallel decodes serially whatever --pipeline-windows says: its windows take the hook too, on the
+        // pair's driving verifier, so STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT are safe there - both cards plan on the device)
+        const bool serial_windows = (!pipe || tp_on) && !piped_groups;
         const bool tier_lags = !drive.d.usage.empty() && (adapt_nowait() || adapt_lag() > 1);
         drive.d.evict_sync = serial_windows && tier_lags && adapt_evict_sync();
         if (piped_groups && tier_lags && adapt_evict_sync()) {
@@ -11010,16 +11012,19 @@ int main(int argc, char** argv) {
             std::vector<std::unique_ptr<GpuStage>>& stages;
             strata::core::ExpertDispatch& d;
             int32_t* pairs;
+            strata::core::Verifier* tpv0;
             ~PreLaunchOff() {
                 v.set_pre_launch(nullptr);
                 for (auto& st : stages) st->ver.set_pre_launch(nullptr);
+                if (tpv0 != nullptr) tpv0->set_pre_launch(nullptr);
                 d.dres_check = nullptr;
                 if (pairs != nullptr) cudaFreeHost(pairs);
             }
-        } pre_launch_off{ver, stages, drive.d, res_pairs};
+        } pre_launch_off{ver, stages, drive.d, res_pairs, tp_on ? &tpv[0] : nullptr};
         if (drive.d.evict_sync || res_checking) {
             ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(res_checking, e); });
             for (auto& st : stages) st->ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(false, e); });
+            if (tp_on) tpv[0].set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(false, e); });   // [claude] the TP pair's windows
             if (drive.d.evict_sync)
                 std::fprintf(stderr, "strata serve: the adaptive tier's evictions reach the device's table before the next "
                                      "window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)\n");
