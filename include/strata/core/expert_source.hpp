@@ -637,6 +637,11 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// [claude] STRATA_REFILL_DEMAND (generate.cpp): per (layer, expert), the value of `miss_now` when it last missed
+    /// (routed, resident nowhere); empty = off.  The driver bumps `miss_now` a window and refills the rows a long
+    /// prompt lent in the order the windows miss them.
+    std::vector<int32_t> miss_mark;
+    int32_t miss_now = 0;
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies

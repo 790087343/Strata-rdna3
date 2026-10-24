@@ -251,6 +251,12 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// [claude] the prompt's routing counts, per (layer, expert) [n_layers * n_expert], summed over every chunk this
+    /// path read since the last `route_hist_reset` (on: a tiny histogram kernel after each layer's router, one 96 KB
+    /// download a chunk).  generate.cpp refills a long prompt's lent cache slots in this order (STRATA_REFILL_OVERLAP).
+    void route_hist_enable(bool on) { route_hist_on_ = on; }
+    const std::vector<int32_t>& route_hist() const { return route_hist_; }
+    void route_hist_reset() { std::fill(route_hist_.begin(), route_hist_.end(), 0); }
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
@@ -283,6 +289,8 @@ private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
+    bool route_hist_on_ = false;                     ///< route_hist_enable
+    std::vector<int32_t> route_hist_;                ///< route_hist
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

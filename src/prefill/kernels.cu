@@ -3549,6 +3549,17 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
         strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
 }
+__global__ void route_hist_kernel(const int32_t* __restrict__ ids, int64_t n, int32_t* __restrict__ hist, int32_t ne) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int32_t e = ids[i];
+    if (e >= 0 && e < ne) atomicAdd(hist + e, 1);
+}
+void route_hist(const int32_t* ids, int64_t n, int32_t* hist, int64_t n_expert, void* stream) {
+    if (n <= 0) return;
+    route_hist_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(ids, n, hist, (int32_t) n_expert);
+    check("route_hist");
+}
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
     check("blob_dequant");

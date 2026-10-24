@@ -1082,6 +1082,7 @@ struct Prefill::Impl {
     float *ds_w = nullptr, *ds_dm = nullptr;
     uint8_t *ds_gu = nullptr, *ds_keep = nullptr, *ds_help = nullptr;
     size_t ds_flags_n = 0;
+    int32_t* hist_dev = nullptr;           // [claude] Prefill::route_hist: [n_layers * NE] counts, this chunk's
     int64_t ds_th = 0;
     cudaStream_t ds_hs = nullptr;
     bool ds_on = false;                    // this prompt runs the DP share (set by run_dp)
@@ -1180,6 +1181,7 @@ void Prefill::release() {
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
+    if (impl_->hist_dev) { cudaFree(impl_->hist_dev); impl_->hist_dev = nullptr; }   // [claude] route_hist
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -2909,6 +2911,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    if (route_hist_on_ && m.hist_dev == nullptr) {   // [claude] route_hist: the device counts, had once
+        const size_t nh = (size_t) (g.n_layers * NE);
+        if (cudaMalloc((void**) &m.hist_dev, nh * 4) != cudaSuccess || cudaMemset(m.hist_dev, 0, nh * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            m.hist_dev = nullptr;
+            route_hist_on_ = false;
+        }
+    }
     // [claude] DP (run_dp): every layer here, every other chunk; the state of a layer this GPU does not own lives in
     // the foreign session, and the PLE run is the one of the session holding layer 1
     const bool dp = dp_active_;
@@ -4052,6 +4062,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (m.hist_dev != nullptr) strata::prefill::route_hist(m.ids, T * K, m.hist_dev + l * NE, NE, m.cs);   // [claude] route_hist
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -5568,6 +5579,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.experts_dma += iss_dma;
         }
         stats_.tokens += T;
+        if (m.hist_dev != nullptr) {   // [claude] route_hist: this chunk's counts join the prompt's (one small download)
+            const size_t nh = (size_t) (m.g->n_layers * NE);
+            std::vector<int32_t> hh(nh);
+            if (cudaMemcpyAsync(hh.data(), m.hist_dev, nh * 4, cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
+                cudaMemsetAsync(m.hist_dev, 0, nh * 4, m.cs) == cudaSuccess && cudaStreamSynchronize(m.cs) == cudaSuccess) {
+                if (route_hist_.size() != nh) route_hist_.assign(nh, 0);
+                for (size_t i = 0; i < nh; ++i) route_hist_[i] += hh[i];
+            } else (void) cudaGetLastError();
+        }
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {

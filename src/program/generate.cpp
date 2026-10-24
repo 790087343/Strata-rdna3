@@ -31,6 +31,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/sdma_copy.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -176,6 +177,16 @@ int64_t dp_min_tokens() {
 }
 int64_t dp_pipe_chunk() {
     static const int64_t v = [] { const char* e = std::getenv("STRATA_DP_PIPE_CHUNK"); return e ? std::max<int64_t>(512, std::atoll(e)) : (int64_t) 8192; }();
+    return v;
+}
+// [claude] STRATA_REFILL_ORDER=prompt (the default with STRATA_REFILL_OVERLAP) | usage: whether a long prompt's lent
+// slots are refilled in the order of the prompt's own routing counts (Prefill::route_hist) or the tier's usage alone
+bool refill_order_prompt() {
+    static const bool v = [] {
+        const char* w = std::getenv("STRATA_REFILL_OVERLAP");
+        const char* m = std::getenv("STRATA_REFILL_ORDER");
+        return w != nullptr && std::atoi(w) > 0 && (m == nullptr || std::strcmp(m, "usage") != 0);
+    }();
     return v;
 }
 // the DP plan's chunk for a segment of n tokens (Prefill::run_dp: an even number of balanced chunks, multiples of 256)
@@ -4569,6 +4580,15 @@ int main(int argc, char** argv) {
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
     std::vector<std::pair<int32_t, int32_t>> profile_loaded;
     if (!o.expert_profile_save.empty()) profile_loaded = profile;
+    // [claude] the ranking as a rank per (layer, expert) pair (-1: unranked): the late refill's last-resort order
+    std::vector<int32_t> prof_rank;
+    if (!profile.empty()) {
+        prof_rank.assign((size_t) (g.n_layers * g.n_expert), -1);
+        for (size_t r = 0; r < profile.size(); ++r) {
+            const size_t i = (size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second;
+            if (i < prof_rank.size() && prof_rank[i] < 0) prof_rank[i] = (int32_t) r;
+        }
+    }
     // ---- layer split across GPUs: "auto" places the split points by a cost model of one decode window, measured on
     // the 5080 + 3090 rig (bench/results/2026-09-29-layer-split):
     //   - every layer costs its GPU a time inversely proportional to SMs x clock (0.33 ms on an RTX 5080, 0.50 on a
@@ -9174,6 +9194,7 @@ int main(int argc, char** argv) {
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
                 if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
+                if (refill_order_prompt()) st.sp.route_hist_enable(true);   // [claude] the late refill's order
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, res_of_stage(i).data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
@@ -9182,6 +9203,7 @@ int main(int argc, char** argv) {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
+            if (refill_order_prompt()) sp.route_hist_enable(true);   // [claude] the late refill's order
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -10705,9 +10727,102 @@ int main(int argc, char** argv) {
         // Until then those experts run where any miss does.  The adaptive tier waits until every part has joined.
         struct LateRow { int32_t i, slot; };
         struct LateTranche { cudaEvent_t ev = nullptr; int dev = -1; std::vector<int32_t>* tbl = nullptr;
-                             std::vector<LateRow> rows; int64_t due = 0; };
+                             std::vector<LateRow> rows; int64_t due = 0; int64_t pending = 0; cudaStream_t stream = nullptr;
+                             uint64_t id = 0; strata::core::SdmaCopier* sd = nullptr; strata::core::SdmaCopier::Done done;
+                             bool bad = false; };
+        // STRATA_REFILL_SDMA=1: the refill copies go to the card's SDMA engine through HSA (strata/core/sdma_copy.hpp) instead
+        // of hipMemcpyAsync, which ran them as copy kernels beside the decode windows' kernels here (every stage of a window
+        // on that card 3-4x slower while ~14 GB streamed in).  The default stays hipMemcpyAsync.
+        static const bool late_sdma = [] { const char* v = std::getenv("STRATA_REFILL_SDMA"); return v != nullptr && std::atoi(v) != 0; }();
+        auto late_sd_for = [&](int dev) -> strata::core::SdmaCopier* {
+            if (!late_sdma) return nullptr;
+            std::string e2;
+            strata::core::SdmaCopier* c = strata::core::SdmaCopier::for_device(dev < 0 ? 0 : dev, e2);
+            static std::set<int> said;
+            if (said.insert(dev).second)
+                std::fprintf(stderr, c != nullptr ? "strata serve: the late refill on CUDA%d goes to the SDMA engine through HSA (engine %d)\n"
+                                                  : "strata serve: the late refill on CUDA%d stays on hipMemcpyAsync: %s\n",
+                             dev < 0 ? 0 : dev, c != nullptr ? c->engine() : 0, e2.c_str());
+            return c;
+        };
+        // a part's completion counter for n copies (none: its event alone)
+        auto late_arm = [&](LateTranche& t, int64_t n) {
+            t.sd = late_sd_for(t.dev);
+            std::string e2;
+            if (t.sd != nullptr && !t.sd->create(t.done, n, e2)) {
+                std::fprintf(stderr, "strata serve: %s: the part's copies go through hipMemcpyAsync\n", e2.c_str());
+                t.sd = nullptr;
+            }
+        };
+        // one refill copy of a part: SDMA (its counter) or hipMemcpyAsync on its stream
+        auto late_copy = [&](LateTranche& t, uint8_t* dst, const uint8_t* src, size_t nb) -> bool {
+            if (t.sd != nullptr) {
+                std::string e2;
+                if (t.sd->copy(dst, src, nb, t.done, e2)) return true;
+                t.sd->skip(t.done, 1);   // this one goes the other way
+                static bool said = false;
+                if (!said) { said = true; std::fprintf(stderr, "strata serve: an SDMA refill copy failed (%s): hipMemcpyAsync for it\n", e2.c_str()); }
+            }
+            const strata::core::OnDevice on(t.dev);
+            return cudaMemcpyAsync(dst, src, nb, cudaMemcpyHostToDevice, t.stream) == cudaSuccess;
+        };
+        // whether a part's copies are all in (wait: block until they are)
+        auto late_ready = [&](LateTranche& t, bool wait) -> bool {
+            if (t.sd != nullptr) {
+                if (wait) t.sd->wait(t.done);
+                else if (!t.sd->landed(t.done)) return false;
+            }
+            if (t.ev != nullptr) {
+                const strata::core::OnDevice on(t.dev);
+                if (wait) cudaEventSynchronize(t.ev);
+                else if (cudaEventQuery(t.ev) != cudaSuccess) return false;
+            }
+            return true;
+        };
         std::vector<LateTranche> late;
         int64_t late_windows = 0;   // the decode windows run since this request's prompt was read
+        // STRATA_REFILL_PACE=<MiB per decode window> (with STRATA_REFILL_OVERLAP; 0 = every copy at once): the refill
+        // that goes out when the prompt is done is issued a budget a window, so it never fills the cards' links - all
+        // at once, ~12 GB of copies (a 128K prompt under TP) held the link ~1 s and each TP window's exchanges and CPU
+        // rows waited behind them (2-GPU IQ3 128K: 129 -> 98 tok/s over the first 256 tokens).  A part's join window
+        // is fixed by its place in the queue (bytes / budget + W), not by when its copies land (#463).
+        struct LateCopy { uint8_t* dst; const uint8_t* src; size_t nb; uint64_t tranche; int32_t i, slot; };
+        std::deque<LateCopy> late_q;
+        uint64_t late_next_id = 1;   // LateTranche::id: a queued copy names its part by it (parts may join out of order)
+        static const int64_t late_pace = [] { const char* v = std::getenv("STRATA_REFILL_PACE"); return v ? (int64_t) std::max(0, std::atoi(v)) << 20 : (int64_t) 0; }();
+        // STRATA_REFILL_RATE=<MiB/s> (an alternative to STRATA_REFILL_PACE: a budget by the time passed since the last
+        // window's pump, so slow windows do not leave the link idle; ~12000 keeps a PCIe 4.0 x8 link busy while the
+        // copies not yet issued stay on the host, where STRATA_REFILL_DEMAND can reorder them)
+        static const double late_rate = [] { const char* v = std::getenv("STRATA_REFILL_RATE"); return v ? std::max(0.0, std::atof(v)) * 1048576.0 : 0.0; }();
+        // STRATA_REFILL_DEMAND=1 (with STRATA_REFILL_RATE / PACE and STRATA_REFILL_JOIN=landed): the lent rows a decode
+        // window misses (the CPU computed them) go to the front of the queue as a part of their own - the next windows
+        // most likely route to them again
+        static const bool late_demand = [] { const char* v = std::getenv("STRATA_REFILL_DEMAND"); return v != nullptr && std::atoi(v) != 0; }();
+        Clock::time_point late_pump_t = Clock::now();
+        int64_t late_promoted = 0;   // (trace) rows moved to the front so far
+        auto late_close = [&](LateTranche& t) -> bool {   // the part's last copy is out: its event
+            const strata::core::OnDevice on(t.dev);
+            return cudaEventCreateWithFlags(&t.ev, cudaEventDisableTiming) == cudaSuccess && cudaEventRecord(t.ev, t.stream) == cudaSuccess;
+        };
+        // issue up to `budget` bytes of queued copies (budget < 0: all of them)
+        auto late_pump = [&](int64_t budget) {
+            int64_t sent = 0;
+            while (!late_q.empty() && (budget < 0 || sent < budget)) {
+                const LateCopy c = late_q.front();
+                late_q.pop_front();
+                LateTranche* tp = nullptr;
+                for (LateTranche& x : late) if (x.id == c.tranche) { tp = &x; break; }
+                if (tp == nullptr) continue;
+                LateTranche& t = *tp;
+                if (!late_copy(t, c.dst, c.src, c.nb))
+                    std::fprintf(stderr, "strata serve: a paced refill copy failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                sent += (int64_t) c.nb;
+                if (--t.pending == 0 && !late_close(t)) {
+                    t.bad = true;
+                    std::fprintf(stderr, "strata serve: a paced refill event failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                }
+            }
+        };
         // STRATA_REFILL_DEFER=1 (with STRATA_REFILL_OVERLAP): the loans read last go out only once the first token is
         // out - their copies fill that card's link, and the prompt's last windows and the first decode window wait
         // on it (TP: 6 tokens 24 -> 100 ms, the first window 12 -> 78 ms)
@@ -10723,22 +10838,45 @@ int main(int argc, char** argv) {
             std::string e;
             if (!f(e)) std::fprintf(stderr, "strata serve: %s\n", e.c_str());
         };
+        // STRATA_REFILL_JOIN=due (the default: part t joins at its window, waited for - #463's fixed schedule) |
+        // landed (a part joins at the first window from its due one whose start finds its copies in - cudaEventQuery,
+        // never a wait here; which window an expert first runs on the GPU in then depends on the copies' timing)
+        static const bool late_landed = [] { const char* v = std::getenv("STRATA_REFILL_JOIN"); return v != nullptr && std::strcmp(v, "landed") == 0; }();
+        static const bool late_tr = std::getenv("STRATA_TRACE") != nullptr;
         auto late_apply = [&](bool all) {
             if (all) late_launch();
             if (late.empty()) return;
-            size_t k = 0;
-            for (; k < late.size(); ++k) {
+            size_t joined = 0, rows_joined = 0;
+            std::vector<LateTranche> keep;
+            for (size_t k = 0; k < late.size(); ++k) {
                 LateTranche& t = late[k];
-                if (!all && t.due > late_windows) break;
-                {
-                    const strata::core::OnDevice on(t.dev);
-                    cudaEventSynchronize(t.ev);
-                    cudaEventDestroy(t.ev);
+                bool join = all || t.due <= late_windows;
+                if (join && !all && late_landed) join = t.pending == 0 && !t.bad && late_ready(t, false);
+                if (!join) {
+                    if (!late_landed) {   // due: the parts join in issue order; the first not yet due ends the pass
+                        for (; k < late.size(); ++k) keep.push_back(std::move(late[k]));
+                        break;
+                    }
+                    keep.push_back(std::move(t));
+                    continue;
                 }
-                for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
+                while (t.pending > 0 && !late_q.empty()) late_pump((int64_t) late_q.front().nb);   // due before its copies all went: the rest now
+                if (!t.bad) {   // (bad: its event failed; nothing to wait for, the rows stay lent out)
+                    late_ready(t, true);
+                    for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
+                    rows_joined += t.rows.size();
+                }
+                if (t.ev != nullptr) { const strata::core::OnDevice on(t.dev); cudaEventDestroy(t.ev); t.ev = nullptr; }
+                if (t.sd != nullptr) t.sd->destroy(t.done);
+                ++joined;
             }
-            if (k == 0) return;
-            late.erase(late.begin(), late.begin() + (ptrdiff_t) k);
+            late.swap(keep);   // (the parts not joined were moved into `keep`: back, whether any joined or not)
+            if (joined == 0) return;
+            if (late_tr) {
+                std::fprintf(stderr, "strata trace: late join %zu parts %zu rows at window %lld, %zu parts left\n", joined,
+                             rows_joined, (long long) late_windows, late.size());
+                std::fflush(stderr);
+            }
             res_upload();
         };
         // Where the tier does not wait for its copies (STRATA_ADAPT_NOWAIT=1, STRATA_ADAPT_LAG > 1), its evictions reach
@@ -13870,7 +14008,9 @@ int main(int argc, char** argv) {
                     if (st->dev == p.dev) return st->adapt_stream;
                 return nullptr;
             };
-            auto late_issue = [&](PfPart& p, std::string& e) -> bool {
+            // `paced` (STRATA_REFILL_PACE, the refill at the prompt's end): queued for late_pump, a budget a window; the
+            // early refill (STRATA_DP_EARLY_REFILL, beside the other card's read) goes out at once
+            auto late_issue = [&](PfPart& p, std::string& e, bool paced) -> bool {
                 if (p.lent.empty()) return true;
                 const cudaStream_t ls = late_stream_of(p);
                 if (ls == nullptr || p.issued) return refill_one(p, e);
@@ -13878,37 +14018,93 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(p.dev);
                 std::vector<std::pair<int32_t, int32_t>> rows = std::move(p.lent);
                 p.lent.clear();
-                if (drive.d.usage.size() >= (size_t) (g.n_layers * g.n_expert))
+                // the order: the prompt's own routing counts first (STRATA_REFILL_ORDER=prompt, the default: what the
+                // first windows of its answer most likely route to), then the tier's decayed usage, then the profile's rank
+                {
+                    std::vector<int32_t> hist;
+                    if (refill_order_prompt()) {
+                        auto add = [&](const strata::prefill::Prefill& q) {
+                            const std::vector<int32_t>& h = q.route_hist();
+                            if (h.empty()) return;
+                            if (hist.size() != h.size()) hist.assign(h.size(), 0);
+                            for (size_t i = 0; i < h.size(); ++i) hist[i] += h[i];
+                        };
+                        add(sp);
+                        for (auto& st : stages) add(st->sp);
+                    }
+                    const size_t n_pairs = (size_t) (g.n_layers * g.n_expert);
+                    const bool hh = hist.size() >= n_pairs, hu = drive.d.usage.size() >= n_pairs, hr = prof_rank.size() >= n_pairs;
                     std::stable_sort(rows.begin(), rows.end(), [&](const auto& x, const auto& y) {
-                        return drive.d.usage[(size_t) x.first] > drive.d.usage[(size_t) y.first];
+                        const size_t a = (size_t) x.first, b = (size_t) y.first;
+                        if (hh && hist[a] != hist[b]) return hist[a] > hist[b];
+                        if (hu && drive.d.usage[a] != drive.d.usage[b]) return drive.d.usage[a] > drive.d.usage[b];
+                        if (hr && prof_rank[a] != prof_rank[b]) return (uint32_t) prof_rank[a] < (uint32_t) prof_rank[b];
+                        return false;
                     });
-                const size_t per = (rows.size() + (size_t) late_nt - 1) / (size_t) late_nt;
+                    if (trace && hh) {
+                        int64_t routed = 0, in_rows = 0, head = 0;
+                        for (size_t i = 0; i < n_pairs; ++i) routed += hist[i];
+                        for (size_t j = 0; j < rows.size(); ++j) {
+                            in_rows += hist[(size_t) rows[j].first];
+                            if (j < rows.size() / 8) head += hist[(size_t) rows[j].first];
+                        }
+                        std::fprintf(stderr, "strata trace: late refill order: the prompt routed %lld rows, %lld of them to the "
+                                             "%zu lent slots, %lld to the first eighth\n", (long long) routed, (long long) in_rows,
+                                     rows.size(), (long long) head);
+                    }
+                }
+                const bool pace = paced && (late_pace > 0 || late_rate > 0.0);
+                if (pace && late_demand && drive.d.miss_mark.size() != (size_t) (g.n_layers * g.n_expert))
+                    drive.d.miss_mark.assign((size_t) (g.n_layers * g.n_expert), -1);
+                // the queue's bytes ahead of this part (the other card's parts too: one budget a window per card would
+                // let both links fill; the budget is per window, both cards' copies together)
+                int64_t queued = 0;
+                for (const LateCopy& c : late_q) queued += (int64_t) c.nb;
+                // STRATA_REFILL_TRANCHE_SLOTS=<n> (0 = STRATA_REFILL_TRANCHES equal parts): parts of n slots
+                static const int64_t late_ts = [] { const char* v = std::getenv("STRATA_REFILL_TRANCHE_SLOTS"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+                const size_t per = late_ts > 0 ? (size_t) late_ts : (rows.size() + (size_t) late_nt - 1) / (size_t) late_nt;
                 for (size_t t0 = 0, t = 0; t0 < rows.size(); t0 += per, ++t) {
                     LateTranche lt;
                     lt.dev = p.dev;
                     lt.tbl = &tbl_of(p);
-                    lt.due = late_windows + (int64_t) (t + 1) * late_w;
+                    lt.stream = ls;
+                    lt.id = late_next_id++;
+                    const uint64_t tid = lt.id;
+                    late_arm(lt, (int64_t) (std::min(rows.size(), t0 + per) - t0));
                     for (size_t j = t0; j < std::min(rows.size(), t0 + per); ++j) {
                         const auto [i, slot] = rows[j];
                         const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                         const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                         uint8_t* dst = p.cache->device_slot(slot);
-                        if (b == nullptr || dst == nullptr ||
-                            cudaMemcpyAsync(dst, b, (size_t) nb, cudaMemcpyHostToDevice, ls) != cudaSuccess) {
+                        if (b == nullptr || dst == nullptr) {
+                            e = "prefill: a late refill copy has no source or slot";
+                            return false;
+                        }
+                        if (pace) {
+                            late_q.push_back({dst, b, (size_t) nb, tid, i, slot});
+                            queued += nb;
+                            ++lt.pending;
+                        } else if (!late_copy(lt, dst, b, (size_t) nb)) {
                             e = std::string("prefill: a late refill copy failed: ") + cudaGetErrorString(cudaGetLastError());
                             return false;
                         }
                         srcp->note_async_read(b, nullptr);   // #1237
                         lt.rows.push_back({i, slot});
                     }
-                    if (cudaEventCreateWithFlags(&lt.ev, cudaEventDisableTiming) != cudaSuccess ||
-                        cudaEventRecord(lt.ev, ls) != cudaSuccess) {
+                    // paced: the window its last copy goes out in (fixed by the queue's bytes), then W more
+                    // (landed: W windows from now for every part, then as its copies land)
+                    const int64_t per_w = late_pace > 0 ? late_pace : std::max<int64_t>(1, (int64_t) (late_rate * 0.02));   // (rate: ~a 20 ms window's)
+                    lt.due = late_windows + (pace ? (queued + per_w - 1) / per_w : 0) + (late_landed ? late_w : (int64_t) (t + 1) * late_w);
+                    if (lt.pending == 0 && !late_close(lt)) {
                         e = std::string("prefill: a late refill event failed: ") + cudaGetErrorString(cudaGetLastError());
                         return false;
                     }
                     late.push_back(std::move(lt));
                 }
                 p.lent_chunk = 0;
+                // rate: the first stretch goes out now, not at the first window's pump (the prompt's last part and the
+                // first window would leave the link idle)
+                if (pace && late_pace == 0) { late_pump((int64_t) (late_rate * 0.1)); late_pump_t = Clock::now(); }
                 return true;
             };
             const bool late_defer = late_defer_w() > 0;
@@ -13916,13 +14112,13 @@ int main(int argc, char** argv) {
                 if (late_defer) {
                     late_go = [&](std::string& ee) -> bool {
                         for (PfPart& p : pf_parts)
-                            if (!p.lent.empty() && !late_issue(p, ee)) return false;
+                            if (!p.lent.empty() && !late_issue(p, ee, true)) return false;
                         return true;
                     };
                     return true;
                 }
                 for (PfPart& p : pf_parts)
-                    if (!p.lent.empty() && !late_issue(p, e)) return false;
+                    if (!p.lent.empty() && !late_issue(p, e, true)) return false;
                 return true;
             };
             // #340: with several stages every stage's copies go out first (each card on its own link), then each is
@@ -14144,7 +14340,7 @@ int main(int argc, char** argv) {
                     // (not under --batch: slots may decode between the read and the refill's wait)
                     if (early_refill && early != nullptr && o.batch == 0)
                         sp.on_dp_done = [&, early](std::string& ee) {
-                            return late_w > 0 ? late_issue(*early, ee) : refill_issue(*early, ee);
+                            return late_w > 0 ? late_issue(*early, ee, false) : refill_issue(*early, ee);
                         };
                     const bool dp_ok = strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head,
                                                                         b0 - a0 - head, a0 + head, o.prefill_chunk,
@@ -14588,6 +14784,10 @@ int main(int argc, char** argv) {
             apply_pending(true);
             late_apply(true);
             late_windows = 0;   // STRATA_REFILL_OVERLAP: the parts' windows count from this request's first decode window
+            if (refill_order_prompt() && !late_go) {   // the next prompt's routing counts start from zero
+                sp.route_hist_reset();
+                for (auto& st : stages) st->sp.route_hist_reset();
+            }
             const auto drain_t0 = Clock::now();
             const bool drained_ok = adapt_tick(true);
             // 149: how long the request waited for the adaptive round still in flight (in the prompt's time)
@@ -15651,6 +15851,57 @@ int main(int argc, char** argv) {
                 drive.d.failed = false;
                 if (late_defer_w() > 0 && late_windows >= late_defer_w()) late_launch();   // STRATA_REFILL_DEFER=<k>: after k windows
                 late_apply(false);   // STRATA_REFILL_OVERLAP: the parts due by this window join (waited for)
+                if (!late_q.empty()) {   // STRATA_REFILL_PACE / RATE: this window's share of the refill
+                    if (late_demand) {
+                        // the rows the last window missed: to the front, as a part of their own per card (its rows leave
+                        // the parts they were queued in; a part left with nothing queued closes now)
+                        const int32_t mark = drive.d.miss_now;
+                        std::deque<LateCopy> hot;
+                        std::vector<LateTranche> fresh;
+                        for (auto it = late_q.begin(); it != late_q.end();) {
+                            if (drive.d.miss_mark.empty() || drive.d.miss_mark[(size_t) it->i] != mark) { ++it; continue; }
+                            LateTranche* old = nullptr;
+                            for (LateTranche& x : late) if (x.id == it->tranche) { old = &x; break; }
+                            if (old == nullptr) { ++it; continue; }
+                            LateTranche* nt = nullptr;
+                            for (LateTranche& x : fresh) if (x.dev == old->dev && x.tbl == old->tbl) { nt = &x; break; }
+                            if (nt == nullptr) {
+                                LateTranche lt;
+                                lt.dev = old->dev; lt.tbl = old->tbl; lt.stream = old->stream; lt.id = late_next_id++;
+                                lt.due = late_windows + late_w;
+                                fresh.push_back(std::move(lt));
+                                nt = &fresh.back();
+                            }
+                            for (size_t r = 0; r < old->rows.size(); ++r)
+                                if (old->rows[r].i == it->i) { old->rows.erase(old->rows.begin() + (ptrdiff_t) r); break; }
+                            --old->pending;
+                            if (old->sd != nullptr) old->sd->skip(old->done, 1);   // the moved row's copy counts for the new part
+                            if (old->pending == 0 && old->ev == nullptr && !late_close(*old))
+                                std::fprintf(stderr, "strata serve: a refill part's event failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                            LateCopy c = *it;
+                            c.tranche = nt->id;
+                            ++nt->pending;
+                            nt->rows.push_back({c.i, c.slot});
+                            hot.push_back(c);
+                            it = late_q.erase(it);
+                        }
+                        if (!hot.empty()) {
+                            late_promoted += (int64_t) hot.size();
+                            for (LateTranche& x : fresh) { late_arm(x, x.pending); late.push_back(std::move(x)); }
+                            late_q.insert(late_q.begin(), hot.begin(), hot.end());
+                            if (late_tr) {
+                                std::fprintf(stderr, "strata trace: late demand %zu rows to the front at window %lld (%lld so far, %zu queued)\n",
+                                             hot.size(), (long long) late_windows, (long long) late_promoted, late_q.size());
+                                std::fflush(stderr);
+                            }
+                        }
+                    }
+                    ++drive.d.miss_now;
+                    const auto now = Clock::now();
+                    const double dt = std::chrono::duration<double>(now - late_pump_t).count();
+                    late_pump_t = now;
+                    late_pump(late_pace > 0 ? late_pace : (int64_t) (late_rate * std::min(dt, 0.25)));
+                }
                 ++late_windows;
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing

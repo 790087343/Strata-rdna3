@@ -4857,7 +4857,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
                     !(d.tp_other_res != nullptr && d.tp_other_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) &&
-                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
+                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) {
+                    ++nmiss;
+                    if (!d.miss_mark.empty()) d.miss_mark[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] = d.miss_now;   // [claude]
+                }
             }
         }
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
