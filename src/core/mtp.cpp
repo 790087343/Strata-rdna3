@@ -218,6 +218,11 @@ float mtp_half_to_float(uint16_t h) {
 bool MtpDrafter::make_hc_r8(std::string& err) {
     static const bool want = [] { const char* v = std::getenv("STRATA_MTP_GR_R8"); return v != nullptr && v[0] == '1'; }();
     if (!want || hc_r8_[0] != nullptr) return true;
+    if (!hc_r8_allowed_) {
+        std::fprintf(stderr, "strata mtp: STRATA_MTP_GR_R8=1 is off: a draft chain may run beside a verify window on this card "
+                             "(--pipeline-windows), and two grid-barrier kernels on one card deadlock\n");
+        return true;
+    }
     if (!strata::kernels::rdna_gr_enabled()) {
         std::fprintf(stderr, "strata mtp: STRATA_MTP_GR_R8=1 needs STRATA_GR_RDNA=1: the BF16 hyper-connection read stays\n");
         return true;

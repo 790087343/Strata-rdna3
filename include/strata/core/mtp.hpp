@@ -222,7 +222,14 @@ private:
     /// verifier's STRATA_GR_RDNA_Q8 form, rdna_gr.cu), so each read is one rdna_gr_fused launch instead of down + up.
     /// [0,1] the attention read, [2,3] the MLP read, [4,5] the final mixer; null: the BF16 read
     void* hc_r8_[6] = {};
+    bool hc_r8_allowed_ = true;
     bool make_hc_r8(std::string& err);
+public:
+    /// [claude] STRATA_MTP_GR_R8's single-kernel read spins at a grid barrier: where a draft chain can run beside a verify
+    /// window on the same card (--pipeline-windows' loop) the two grid-barrier kernels deadlock each other, so that loop
+    /// refuses it (measured: 2-GPU Q4 hung at layer 24).  Call before bind.
+    void set_hc_r8_allowed(bool on) { hc_r8_allowed_ = on; }
+private:
     std::vector<std::pair<std::string, uint64_t>> q4_off_;
     int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)
     std::string dvocab_path_;
