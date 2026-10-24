@@ -549,6 +549,8 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, tpl_.flag_h, h_ple_flag_, hflag_in_h_})   // the TP exchange and PLE flags, an overlapped split's hand-off wait
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    if (tpl_.flag_h == nullptr && tpl_.flag_dev >= 0)   // [claude] STRATA_TP_INBOX=vram: the word is in VRAM - written through its own stream, not waited for
+        tp_flag_store(nullptr, tpl_.flag, tpl_.flag_dev, UINT32_MAX, tp_flag_cs_);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     const OnDevice on_device(device_);
@@ -671,6 +673,7 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (tp_flag_cs_) { const OnDevice on(tpl_.flag_dev); cudaStreamDestroy(tp_flag_cs_); }
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
@@ -1266,7 +1269,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (mode != 2) tp_pub += (uint32_t) tp_exchange_blocks(n);   // the blocks this card's sends have published
         const int par = (int) (tp_k & 1u);
         tp_exchange(buf, tpl_.peer_inbox[par], tpl_.inbox[par], tpl_.peer_flag, tpl_.flag, tp_epoch_d_, tp_k, tp_pub,
-                    tp_cnt_, n, tpl_.rank, mode, cs);
+                    tp_cnt_, n, tpl_.rank, mode, cs, tpl_.flag_h == nullptr && tpl_.flag_dev >= 0);
     };
     // the ring a layer's group rings on the host: counted from this card's first OWNED layer under TP
     auto ringof = [&](int64_t l, int grp) { return (uint32_t) ((l - (tp_ ? tp_lb_ : lb_)) * G + grp + 1); };
@@ -3849,6 +3852,7 @@ bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn po
     if (tp_epoch_ > 0xF0000000u) {
         for (Verifier* x : v) {
             if (x->tpl_.flag_h != nullptr) *(volatile uint32_t*) x->tpl_.flag_h = 0;
+            else if (x->tpl_.flag_dev >= 0) tp_flag_store(nullptr, x->tpl_.flag, x->tpl_.flag_dev, 0, nullptr);   // (the VRAM word, synchronous)
             *(volatile uint32_t*) x->h_ple_flag_ = 0;
         }
         tp_epoch_ = 0;

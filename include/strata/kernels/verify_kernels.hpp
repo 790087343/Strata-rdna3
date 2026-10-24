@@ -227,7 +227,7 @@ void tp_window_begin(uint32_t* epoch_d, unsigned* cnt, const uint32_t* epoch_h, 
 int tp_exchange_blocks(int64_t n);
 void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t* peer_flag, const uint32_t* my_flag,
                  const uint32_t* epoch_d, uint32_t k, uint32_t pub, unsigned* cnt, int64_t n, int rank, int mode,
-                 void* stream);
+                 void* stream, bool vram = false);
 /// Spin until *flag >= *epoch_d + k (a mapped host flag the host raises: the TP PLE rows, gathered once for both cards).
 void tp_wait_epoch(const uint32_t* flag, const uint32_t* epoch_d, uint32_t k, void* stream);
 

@@ -1828,7 +1828,10 @@ constexpr int kTpThreads = 256;
 // publish does); the inbox is read with volatile loads (as copy_from_mapped does: fine-grained host memory is not
 // cached, and the volatile keeps the compiler from hoisting them over the wait).  The flag store is volatile and fenced
 // on both sides (#697: on RDNA a plain store can sit in L2 until the stream syncs).
-template <int MODE>
+// [claude] VRAM (STRATA_TP_INBOX=vram): the flag word is in the receiving card's VRAM (uncached) and the inbox fine-grained
+// VRAM there, written by the peer over PCIe: the flag is raised with a system-scope release store and polled with
+// system-scope acquire loads (p2p_pingpong's recipe); the data path is the same.
+template <int MODE, bool VRAM>
 __global__ void __launch_bounds__(kTpThreads) tp_exchange_kernel(float4* __restrict__ mine, float4* peer_inbox,
                                                                    const volatile float4* my_inbox,
                                                                    volatile uint32_t* peer_flag,
@@ -1845,6 +1848,10 @@ __global__ void __launch_bounds__(kTpThreads) tp_exchange_kernel(float4* __restr
             const unsigned done = atomicAdd(cnt, 1u) + 1u;
             if (done == pub) {   // the last block of this exchange to have stored (pub: the card's sends' blocks so far, this one's included)
                 __threadfence_system();
+#if defined(__HIP_PLATFORM_AMD__)
+                if (VRAM) __hip_atomic_store((uint32_t*) peer_flag, want, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                else
+#endif
                 *peer_flag = want;
                 __threadfence_system();
             }
@@ -1852,6 +1859,10 @@ __global__ void __launch_bounds__(kTpThreads) tp_exchange_kernel(float4* __restr
     }
     if (MODE != 0 && MODE != 2) return;
     if (threadIdx.x == 0) {
+#if defined(__HIP_PLATFORM_AMD__)
+        if (VRAM) { while (__hip_atomic_load((const uint32_t*) my_flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < want) strata_spin_pause(); }
+        else
+#endif
         while (*my_flag < want) strata_spin_pause();
         __threadfence_system();
     }
@@ -1888,7 +1899,7 @@ int tp_exchange_blocks(int64_t n) {
 
 void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t* peer_flag, const uint32_t* my_flag,
                  const uint32_t* epoch_d, uint32_t k, uint32_t pub, unsigned* cnt, int64_t n, int rank, int mode,
-                 void* stream) {
+                 void* stream, bool vram) {
     if (mine == nullptr || epoch_d == nullptr || cnt == nullptr || n <= 0 || (n & 3) != 0 || ((uintptr_t) mine & 15) != 0 ||
         (mode != 2 && (peer_inbox == nullptr || peer_flag == nullptr)) || (mode != 1 && (my_inbox == nullptr || my_flag == nullptr))) {
         std::fprintf(stderr, "tp_exchange: invalid arguments\n");
@@ -1903,9 +1914,15 @@ void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t
     const volatile float4* i4 = (const volatile float4*) my_inbox;
     volatile uint32_t* pf = (volatile uint32_t*) peer_flag;
     const volatile uint32_t* mf = (const volatile uint32_t*) my_flag;
-    if (mode == 0) tp_exchange_kernel<0><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
-    else if (mode == 1) tp_exchange_kernel<1><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
-    else tp_exchange_kernel<2><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
+    if (vram) {
+        if (mode == 0) tp_exchange_kernel<0, true><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
+        else if (mode == 1) tp_exchange_kernel<1, true><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
+        else tp_exchange_kernel<2, true><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
+    } else {
+        if (mode == 0) tp_exchange_kernel<0, false><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
+        else if (mode == 1) tp_exchange_kernel<1, false><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
+        else tp_exchange_kernel<2, false><<<grid, block, 0, cs>>>(m4, p4, i4, pf, mf, epoch_d, k, pub, cnt, rank, n4);
+    }
     check("tp_exchange");
 }
 

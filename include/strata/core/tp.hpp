@@ -45,6 +45,13 @@ struct TpPages {
     uint32_t* flag_h[2] = {};
     uint32_t* flag_d[2][2] = {};      ///< [card][as seen from device index 0/1]
     int64_t floats = 0;
+    /// [claude] STRATA_TP_INBOX=vram (HIP): each card's inboxes and flag are in ITS OWN VRAM (UNCACHED inboxes, an
+    /// uncached flag - a fine-grained inbox reads stale L2 lines on gfx1100, lv-p2p/p2p_modes.cpp; the peer writes them over PCIe
+    /// with peer access), so the receiving kernel reads local memory and polls
+    /// a local word instead of pinned host memory over PCIe.  inbox_h / flag_h are then null (the host writes the flag with
+    /// tp_flag_store), inbox_d[c][p][*] and flag_d[c][*] are card c's device addresses, valid from both devices.
+    bool vram = false;
+    void* vram_owned[2][3] = {};
     ~TpPages();
     TpPages() = default;
     TpPages(const TpPages&) = delete;
@@ -53,6 +60,9 @@ struct TpPages {
     /// only (no GPU-to-GPU peer access).
     bool alloc(int dev0, int dev1, int64_t floats, std::string& err);
 };
+/// [claude] a host store of a TP flag word: a volatile store when the flag is pinned host memory (`flag_h`), else (the VRAM
+/// pages) a memset of the device word on `dev` through `stream` (null: a synchronous one).  False when the device write failed.
+bool tp_flag_store(uint32_t* flag_h, uint32_t* flag_d, int dev, uint32_t value, void* stream);
 
 /// Card `rank`'s weights for the TP window: `full` (a table on this device that holds EVERY layer's small tensors - the
 /// hyper-connections, norms, routers, indexers, the GDN a/b/conv rows, as the untrimmed pack arena does) copied, with

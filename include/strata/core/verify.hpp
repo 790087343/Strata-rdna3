@@ -268,6 +268,7 @@ public:
         uint32_t* flag = nullptr;    ///< this card's flag: the peer raises it when its partial is in my inbox
         uint32_t* flag_h = nullptr;  ///< ... its host address (the watchdog releases it)
         uint32_t* peer_flag = nullptr;
+        int flag_dev = -1;           ///< [claude] STRATA_TP_INBOX=vram: `flag` is a word in this device's VRAM (flag_h null)
     };
     /// `mode` 1: the routed experts of layers [own_lb, own_le) are this card's (M1); 2 (by id, M2): every layer's
     /// experts are split between the two cards' caches - rank 0 rings the host for every layer (the CPU rows, the
@@ -418,6 +419,7 @@ private:
     uint32_t* h_tp_epoch_ = nullptr; uint32_t* m_tp_epoch_ = nullptr;   // mapped: the host's epoch word
     uint32_t* tp_epoch_d_ = nullptr;             ///< device: the graph's copy of it (tp_window_begin)
     unsigned* tp_cnt_ = nullptr;                 ///< device: the publishing blocks' counter
+    cudaStream_t tp_flag_cs_ = nullptr;          ///< [claude] STRATA_TP_INBOX=vram: the host's writes of the VRAM flag word
     uint32_t* h_ple_flag_ = nullptr; uint32_t* m_ple_flag_ = nullptr;   // the PLE rows are in h_ple_ (raised to epoch + 1)
     bool tp_own(int64_t l) const { return !tp_ || tp_gpu_only_ || (l >= tp_lb_ && l < tp_le_); }
     bool run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);

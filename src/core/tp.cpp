@@ -92,7 +92,28 @@ TpPages::~TpPages() {
     for (int c = 0; c < 2; ++c) {
         for (int p = 0; p < 2; ++p) if (inbox_h[c][p]) cudaFreeHost(inbox_h[c][p]);
         if (flag_h[c]) cudaFreeHost(flag_h[c]);
+        for (int i = 0; i < 3; ++i)
+            if (vram_owned[c][i] != nullptr) {
+                const OnDevice on(dev[c]);
+                cudaFree(vram_owned[c][i]);
+            }
     }
+}
+
+bool tp_flag_store(uint32_t* flag_h, uint32_t* flag_d, int dev, uint32_t value, void* stream) {
+    if (flag_h != nullptr) {
+        *(volatile uint32_t*) flag_h = value;
+        return true;
+    }
+    if (flag_d == nullptr || dev < 0) return false;
+#if defined(STRATA_USE_HIP)
+    const OnDevice on(dev);
+    if (stream != nullptr) return hipMemsetD32Async((hipDeviceptr_t) flag_d, value, 1, (hipStream_t) stream) == hipSuccess;
+    return hipMemsetD32((hipDeviceptr_t) flag_d, value, 1) == hipSuccess;
+#else
+    (void) value; (void) stream;
+    return false;
+#endif
 }
 
 bool TpPages::alloc(int dev0, int dev1, int64_t n, std::string& err) {
@@ -100,6 +121,57 @@ bool TpPages::alloc(int dev0, int dev1, int64_t n, std::string& err) {
     dev[1] = dev1;
     floats = n;
     const size_t bytes = (size_t) n * sizeof(float);
+#if defined(STRATA_USE_HIP)
+    // [claude] STRATA_TP_INBOX=vram: the pages in the receiving card's VRAM (see tp.hpp).  Needs peer access both ways;
+    // any failure falls back to the pinned pages below with a note.
+    static const bool want_vram = [] { const char* v = std::getenv("STRATA_TP_INBOX"); return v != nullptr && std::strcmp(v, "vram") == 0; }();
+    if (want_vram) {
+        bool ok = true;
+        int can01 = 0, can10 = 0;
+        cudaDeviceCanAccessPeer(&can01, dev0, dev1);
+        cudaDeviceCanAccessPeer(&can10, dev1, dev0);
+        ok = can01 && can10;
+        for (int c = 0; ok && c < 2; ++c) {
+            const OnDevice on(dev[c]);
+            const cudaError_t e = cudaDeviceEnablePeerAccess(dev[1 - c], 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) ok = false;
+            (void) cudaGetLastError();
+        }
+        for (int c = 0; ok && c < 2; ++c) {
+            const OnDevice on(dev[c]);
+            for (int p = 0; ok && p < 2; ++p) {
+                void* q = nullptr;
+                if (hipExtMallocWithFlags(&q, bytes, hipDeviceMallocUncached) != hipSuccess || hipMemset(q, 0, bytes) != hipSuccess) { ok = false; break; }
+                vram_owned[c][p] = q;
+                for (int d = 0; d < 2; ++d) inbox_d[c][p][d] = (float*) q;
+            }
+            void* f = nullptr;
+            if (ok && (hipExtMallocWithFlags(&f, 256, hipDeviceMallocUncached) != hipSuccess || hipMemset(f, 0, 256) != hipSuccess)) ok = false;
+            if (ok) {
+                vram_owned[c][2] = f;
+                for (int d = 0; d < 2; ++d) flag_d[c][d] = (uint32_t*) f;
+            }
+            if (ok && hipDeviceSynchronize() != hipSuccess) ok = false;
+        }
+        if (ok) {
+            vram = true;
+            std::fprintf(stderr, "strata generate: tensor parallel: the exchange pages are in each card's VRAM (STRATA_TP_INBOX=vram)\n");
+            return true;
+        }
+        (void) cudaGetLastError();
+        for (int c = 0; c < 2; ++c)
+            for (int i = 0; i < 3; ++i)
+                if (vram_owned[c][i] != nullptr) {
+                    const OnDevice on(dev[c]);
+                    cudaFree(vram_owned[c][i]);
+                    vram_owned[c][i] = nullptr;
+                }
+        std::memset(inbox_d, 0, sizeof(inbox_d));
+        std::memset(flag_d, 0, sizeof(flag_d));
+        std::fprintf(stderr, "strata generate: tensor parallel: STRATA_TP_INBOX=vram needs peer access between the two cards and "
+                             "fine-grained VRAM; the pinned pages are used\n");
+    }
+#endif
     for (int c = 0; c < 2; ++c) {
         for (int p = 0; p < 2; ++p) {
             if (!pinned_coherent((void**) &inbox_h[c][p], bytes)) { err = "tp: the exchange inbox allocation failed"; return false; }

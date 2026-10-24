@@ -9673,6 +9673,7 @@ int main(int argc, char** argv) {
                 }
                 link.flag = tp_pages.flag_d[r][r];
                 link.flag_h = tp_pages.flag_h[r];
+                link.flag_dev = tp_pages.vram ? tp_dev[r] : -1;
                 link.peer_flag = tp_pages.flag_d[1 - r][r];
                 const int64_t own_lb = tp2 ? 0 : (r == 0 ? 0 : split_at[0]);
                 const int64_t own_le = tp2 ? (r == 0 ? g.n_layers : 0) : (r == 0 ? split_at[0] : g.n_layers);
