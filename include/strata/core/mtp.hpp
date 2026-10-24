@@ -218,6 +218,11 @@ private:
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
+    /// [claude] STRATA_MTP_GR_R8=1: int8 + fp16-scale images of the three hyper-connections' down / up projections (the
+    /// verifier's STRATA_GR_RDNA_Q8 form, rdna_gr.cu), so each read is one rdna_gr_fused launch instead of down + up.
+    /// [0,1] the attention read, [2,3] the MLP read, [4,5] the final mixer; null: the BF16 read
+    void* hc_r8_[6] = {};
+    bool make_hc_r8(std::string& err);
     std::vector<std::pair<std::string, uint64_t>> q4_off_;
     int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)
     std::string dvocab_path_;
@@ -294,6 +299,7 @@ private:
     /// and with --pipeline-windows a chain and that stage's window can run on the card at once)
     strata::kernels::GrWorkspace own_gr_;
     uint8_t* xq_ = nullptr;
+    unsigned* qcnt_ = nullptr;   ///< [claude] STRATA_MTP_QFUSE: the hyper-connection reads' q8_1 counters (n_embd / 32 words, zero between reads)
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *y_ = nullptr, *sample_ = nullptr;
