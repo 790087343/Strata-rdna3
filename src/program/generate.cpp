@@ -10615,6 +10615,46 @@ int main(int argc, char** argv) {
         bool aflipped = false;   // the pending swaps are in the tables and their copies may still be landing
         bool aov = false;
         int64_t aov_flips = 0;
+        // [claude] STRATA_ADAPT_SDMA=1: the adaptive tier's swap copies go to the card's SDMA engine through HSA
+        // (strata/core/sdma_copy.hpp) instead of hipMemcpyAsync (see STRATA_REFILL_SDMA: out of the registered arena those
+        // ran as copy kernels beside the window's).  One part per (card, layer) a round; under STRATA_ADAPT_OVERLAP a
+        // part's landing handler opens the gate for its layer (the stream-ordered ticks cannot see HSA copies).
+        static const bool adapt_sdma = [] { const char* v = std::getenv("STRATA_ADAPT_SDMA"); return v != nullptr && std::atoi(v) != 0; }();
+        struct AdaptSd {
+            struct Part { strata::core::SdmaCopier* sd = nullptr; strata::core::SdmaCopier::Done done; int dev = -1; int32_t layer = -1; int64_t n = 0; AdaptSd* owner = nullptr; };
+            std::vector<Part> parts;          // this round's (reserved before any handler is registered: stable addresses)
+            std::mutex mu;
+            std::vector<int32_t> layer_left;  // per layer: parts not landed yet
+            std::vector<int32_t> layers;      // the round's layers with swaps, ascending
+            strata::core::AdaptGate* gate = nullptr;
+            bool gating = false;              // aov this round: the handlers move gate->landed
+            int32_t n_layers = 0;
+            std::atomic<int> fired{0};        // handlers run this round (a part is cleared only once its handler ran)
+            int armed = 0;                    // parts with a handler
+            static void landed_cb(void* p) {
+                Part* part = static_cast<Part*>(p);
+                AdaptSd& a = *part->owner;
+                struct Fire { std::atomic<int>& f; ~Fire() { f.fetch_add(1, std::memory_order_release); } } fire{a.fired};
+                std::lock_guard<std::mutex> lk(a.mu);
+                if (part->layer >= 0 && part->layer < (int32_t) a.layer_left.size()) --a.layer_left[(size_t) part->layer];
+                if (!a.gating || a.gate == nullptr) return;
+                int32_t v = a.n_layers;   // the highest layer whose swap copies (and every earlier layer's) have landed
+                for (int32_t l : a.layers) if (a.layer_left[(size_t) l] > 0) { v = l - 1; break; }
+                int32_t cur = a.gate->landed.load(std::memory_order_relaxed);
+                while (cur < v && !a.gate->landed.compare_exchange_weak(cur, v, std::memory_order_release)) {}
+            }
+            bool all_landed() const {
+                for (const Part& p : parts) if (p.sd != nullptr && !p.sd->landed(p.done)) return false;
+                return fired.load(std::memory_order_acquire) >= armed;
+            }
+            void wait_all() {
+                for (Part& p : parts) if (p.sd != nullptr) p.sd->wait(p.done);
+                while (fired.load(std::memory_order_acquire) < armed) std::this_thread::yield();
+            }
+            void clear() { for (Part& p : parts) if (p.sd != nullptr) p.sd->destroy(p.done); parts.clear(); armed = 0; fired.store(0); }
+        } asd;
+        asd.gate = &agate;
+        asd.n_layers = (int32_t) g.n_layers;
         // #2010: the overlap is opt-in on every backend now, so the off state is the default and has to be visible too.
         // The predicates are side-effect free, so they are read in both states: they name why it could not run.
         const bool aov_want = adapt_overlap();
@@ -10697,6 +10737,11 @@ int main(int argc, char** argv) {
                     if (wait) cudaEventSynchronize(st->adapt_ev);
                     else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
                 }
+            if (!asd.parts.empty()) {   // STRATA_ADAPT_SDMA: the round's HSA copies
+                if (wait) asd.wait_all();
+                else if (!asd.all_landed()) return;
+                asd.clear();
+            }
             for (auto& st : stages) st->adapt_live = false;
             unpin_blobs(pin_live);
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
@@ -11059,6 +11104,57 @@ int main(int argc, char** argv) {
                 adapt_fence();
             }
             bool main_live = false;
+            // STRATA_ADAPT_SDMA: this round's parts, one per (card, layer), before any copy (stable addresses for the handlers)
+            bool sd_round = false;
+            if (adapt_sdma && !swaps.empty()) {
+                std::lock_guard<std::mutex> lk(asd.mu);
+                asd.clear();
+                asd.parts.reserve(swaps.size());
+                if (asd.layer_left.size() != (size_t) g.n_layers) asd.layer_left.assign((size_t) g.n_layers, 0);
+                std::fill(asd.layer_left.begin(), asd.layer_left.end(), 0);
+                asd.layers.clear();
+                asd.gating = aov;
+                for (const Swap& s : swaps) {
+                    GpuStage* gs = stage_of_swap(s);
+                    const int dev = gs ? gs->dev : 0;
+                    AdaptSd::Part* part = nullptr;
+                    for (AdaptSd::Part& p : asd.parts) if (p.dev == dev && p.layer == s.layer) { part = &p; break; }
+                    if (part == nullptr) {
+                        std::string e2;
+                        strata::core::SdmaCopier* sd = strata::core::SdmaCopier::for_device(dev, e2);
+                        static std::set<int> said;
+                        if (said.insert(dev).second)
+                            std::fprintf(stderr, sd != nullptr ? "strata serve: the adaptive tier's copies on CUDA%d go to the SDMA engine through HSA (engine %d)\n"
+                                                               : "strata serve: the adaptive tier's copies on CUDA%d stay on hipMemcpyAsync: %s\n",
+                                         dev, sd != nullptr ? sd->engine() : 0, e2.c_str());
+                        asd.parts.push_back({sd, {}, dev, s.layer, 0, &asd});
+                        part = &asd.parts.back();
+                        if (asd.layers.empty() || asd.layers.back() != s.layer) asd.layers.push_back(s.layer);
+                        ++asd.layer_left[(size_t) s.layer];
+                    }
+                    ++part->n;
+                }
+                std::sort(asd.layers.begin(), asd.layers.end());
+                for (AdaptSd::Part& p : asd.parts) {
+                    std::string e2;
+                    if (p.sd != nullptr && !p.sd->create(p.done, p.n, e2)) p.sd = nullptr;
+                    if (p.sd != nullptr && !p.sd->on_landed(p.done, &AdaptSd::landed_cb, &p)) {   // no handler: no gate from it
+                        p.sd->destroy(p.done);
+                        p.sd = nullptr;
+                    }
+                    if (p.sd != nullptr) ++asd.armed;
+                }
+                // a part without a copier: its layer's copies go the old way, and (aov) its tick too - the layer counts as landed for the gate
+                for (AdaptSd::Part& p : asd.parts) if (p.sd == nullptr) --asd.layer_left[(size_t) p.layer];
+                sd_round = true;
+            }
+            auto sd_part_of = [&](const Swap& s) -> AdaptSd::Part* {
+                if (!sd_round) return nullptr;
+                GpuStage* gs = stage_of_swap(s);
+                const int dev = gs ? gs->dev : 0;
+                for (AdaptSd::Part& p : asd.parts) if (p.dev == dev && p.layer == s.layer) return p.sd != nullptr ? &p : nullptr;
+                return nullptr;
+            };
             // STRATA_DMA_BATCH (F12): the main device's copies as one cudaMemcpyBatchAsync (mode 0: one each)
             const int dma_mode = multi_gpu ? 0 : strata::core::dma_batch_mode();
             std::vector<void*> cp_dst;
@@ -11090,10 +11186,22 @@ int main(int argc, char** argv) {
                     pending_card.push_back(s.card);
                     continue;
                 }
+                AdaptSd::Part* sdp = slot >= 0 && b != nullptr ? sd_part_of(s) : nullptr;
+                bool sd_ok = false;
+                if (sdp != nullptr) {
+                    std::string e2;
+                    sd_ok = sdp->sd->copy(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                                          (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), sdp->done, e2);
+                    if (!sd_ok) {
+                        sdp->sd->skip(sdp->done, 1);
+                        static bool said = false;
+                        if (!said) { said = true; std::fprintf(stderr, "strata serve: an SDMA swap copy failed (%s): hipMemcpyAsync for it\n", e2.c_str()); }
+                    }
+                }
                 if (slot < 0 || b == nullptr ||
-                    adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                    (!sd_ok && adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                   gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
+                                   gs ? gs->adapt_stream : adapt_stream) != cudaSuccess)) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
                     return false;
@@ -11104,6 +11212,7 @@ int main(int argc, char** argv) {
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
                 pending_card.push_back(s.card);
+                if (aov && sdp != nullptr) continue;   // the layer's handler tells the gate
                 if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
                     (agate.hland != nullptr
                          ? cudaMemcpyAsync((void*) agate.hland, agate.dvals + s.layer, 4, cudaMemcpyDeviceToHost, adapt_stream)

@@ -113,6 +113,23 @@ void SdmaCopier::wait(const Done& d) const {
     if (d.handle == 0) return;
     while (hsa_signal_wait_scacquire(sig_of(d), HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_BLOCKED) > 0) {}
 }
+namespace {
+struct Landed { void (*fn)(void*); void* arg; };
+bool landed_handler(hsa_signal_value_t, void* p) {
+    std::unique_ptr<Landed> l(static_cast<Landed*>(p));
+    l->fn(l->arg);
+    return false;   // once
+}
+}  // namespace
+bool SdmaCopier::on_landed(Done& d, void (*fn)(void*), void* arg) {
+    if (d.handle == 0) return false;
+    auto* l = new Landed{fn, arg};
+    if (hsa_amd_signal_async_handler(sig_of(d), HSA_SIGNAL_CONDITION_LT, 1, landed_handler, l) != HSA_STATUS_SUCCESS) {
+        delete l;
+        return false;
+    }
+    return true;
+}
 #else
 SdmaCopier* SdmaCopier::for_device(int, std::string& err) { err = "not a HIP build"; return nullptr; }
 bool SdmaCopier::create(Done&, int64_t, std::string& err) { err = "not a HIP build"; return false; }
@@ -121,6 +138,7 @@ void SdmaCopier::skip(Done&, int64_t) {}
 bool SdmaCopier::copy(void*, const void*, size_t, Done&, std::string& err) { err = "not a HIP build"; return false; }
 bool SdmaCopier::landed(const Done&) const { return true; }
 void SdmaCopier::wait(const Done&) const {}
+bool SdmaCopier::on_landed(Done&, void (*)(void*), void*) { return false; }
 #endif
 
 }  // namespace strata::core

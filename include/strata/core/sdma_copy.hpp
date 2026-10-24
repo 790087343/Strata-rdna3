@@ -30,6 +30,9 @@ public:
     bool copy(void* dst_dev, const void* src_host, size_t bytes, Done& d, std::string& err);
     bool landed(const Done& d) const;
     void wait(const Done& d) const;
+    /// `fn(arg)` once `d` lands (the runtime's async thread; at most once per call; the Done must stay alive until then).
+    /// false: not registered (the caller polls `landed` instead).
+    bool on_landed(Done& d, void (*fn)(void*), void* arg);
 
     /// the engine the copies are asked for (STRATA_REFILL_SDMA_ENGINE=<n>; -1: the runtime's choice)
     int engine() const { return engine_; }
