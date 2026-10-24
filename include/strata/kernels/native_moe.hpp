@@ -41,4 +41,10 @@ void native_moe_combine_multi_cpu(const float* cpu, const float* hit, const int3
 void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,
                                          const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
                                          void* stream);
+/// TENSOR PARALLEL by id (STRATA_TP_NOMEMSET=1): the combine of a card whose experts wrote only the rows dst[0, *count)
+/// (entry index = token * k + expert) of `parts`; every other row is read as 0.0f.  Bitwise what the memset of `parts`
+/// to zero followed by native_moe_combine_multi (shared_gate null) / native_moe_combine_multi_hits_gated computed.
+void native_moe_combine_multi_rows(const float* parts, const int32_t* dst, const int32_t* count, const float* weights,
+                                   const float* shared, const float* shared_gate, float* output, int64_t n_embd, int64_t k,
+                                   int n_tok, void* stream);
 }

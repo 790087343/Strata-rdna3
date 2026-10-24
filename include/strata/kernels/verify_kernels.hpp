@@ -118,6 +118,9 @@ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip,
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream);
+/// [claude] a check (STRATA_TP_NOMEMSET=2): the 32-bit words where a and b differ are counted into counter[0] (device or mapped
+/// memory; counter[1] counts the launches)
+void count_mismatch_f32(const float* a, const float* b, long long n, unsigned* counter, void* stream);
 /// copy_from_mapped, or zeros when *skip == value (n a multiple of 4, 16-byte aligned).
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream);

@@ -195,6 +195,81 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
     sum.w += sh.w;
     output4[c4] = sum;
 }
+// TENSOR PARALLEL by id (STRATA_TP_NOMEMSET=1, verify.cpp post()): this card's experts wrote their rows of `parts` - the
+// entries listed in dst[0, *count) (entry index = token * k + expert) - and the other card's rows were never written
+// this layer.  Bitwise what the memset of `parts` to zero followed by combine<ZADD, GATED> / combine_k10_vec4 computes:
+// an unlisted row is read as 0.0f and goes through the same arithmetic.
+__device__ __forceinline__ int rows_mask(const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int k, int tk, int* s_mask) {
+    if (threadIdx.x == 0) *s_mask = 0;
+    __syncthreads();
+    const int nh = *count;
+    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
+        const int r = dst[h];
+        if (r / k == tk) atomicOr(s_mask, 1 << (r % k));
+    }
+    __syncthreads();
+    return *s_mask;
+}
+template<bool ZADD, bool GATED>
+__global__ void combine_rows(const float* __restrict__ parts, const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                             const float* __restrict__ weights, const float* __restrict__ shared, float* __restrict__ output,
+                             int64_t n_embd, int k, const float* __restrict__ sg) {
+    __shared__ int s_mask;
+    const int64_t tk = blockIdx.y;
+    const int mask = rows_mask(dst, count, k, (int) tk, &s_mask);
+    parts += tk * k * n_embd; weights += tk * k; if (shared) shared += tk * n_embd; output += tk * n_embd;
+    const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col >= n_embd) return;
+    float p0 = (mask & 1) ? parts[col] : 0.0f;
+    if (ZADD) p0 = 0.0f + p0;
+    float sum = p0 * weights[0];
+    for (int expert = 1; expert < k; ++expert) {
+        float p = ((mask >> expert) & 1) ? parts[int64_t(expert) * n_embd + col] : 0.0f;
+        if (ZADD) p = 0.0f + p;
+        sum += p * weights[expert];
+    }
+    if constexpr (GATED) {
+#pragma clang fp contract(off)
+        const float g = __fdividef(1.0f, 1.0f + __expf(-sg[tk]));
+        const float sh = shared[col] * g;
+        sum += sh;
+    } else {
+        if (shared) sum += shared[col];
+    }
+    output[col] = sum;
+}
+__global__ void combine_k10_vec4_rows(const float4* __restrict__ parts4, const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                      const float* __restrict__ weights, const float4* __restrict__ shared4,
+                                      float4* __restrict__ output4, int64_t n4) {
+    __shared__ int s_mask;
+    const int64_t tk = blockIdx.y;
+    const int mask = rows_mask(dst, count, 10, (int) tk, &s_mask);
+    parts4 += tk * 10 * n4;
+    weights += tk * 10;
+    shared4 += tk * n4;
+    output4 += tk * n4;
+    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c4 >= n4) return;
+    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float w0 = __ldg(weights + 0);
+    const float4 p0 = (mask & 1) ? parts4[c4] : zero;
+    float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
+#pragma unroll
+    for (int expert = 1; expert < 10; ++expert) {
+        const float w = __ldg(weights + expert);
+        const float4 p = ((mask >> expert) & 1) ? parts4[int64_t(expert) * n4 + c4] : zero;
+        sum.x = fmaf(p.x, w, sum.x);
+        sum.y = fmaf(p.y, w, sum.y);
+        sum.z = fmaf(p.z, w, sum.z);
+        sum.w = fmaf(p.w, w, sum.w);
+    }
+    const float4 sh = shared4[c4];
+    sum.x += sh.x;
+    sum.y += sh.y;
+    sum.z += sh.z;
+    sum.w += sh.w;
+    output4[c4] = sum;
+}
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
@@ -260,6 +335,28 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
     } else {
         combine<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
             parts, weights, shared, output, n_embd, int(k));
+    }
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_rows(const float* parts, const int32_t* dst, const int32_t* count, const float* weights,
+                                   const float* shared, const float* shared_gate, float* output, int64_t n_embd, int64_t k,
+                                   int n_tok, void* stream) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || !dst || !count || (shared_gate && !shared))
+        throw std::invalid_argument("native MoE combine (rows) requires a stream, width, 1..15 experts, tokens, the rows");
+    cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (shared_gate) {   // native_moe_combine_multi_hits_gated's arithmetic
+        combine_rows<true, true><<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, st>>>(
+            parts, dst, count, weights, shared, output, n_embd, int(k), shared_gate);
+    } else if (k == 10 && shared != nullptr && (n_embd & 3) == 0 &&
+               (((uintptr_t) parts | (uintptr_t) shared | (uintptr_t) output) & 15u) == 0) {   // native_moe_combine_multi's vec4 case
+        const int64_t n4 = n_embd >> 2;
+        combine_k10_vec4_rows<<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, st>>>(
+            reinterpret_cast<const float4*>(parts), dst, count, weights, reinterpret_cast<const float4*>(shared),
+            reinterpret_cast<float4*>(output), n4);
+    } else {   // ... and its scalar case
+        combine_rows<false, false><<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, st>>>(
+            parts, dst, count, weights, shared, output, n_embd, int(k), nullptr);
     }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

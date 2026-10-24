@@ -98,6 +98,35 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// [claude] STRATA_TP_NOMEMSET=2's check: the words where the memset path's combine and the rows combine differ, counted into
+// mapped memory by a node of the window graph and reported from a thread every second while they change
+unsigned* g_tp_nomemset_h = nullptr;
+unsigned* g_tp_nomemset_d = nullptr;
+// (the mapped counter is allocated before any capture: set_tp calls this when STRATA_TP_NOMEMSET=2)
+void tp_nomemset_init() {
+    unsigned*& h = g_tp_nomemset_h;
+    unsigned*& d = g_tp_nomemset_d;
+    if (h == nullptr) {
+        void* p = nullptr;
+        if (cudaHostAlloc(&p, 64, cudaHostAllocMapped) != cudaSuccess) { (void) cudaGetLastError(); return; }
+        std::memset(p, 0, 64);
+        h = (unsigned*) p;
+        if (cudaHostGetDevicePointer((void**) &d, p, 0) != cudaSuccess) { d = nullptr; return; }
+        std::thread([h] {
+            unsigned last_calls = 0;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const unsigned calls = ((volatile unsigned*) h)[1], bad = ((volatile unsigned*) h)[0];
+                if (calls == last_calls) continue;
+                last_calls = calls;
+                std::fprintf(stderr, "strata verify: STRATA_TP_NOMEMSET=2 check: %u mismatching words over %u compares\n", bad, calls);
+            }
+        }).detach();
+    }
+}
+void tp_nomemset_check(const float* a, const float* b, int64_t n, cudaStream_t cs) {
+    if (g_tp_nomemset_d != nullptr) strata::kernels::count_mismatch_f32(a, b, (long long) n, g_tp_nomemset_d, cs);
+}
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
@@ -2252,7 +2281,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         bool hits_in_combine = false;
         if (tp_gpu_only_) {   // TP by id: this card's hits into zeroed rows, the combine with its half of the shared expert, the all-reduce
-            if (cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs) != cudaSuccess) {
+            // [claude] STRATA_TP_NOMEMSET=1: no memset - the combine reads only the rows this card's experts wrote (the plan's
+            // dst[0, counts[1])) and 0.0f for the rest: bitwise the same sums (native_moe_combine_multi_rows).  =2: both, and
+            // the two outputs compared on the device (a check; the memset path's output is the one used)
+            static const int nomemset = [] { const char* v = std::getenv("STRATA_TP_NOMEMSET"); return v != nullptr ? std::atoi(v) : 0; }();
+            if (nomemset != 1 && cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs) != cudaSuccess) {
                 err = "verify: the TP parts memset failed";
                 return false;
             }
@@ -2262,10 +2295,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr)
                 cudaStreamWaitEvent(cs, ev_join_, 0);
             try {   // (STRATA_LFUSE / STRATA_COMBINE_CPU: the shared expert's gate rode in the router GEMV: the combine applies it)
-                if (sg_gated_[grp])
-                    native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
-                else
-                    native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                if (nomemset != 1) {
+                    if (sg_gated_[grp])
+                        native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+                    else
+                        native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                }
+                if (nomemset != 0) {
+                    float* dst = nomemset == 1 ? bo_ + tb * N : hit_out;   // (=2: hit_out is unused on this path: the check's scratch)
+                    native_moe_combine_multi_rows(parts_out, p_dst, p_counts + 1, w_ + tb * K, shared_ + tb * N,
+                                                  sg_gated_[grp] ? sh_g_ + tb : nullptr, dst, N, K, n, cs);
+                    if (nomemset == 2) tp_nomemset_check(bo_ + tb * N, hit_out, (int64_t) n * N, cs);
+                }
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
             tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);
         } else if (!tp_own(l)) {   // TP: this layer's block output comes from the card that owns its experts
@@ -3749,6 +3790,11 @@ bool Verifier::set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool h
     static const bool devplan = [] { const char* v = std::getenv("STRATA_TP_DEVPLAN"); return v == nullptr || v[0] != '0'; }();
     tp_dev_plan_ = mode == 2 && link.rank == 0 && devplan;
     tpl_ = link;
+    if (const char* nm = std::getenv("STRATA_TP_NOMEMSET"); nm != nullptr && std::atoi(nm) == 2) tp_nomemset_init();   // (before the captures)
+    if (link.flag_h == nullptr && link.flag_dev >= 0) {   // [claude] STRATA_TP_INBOX=vram: the host's flag writes go through this stream
+        const OnDevice on(link.flag_dev);
+        if (cudaStreamCreateWithFlags(&tp_flag_cs_, cudaStreamNonBlocking) != cudaSuccess) { tp_flag_cs_ = nullptr; (void) cudaGetLastError(); }
+    }
     tp_lb_ = own_lb;
     tp_le_ = own_le;
     tp_head_ = head;

@@ -1589,6 +1589,21 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, 
     copy_i32_unless_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n, skip, value);
     check("copy_i32_from_mapped_unless");
 }
+// [claude] a check kernel (STRATA_TP_NOMEMSET=2): the 32-bit words where a and b differ, counted into counter[0]; counter[1] counts the calls
+namespace {
+__global__ void count_mismatch_kernel(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b, long long n, unsigned* counter) {
+    unsigned bad = 0;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x) bad += a[i] != b[i];
+    if (bad) atomicAdd(counter, bad);
+    if (blockIdx.x == 0 && threadIdx.x == 0) atomicAdd(counter + 1, 1u);
+}
+}  // namespace
+void count_mismatch_f32(const float* a, const float* b, long long n, unsigned* counter, void* stream) {
+    if (n <= 0) return;
+    const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
+    count_mismatch_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((const uint32_t*) a, (const uint32_t*) b, n, counter);
+    check("count_mismatch_f32");
+}
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream) {
     if (n <= 0) return;
