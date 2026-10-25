@@ -23,6 +23,9 @@
 #include <exception>
 #include <algorithm>
 #include <set>
+#include <thread>
+#include <vector>
+#include <cstdlib>
 
 namespace strata::core {
 
@@ -521,11 +524,43 @@ bool copy2d(Stager& st, int ddev, void* dst, size_t dpitch, int sdev, const void
 }
 }  // namespace
 
+// [claude] the streamed K/V's host copies (pinned RAM on both sides): copied by CPU threads (STRATA_TP_MOVE_THREADS,
+// default 12; 0 = through cudaMemcpy2DAsync as before).  A 261,625-cell hand-over moved ~3 GB of them through the
+// copy engine (host -> host over the link) in ~250 ms, beside the late refill's copies on the same link.
+struct HostJob { uint8_t* dst; size_t dpitch; const uint8_t* src; size_t spitch; size_t w, h; };
+static int tp_move_threads() {
+    static const int v = [] { const char* e = std::getenv("STRATA_TP_MOVE_THREADS"); return e ? std::max(0, std::atoi(e)) : 12; }();
+    return v;
+}
+static void run_host_jobs(const std::vector<HostJob>& jobs, int nt) {
+    size_t rows = 0;
+    for (const HostJob& j : jobs) rows += j.h;
+    if (rows == 0) return;
+    // row ranges of the concatenated jobs, one per thread
+    auto work = [&](size_t r0, size_t r1) {
+        size_t base = 0;
+        for (const HostJob& j : jobs) {
+            const size_t a = std::max(r0, base), b = std::min(r1, base + j.h);
+            for (size_t r = a; r < b; ++r) std::memcpy(j.dst + (r - base) * j.dpitch, j.src + (r - base) * j.spitch, j.w);
+            base += j.h;
+            if (base >= r1) break;
+        }
+    };
+    nt = (int) std::min<size_t>((size_t) std::max(1, nt), rows);
+    std::vector<std::thread> th;
+    const size_t per = (rows + (size_t) nt - 1) / (size_t) nt;
+    for (int t = 1; t < nt; ++t) th.emplace_back(work, (size_t) t * per, std::min(rows, (size_t) (t + 1) * per));
+    work(0, std::min(rows, per));
+    for (auto& x : th) x.join();
+}
+
 bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState* const* stage_ss, const int* stage_dev,
                    int n_stages, const int64_t* stage_lb, SessionState* const* tp_ss, const int* tp_dev, int64_t cells,
                    bool to_tp, std::string& err) {
     using strata::kernels::QsaShapes;
     Stager stg;
+    std::vector<HostJob> hjobs;
+    const bool host_threads = tp_move_threads() > 0;
     const int R = 2;
     {
         static const bool staged = [] { const char* v = std::getenv("STRATA_TP_MOVE_STAGED"); return v != nullptr && v[0] == '1'; }();
@@ -603,10 +638,20 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
                     !pool(F.v_scale, H.v_scale, scale_row, vp) || !pool(F.k_q4, H.k_q4, q4_row, vp) || !pool(F.v_q4, H.v_q4, q4_row, vp))
                     return false;
                 if (F.kv_mode == 1) {   // streamed: the host copy (the used pages), the page table, the slot map
-                    if (!pool(F.host.k_pool, H.host.k_pool, HD * 2, pages_used) || !pool(F.host.v_pool, H.host.v_pool, HD * 2, pages_used) ||
-                        !pool(F.host.k_q, H.host.k_q, HD, pages_used) || !pool(F.host.v_q, H.host.v_q, HD, pages_used) ||
-                        !pool(F.host.k_scale, H.host.k_scale, scale_row, pages_used) || !pool(F.host.v_scale, H.host.v_scale, scale_row, pages_used) ||
-                        !pool(F.host.k_q4, H.host.k_q4, q4_row, pages_used) || !pool(F.host.v_q4, H.host.v_q4, q4_row, pages_used))
+                    // [claude] both host copies are pinned RAM: CPU threads (run_host_jobs) unless STRATA_TP_MOVE_THREADS=0
+                    auto hpool = [&](const void* fp, const void* hp, uint64_t per_head, uint64_t pages) -> bool {
+                        if (!host_threads) return pool(fp, hp, per_head, pages);
+                        if (fp == nullptr || hp == nullptr || pages == 0) return true;
+                        const uint64_t fpitch = NKV * PS * per_head, hpitch = nkv * PS * per_head, w = nkv * PS * per_head;
+                        uint8_t* f = (uint8_t*) fp + r * w;
+                        if (to_tp) hjobs.push_back({(uint8_t*) hp, (size_t) hpitch, f, (size_t) fpitch, (size_t) w, (size_t) pages});
+                        else hjobs.push_back({f, (size_t) fpitch, (const uint8_t*) hp, (size_t) hpitch, (size_t) w, (size_t) pages});
+                        return true;
+                    };
+                    if (!hpool(F.host.k_pool, H.host.k_pool, HD * 2, pages_used) || !hpool(F.host.v_pool, H.host.v_pool, HD * 2, pages_used) ||
+                        !hpool(F.host.k_q, H.host.k_q, HD, pages_used) || !hpool(F.host.v_q, H.host.v_q, HD, pages_used) ||
+                        !hpool(F.host.k_scale, H.host.k_scale, scale_row, pages_used) || !hpool(F.host.v_scale, H.host.v_scale, scale_row, pages_used) ||
+                        !hpool(F.host.k_q4, H.host.k_q4, q4_row, pages_used) || !hpool(F.host.v_q4, H.host.v_q4, q4_row, pages_used))
                         return false;
                     auto words = [&](const int32_t* f, const int32_t* h, uint64_t n) -> bool {
                         if (f == nullptr || h == nullptr || n == 0) return true;
@@ -654,6 +699,7 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
             }
         }
     }
+    run_host_jobs(hjobs, tp_move_threads());   // (the device copies run meanwhile; finish waits for them)
     return stg.finish(err);
 }
 

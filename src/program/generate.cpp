@@ -14125,6 +14125,8 @@ int main(int argc, char** argv) {
             // the most used experts first, and join the tables in parts beside the decode windows
             static const int64_t late_w = [] { const char* v = std::getenv("STRATA_REFILL_OVERLAP"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
             static const int64_t late_nt = [] { const char* v = std::getenv("STRATA_REFILL_TRANCHES"); return v ? (int64_t) std::max(1, std::atoi(v)) : (int64_t) 4; }();
+            bool dp_read_req = false;   // [claude] this request's prompt was read by the DP path (STRATA_REFILL_HEAD_DP)
+            int64_t req_prompt_n = 0;   // [claude] this request's prompt tokens (STRATA_REFILL_HEAD_MIN)
             auto late_stream_of = [&](const PfPart& p) -> cudaStream_t {
                 if (p.dev < 0) return adapt_stream;
                 for (auto& st : stages)
@@ -14190,7 +14192,14 @@ int main(int argc, char** argv) {
                 // out first as a part of their own that joins before the first token (refill_late waits for it), the
                 // rest late as before - the first windows find the hottest of the lent experts on the GPU
                 static const int64_t late_head = [] { const char* v = std::getenv("STRATA_REFILL_HEAD"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
-                const size_t head_n = paced ? std::min(rows.size(), (size_t) late_head) : 0;
+                // STRATA_REFILL_HEAD_DP=1: only after a prompt the DP path read (its first card refilled beside the
+                // second's last chunk; a one-chunk prompt's loans are smaller and its first windows find the cache whole sooner)
+                static const bool late_head_dp = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_DP"); return v != nullptr && std::atoi(v) != 0; }();
+                // STRATA_REFILL_HEAD_MIN=<tokens>: only after a prompt of at least that many tokens (a shorter one's first
+                // windows lose less to the late refill than the head would add to its first token)
+                static const int64_t late_head_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+                const size_t head_n = paced && (!late_head_dp || dp_read_req) && req_prompt_n >= late_head_min
+                                          ? std::min(rows.size(), (size_t) late_head) : 0;
                 for (size_t t0 = 0, t = 0, step = head_n > 0 ? head_n : per; t0 < rows.size(); t0 += step, ++t, step = per) {
                     const bool is_head = head_n > 0 && t0 == 0;
                     LateTranche lt;
@@ -14504,6 +14513,7 @@ int main(int argc, char** argv) {
                                                                         b0 - a0 - head, a0 + head, o.prefill_chunk,
                                                                         kDpMinLast, de);
                     sp.on_dp_done = nullptr;
+                    if (dp_ok) dp_read_req = true;
                     if (dp_ok) return true;
                     if (early != nullptr && (early->issued || early->lent.empty())) { e = de; return false; }   // its loan is half given back
                     if (de.rfind("prefill DP: the p", 0) != 0) { e = de; return false; }
@@ -15000,6 +15010,7 @@ int main(int argc, char** argv) {
             if (tp_on) tpv[0].set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);
+            req_prompt_n = n;
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
