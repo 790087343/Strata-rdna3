@@ -14265,7 +14265,7 @@ int main(int argc, char** argv) {
                 }
                 res_upload();
             };
-            auto refill_late = [&](std::string& e) -> bool {
+            auto refill_late = [&](std::string& e, bool join_now = true) -> bool {
                 if (late_defer) {
                     late_go = [&](std::string& ee) -> bool {
                         for (PfPart& p : pf_parts)
@@ -14276,7 +14276,7 @@ int main(int argc, char** argv) {
                 }
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty() && !late_issue(p, e, true)) return false;
-                late_join_now();
+                if (join_now) late_join_now();
                 return true;
             };
             // #340: with several stages every stage's copies go out first (each card on its own link), then each is
@@ -15097,11 +15097,21 @@ int main(int argc, char** argv) {
                 tr("part next", at, to);
                 // the state to the pair before the late copies go out: the hand-over syncs both devices, and would
                 // wait for the whole refill
+                // [claude] STRATA_REFILL_EARLY_TP=1 (with STRATA_REFILL_SDMA=1: copies on the SDMA engine's HSA queue,
+                // which the hand-over's device syncs do not wait for): the copies go out first and run beside the
+                // hand-over (256K: ~250 ms); the STRATA_REFILL_HEAD parts are joined after it
+                static const bool early_tp = [] { const char* v = std::getenv("STRATA_REFILL_EARLY_TP"); return v != nullptr && std::atoi(v) != 0; }();
+                const bool late_first = late_now && tp_on && early_tp && late_sdma && !late_defer;
+                if (late_first && !refill_late(err, false)) {
+                    std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                    return 1;
+                }
                 if (late_now && tp_on && !tp_to(true, at, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (win && !(late_now ? refill_late(err) : refill(err))) {
+                if (late_first) late_join_now();
+                else if (win && !(late_now ? refill_late(err) : refill(err))) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
