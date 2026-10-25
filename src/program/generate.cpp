@@ -14270,7 +14270,7 @@ int main(int argc, char** argv) {
                 std::vector<LateTranche> keep;
                 for (LateTranche& t : late) {
                     bool join = t.head && !t.bad;
-                    if (!join && late_join_now_env && late_landed && t.pending == 0 && !t.bad) join = late_ready(t, false);
+                    if (!join && late_join_now_env && late_landed_now() && t.pending == 0 && !t.bad) join = late_ready(t, false);
                     if (!join) { keep.push_back(std::move(t)); continue; }
                     late_ready(t, true);
                     for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
