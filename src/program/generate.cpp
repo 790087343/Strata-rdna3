@@ -9325,6 +9325,14 @@ int main(int argc, char** argv) {
                     err.clear();
                 }
             }
+            // [claude] TP by id: each card's table maps its own cache for every layer, so a stage's helper computes
+            // the experts of the stage's layers that its card holds (STRATA_HELP_PEER_RES=0: it only streams)
+            static const bool help_res = [] { const char* v = std::getenv("STRATA_HELP_PEER_RES"); return v == nullptr || v[0] != '0'; }();
+            if (tp2 && help_res && paths.size() == 2) {
+                for (auto& p : paths) p.first->set_help_peer_residency(true);
+                std::fprintf(stderr, "strata serve: tensor parallel: a helped prompt's stage helper computes its own card's "
+                                     "experts of the stage's layers (STRATA_HELP_PEER_RES=0: off)\n");
+            }
         }
         mem_mark("the head and the prompt path");
         // #340: STRATA_SPLIT_SMALL_OWN=S (tokens): on a layer split, every stage that borrows keeps the slots for an
@@ -10775,7 +10783,7 @@ int main(int argc, char** argv) {
         struct LateTranche { cudaEvent_t ev = nullptr; int dev = -1; std::vector<int32_t>* tbl = nullptr;
                              std::vector<LateRow> rows; int64_t due = 0; int64_t pending = 0; cudaStream_t stream = nullptr;
                              uint64_t id = 0; strata::core::SdmaCopier* sd = nullptr; strata::core::SdmaCopier::Done done;
-                             bool bad = false; };
+                             bool bad = false; bool head = false; };
         // STRATA_REFILL_SDMA=1: the refill copies go to the card's SDMA engine through HSA (strata/core/sdma_copy.hpp) instead
         // of hipMemcpyAsync, which ran them as copy kernels beside the decode windows' kernels here (every stage of a window
         // on that card 3-4x slower while ~14 GB streamed in).  The default stays hipMemcpyAsync.
@@ -14178,15 +14186,22 @@ int main(int argc, char** argv) {
                 // STRATA_REFILL_TRANCHE_SLOTS=<n> (0 = STRATA_REFILL_TRANCHES equal parts): parts of n slots
                 static const int64_t late_ts = [] { const char* v = std::getenv("STRATA_REFILL_TRANCHE_SLOTS"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
                 const size_t per = late_ts > 0 ? (size_t) late_ts : (rows.size() + (size_t) late_nt - 1) / (size_t) late_nt;
-                for (size_t t0 = 0, t = 0; t0 < rows.size(); t0 += per, ++t) {
+                // [claude] STRATA_REFILL_HEAD=<n slots> (the refill at the prompt's end): the first n rows of that order go
+                // out first as a part of their own that joins before the first token (refill_late waits for it), the
+                // rest late as before - the first windows find the hottest of the lent experts on the GPU
+                static const int64_t late_head = [] { const char* v = std::getenv("STRATA_REFILL_HEAD"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+                const size_t head_n = paced ? std::min(rows.size(), (size_t) late_head) : 0;
+                for (size_t t0 = 0, t = 0, step = head_n > 0 ? head_n : per; t0 < rows.size(); t0 += step, ++t, step = per) {
+                    const bool is_head = head_n > 0 && t0 == 0;
                     LateTranche lt;
+                    lt.head = is_head;
                     lt.dev = p.dev;
                     lt.tbl = &tbl_of(p);
                     lt.stream = ls;
                     lt.id = late_next_id++;
                     const uint64_t tid = lt.id;
-                    late_arm(lt, (int64_t) (std::min(rows.size(), t0 + per) - t0));
-                    for (size_t j = t0; j < std::min(rows.size(), t0 + per); ++j) {
+                    late_arm(lt, (int64_t) (std::min(rows.size(), t0 + step) - t0));
+                    for (size_t j = t0; j < std::min(rows.size(), t0 + step); ++j) {
                         const auto [i, slot] = rows[j];
                         const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                         const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
@@ -14195,7 +14210,7 @@ int main(int argc, char** argv) {
                             e = "prefill: a late refill copy has no source or slot";
                             return false;
                         }
-                        if (pace) {
+                        if (pace && !is_head) {
                             late_q.push_back({dst, b, (size_t) nb, tid, i, slot});
                             queued += nb;
                             ++lt.pending;
@@ -14223,6 +14238,33 @@ int main(int argc, char** argv) {
                 return true;
             };
             const bool late_defer = late_defer_w() > 0;
+            // [claude] at the prompt's end: the STRATA_REFILL_HEAD parts are waited for and join now; with
+            // STRATA_REFILL_JOIN=landed and STRATA_REFILL_JOIN_NOW=1 every part whose copies are already in (the DP
+            // path's early refill, beside the other card's last chunk) joins now too instead of W windows later
+            static const bool late_join_now_env = [] { const char* v = std::getenv("STRATA_REFILL_JOIN_NOW"); return v != nullptr && std::atoi(v) != 0; }();
+            auto late_join_now = [&]() {
+                size_t joined = 0, rows_joined = 0;
+                std::vector<LateTranche> keep;
+                for (LateTranche& t : late) {
+                    bool join = t.head && !t.bad;
+                    if (!join && late_join_now_env && late_landed && t.pending == 0 && !t.bad) join = late_ready(t, false);
+                    if (!join) { keep.push_back(std::move(t)); continue; }
+                    late_ready(t, true);
+                    for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
+                    rows_joined += t.rows.size();
+                    if (t.ev != nullptr) { const strata::core::OnDevice on(t.dev); cudaEventDestroy(t.ev); t.ev = nullptr; }
+                    if (t.sd != nullptr) t.sd->destroy(t.done);
+                    ++joined;
+                }
+                late.swap(keep);
+                if (joined == 0) return;
+                if (late_tr) {
+                    std::fprintf(stderr, "strata trace: join now %zu parts %zu rows before the first token, %zu parts left\n",
+                                 joined, rows_joined, late.size());
+                    std::fflush(stderr);
+                }
+                res_upload();
+            };
             auto refill_late = [&](std::string& e) -> bool {
                 if (late_defer) {
                     late_go = [&](std::string& ee) -> bool {
@@ -14234,6 +14276,7 @@ int main(int argc, char** argv) {
                 }
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty() && !late_issue(p, e, true)) return false;
+                late_join_now();
                 return true;
             };
             // #340: with several stages every stage's copies go out first (each card on its own link), then each is

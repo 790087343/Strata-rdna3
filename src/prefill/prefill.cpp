@@ -782,6 +782,10 @@ struct PeerPrefill {
     std::vector<PsEntry> pseq;            // this chunk's peer-streamed experts, layer by layer in id order
     std::vector<size_t> pseq_start;
     std::vector<char> ps_flag;            // [layer * NE + e]: streamed by the peer in this chunk
+    // [claude] TP by id, the fused help: [layer * NE + e] the helper card's own cache slot of an expert this card
+    // does not hold (computed there from its cache, nothing streamed; flagged in ps_flag too), else null
+    std::vector<const uint8_t*> hres;
+    int64_t hres_experts = 0;
     size_t p_issued = 0, pk = 0;
     int64_t ps_experts = 0;
     float *mixed = nullptr, *GU = nullptr, *H = nullptr, *Dm = nullptr;
@@ -3372,11 +3376,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 cudaMemcpy(m.ds_help, help.data(), help.size(), cudaMemcpyHostToDevice);
                 ds_helped.assign((size_t) g.n_layers, 0);
             }
+            // [claude] TP by id: the helper's own cache (its table covers every layer) - an expert this card does not
+            // hold but the helper does is computed there from its slot (set_help_peer_residency)
+            const bool hres_on = ps_on && m.pp->fused && help_peer_res_ && helper_ != nullptr &&
+                                 helper_->impl_->host_res != nullptr && helper_->impl_->cache != nullptr;
+            if (ps_on) {
+                m.pp->hres_experts = 0;
+                if (hres_on) m.pp->hres.assign((size_t) g.n_layers * m.g->n_expert, nullptr);
+                else m.pp->hres.clear();
+            }
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
+                const bool hres_l = hres_on && (size_t) l < m.pp->fh_layer.size() && m.pp->fh_layer[(size_t) l];
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    if (hres_l) {
+                        const size_t i = (size_t) l * m.g->n_expert + e;
+                        const int32_t hs = helper_->impl_->host_res[i];
+                        if (hs >= 0 && hs < helper_->impl_->cache->slots()) {
+                            m.pp->hres[i] = helper_->impl_->cache->device_slot(hs);
+                            m.pp->ps_flag[i] = 1;
+                            ++m.pp->hres_experts;
+                            continue;
+                        }
+                    }
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     if (ds_chunk && ds_flag[(size_t) l * m.g->n_expert + e] == 1) continue;   // [claude] the other path streams it
                     int job = -1;
@@ -4238,21 +4262,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t RP = (size_t) P.RP, pper = std::max<size_t>(1, RP / 3);
                             size_t pk = P.pseq_start[(size_t) l];
                             const size_t pend = P.pseq_start[(size_t) l + 1];
-                            for (int32_t e = 0; e < m.g->n_expert && pk < pend;) {
+                            // [claude] TP by id: the helper's resident experts of this layer (P.hres) join the
+                            // batches from its own cache slots, nothing streamed for them
+                            const uint8_t* const* hr = P.hres.empty() ? nullptr : P.hres.data() + (size_t) l * NE;
+                            int32_t e_last = -1;
+                            if (hr != nullptr)
+                                for (int32_t e = (int32_t) NE - 1; e >= 0; --e)
+                                    if (hr[e] != nullptr) { e_last = e; break; }
+                            for (int32_t e = 0; e < m.g->n_expert && (pk < pend || e <= e_last);) {
                                 fused::Batch b;
                                 b.e0 = e;
                                 const size_t k0 = pk;
+                                int n_res = 0;
                                 for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
                                     if (pk < pend && P.pseq[pk].e == e) {
                                         if (pk - k0 == pper) break;
                                         b.blob[e - b.e0] = P.pstage[pk % RP];
                                         ++pk;
+                                    } else if (hr != nullptr && hr[e] != nullptr) {
+                                        b.blob[e - b.e0] = hr[e];
+                                        ++n_res;
                                     }   // else: none of its rows are here (this card's experts are the flagged ones)
                                 }
                                 b.e1 = e;
-                                if (pk == k0) continue;
-                                p_issue_until(pk);
-                                cudaStreamWaitEvent(ps, P.pcopied[(pk - 1) % RP], 0);
+                                if (pk == k0 && n_res == 0) continue;
+                                if (pk > k0) {
+                                    p_issue_until(pk);
+                                    cudaStreamWaitEvent(ps, P.pcopied[(pk - 1) % RP], 0);
+                                }
                                 if (fused::f16_on())
                                     fused::experts_native_f16(b, ng, ne_grp, T * K, P.hGU, P.hXq, P.hsrc, P.hH, P.hDm, ps);
                                 else
@@ -5762,6 +5799,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: device %d experts: %lld streamed (%lld straight from the pinned arena), "
                              "%lld resident, %lld on the CPU\n", m.device, (long long) stats_.experts_streamed,
                      (long long) stats_.experts_dma, (long long) stats_.experts_resident, (long long) stats_.experts_cpu);
+        if (m.pp && m.pp->hres_experts > 0)
+            std::fprintf(stderr, "strata prefill timing: device %d: %lld experts computed by the helper from its own cache\n",
+                         m.device, (long long) m.pp->hres_experts);
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;
