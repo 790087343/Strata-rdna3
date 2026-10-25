@@ -1440,6 +1440,17 @@ class StrataEngine:
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
+            # [claude] A/B inside one engine: {"STRATA_REFILL_PACE": 64, ...} - engine switches for this request only (the
+            # engine takes the runtime-switchable ones, include/strata/core/request_switches.hpp, and logs any other as
+            # ignored).  Names and values of [A-Za-z0-9_.-] only; anything else is not sent.
+            ev = tune.get("env")
+            if isinstance(ev, dict) and ev:
+                ok = re.compile(r"[A-Za-z0-9_.\-]{1,64}")
+                items = [f"{k}:{v if not isinstance(v, bool) else int(v)}" for k, v in ev.items()
+                         if isinstance(k, str) and ok.fullmatch(k) and isinstance(v, (str, int, float))
+                         and ok.fullmatch(str(v if not isinstance(v, bool) else int(v)))]
+                if items:
+                    keys += " env=" + ",".join(items)
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:

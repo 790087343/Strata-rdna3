@@ -34,6 +34,7 @@
 #include "strata/core/sdma_copy.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/core/request_switches.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/uma_cache.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -10843,15 +10844,17 @@ int main(int argc, char** argv) {
         struct LateCopy { uint8_t* dst; const uint8_t* src; size_t nb; uint64_t tranche; int32_t i, slot; };
         std::deque<LateCopy> late_q;
         uint64_t late_next_id = 1;   // LateTranche::id: a queued copy names its part by it (parts may join out of order)
-        static const int64_t late_pace = [] { const char* v = std::getenv("STRATA_REFILL_PACE"); return v ? (int64_t) std::max(0, std::atoi(v)) << 20 : (int64_t) 0; }();
+        // [claude] per-request A/B: these five are the request's values (env=..., request_switches.hpp), the start-up ones by default
+        namespace rsw = strata::core::reqsw;
+        auto late_pace_now = [] { return rsw::get_i64(rsw::REFILL_PACE); };
         // STRATA_REFILL_RATE=<MiB/s> (an alternative to STRATA_REFILL_PACE: a budget by the time passed since the last
         // window's pump, so slow windows do not leave the link idle; ~12000 keeps a PCIe 4.0 x8 link busy while the
         // copies not yet issued stay on the host, where STRATA_REFILL_DEMAND can reorder them)
-        static const double late_rate = [] { const char* v = std::getenv("STRATA_REFILL_RATE"); return v ? std::max(0.0, std::atof(v)) * 1048576.0 : 0.0; }();
+        auto late_rate_now = [] { return rsw::get(rsw::REFILL_RATE); };
         // STRATA_REFILL_DEMAND=1 (with STRATA_REFILL_RATE / PACE and STRATA_REFILL_JOIN=landed): the lent rows a decode
         // window misses (the CPU computed them) go to the front of the queue as a part of their own - the next windows
         // most likely route to them again
-        static const bool late_demand = [] { const char* v = std::getenv("STRATA_REFILL_DEMAND"); return v != nullptr && std::atoi(v) != 0; }();
+        auto late_demand_now = [] { return rsw::get_bool(rsw::REFILL_DEMAND); };
         Clock::time_point late_pump_t = Clock::now();
         int64_t late_promoted = 0;   // (trace) rows moved to the front so far
         auto late_close = [&](LateTranche& t) -> bool {   // the part's last copy is out: its event
@@ -10882,8 +10885,7 @@ int main(int argc, char** argv) {
         // on it (TP: 6 tokens 24 -> 100 ms, the first window 12 -> 78 ms)
         std::function<bool(std::string&)> late_go;
         auto late_defer_w = [] {   // STRATA_REFILL_DEFER=<k windows> (1: once the first window is done)
-            static const int64_t v = [] { const char* e = std::getenv("STRATA_REFILL_DEFER"); return e ? (int64_t) std::max(0, std::atoi(e)) : (int64_t) 0; }();
-            return v;
+            return rsw::get_i64(rsw::REFILL_DEFER);
         };
         auto late_launch = [&]() {
             if (!late_go) return;
@@ -10895,7 +10897,7 @@ int main(int argc, char** argv) {
         // STRATA_REFILL_JOIN=due (the default: part t joins at its window, waited for - #463's fixed schedule) |
         // landed (a part joins at the first window from its due one whose start finds its copies in - cudaEventQuery,
         // never a wait here; which window an expert first runs on the GPU in then depends on the copies' timing)
-        static const bool late_landed = [] { const char* v = std::getenv("STRATA_REFILL_JOIN"); return v != nullptr && std::strcmp(v, "landed") == 0; }();
+        auto late_landed_now = [] { return rsw::get_bool(rsw::REFILL_JOIN); };
         static const bool late_tr = std::getenv("STRATA_TRACE") != nullptr;
         auto late_apply = [&](bool all) {
             if (all) late_launch();
@@ -10905,6 +10907,7 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < late.size(); ++k) {
                 LateTranche& t = late[k];
                 bool join = all || t.due <= late_windows;
+                const bool late_landed = late_landed_now();
                 if (join && !all && late_landed) join = t.pending == 0 && !t.bad && late_ready(t, false);
                 if (!join) {
                     if (!late_landed) {   // due: the parts join in issue order; the first not yet due ends the pass
@@ -13137,6 +13140,7 @@ int main(int argc, char** argv) {
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             double req_pipe = -1.0;   // --prefill-pipe for this request (setup's calibration of a layer split)
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
+            std::string req_env;     // [claude] env=NAME:VALUE,...: request_switches.hpp (empty: the start-up values)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
@@ -13171,6 +13175,7 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "env") req_env = tok.substr(eq + 1);   // [claude] per-request A/B switches
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -13185,6 +13190,12 @@ int main(int argc, char** argv) {
                     }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            {   // [claude] per-request A/B: this request's switches, before anything of it reads one
+                // (every GEN/GENI starts from the start-up values)
+                std::string said;
+                strata::core::reqsw::apply_request(req_env, said);
+                if (!said.empty()) std::fprintf(stderr, "strata serve: %s\n", said.c_str());
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
             std::vector<float> req_bias;
@@ -14178,6 +14189,9 @@ int main(int argc, char** argv) {
                                      rows.size(), (long long) head);
                     }
                 }
+                const int64_t late_pace = late_pace_now();
+                const double late_rate = late_rate_now();
+                const bool late_demand = late_demand_now(), late_landed = late_landed_now();
                 const bool pace = paced && (late_pace > 0 || late_rate > 0.0);
                 if (pace && late_demand && drive.d.miss_mark.size() != (size_t) (g.n_layers * g.n_expert))
                     drive.d.miss_mark.assign((size_t) (g.n_layers * g.n_expert), -1);
@@ -16031,7 +16045,7 @@ int main(int argc, char** argv) {
                 if (late_defer_w() > 0 && late_windows >= late_defer_w()) late_launch();   // STRATA_REFILL_DEFER=<k>: after k windows
                 late_apply(false);   // STRATA_REFILL_OVERLAP: the parts due by this window join (waited for)
                 if (!late_q.empty()) {   // STRATA_REFILL_PACE / RATE: this window's share of the refill
-                    if (late_demand) {
+                    if (late_demand_now()) {
                         // the rows the last window missed: to the front, as a part of their own per card (its rows leave
                         // the parts they were queued in; a part left with nothing queued closes now)
                         const int32_t mark = drive.d.miss_now;
@@ -16079,7 +16093,7 @@ int main(int argc, char** argv) {
                     const auto now = Clock::now();
                     const double dt = std::chrono::duration<double>(now - late_pump_t).count();
                     late_pump_t = now;
-                    late_pump(late_pace > 0 ? late_pace : (int64_t) (late_rate * std::min(dt, 0.25)));
+                    late_pump(late_pace_now() > 0 ? late_pace_now() : (int64_t) (late_rate_now() * std::min(dt, 0.25)));
                 }
                 ++late_windows;
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in

@@ -76,6 +76,15 @@ struct PinnedArena {
     struct ByNeed {};
     PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
                 uint64_t max_pinned_bytes = 0, const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
+    /// [claude] STRATA_ARENA_SHM: adopt `data` (inside `mapping`, which the destructor unmaps) as the arena and register
+    /// it as the constructor above does; `note` describes the backing.
+    struct Adopt {
+        void* data = nullptr;
+        void* mapping = nullptr;
+        uint64_t mapping_bytes = 0;
+        std::string note;
+    };
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes, const Adopt& adopt);
     bool by_need = false;
     std::vector<std::pair<uint64_t, uint64_t>> pin_ranges;    ///< registered (offset, length), sorted by offset, page-rounded
     std::vector<std::pair<uint64_t, uint64_t>> locked_ranges; ///< the holes locked resident (offset, length)
@@ -95,6 +104,8 @@ struct PinnedArena {
     PinnedArena& operator=(const PinnedArena&) = delete;
 
     bool valid() const { return base != nullptr; }
+    /// the registration (whole, sliced, or the working-set lock) of a reserved or adopted arena
+    void register_after_reserve(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes);
     uint8_t* data() const { return (uint8_t*) base; }
 };
 

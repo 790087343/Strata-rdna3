@@ -9,6 +9,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "strata/core/pinned.hpp"
+#include "strata/core/arena_shm.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -5491,6 +5492,107 @@ std::string expert_gguf_file(const std::string& gguf, const strata::kernels::cpu
 }
 }  // namespace
 
+#if defined(__linux__)
+namespace {
+// [claude] STRATA_ARENA_SHM: what the shared arena's bytes depend on.  The upstream fingerprint (the pack's metadata
+// files and sampled content of every source) plus every source file's canonical path, size, mtime and inode, the pack
+// directory, the arena geometry and this loader's layout version: a pack, quant or file version that differs in any of
+// them gets another object, never this one.  Bump kArenaShmLayout when the bytes the loader writes for the same files change.
+constexpr uint64_t kArenaShmLayout = 1;
+
+void hash_stat(uint64_t& h, const std::string& p) {
+    std::error_code ec;
+    const std::filesystem::path c = std::filesystem::weakly_canonical(p, ec);
+    hash_text(h, ec ? p : c.string());
+    struct stat st{};
+    if (::stat(p.c_str(), &st) != 0) { hash_u64(h, ~0ull); return; }
+    hash_u64(h, (uint64_t) st.st_size);
+    hash_u64(h, (uint64_t) st.st_mtim.tv_sec);
+    hash_u64(h, (uint64_t) st.st_mtim.tv_nsec);
+    hash_u64(h, (uint64_t) st.st_ino);
+    hash_u64(h, (uint64_t) st.st_dev);
+}
+
+bool arena_shm_key(const std::string& pack_dir, const std::string& experts_path, const std::string& gguf,
+                   const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf, uint64_t arena_bytes,
+                   const std::vector<std::string>& sources, uint64_t& key, std::string& err) {
+    uint64_t h = 0;
+    if (!shared_arena_pack_hash(pack_dir, experts_path, from_gguf ? gguf : std::string(), lay, h, err)) return false;
+    hash_text(h, "strata-arena-shm-key");
+    hash_u64(h, kArenaShmLayout);
+    hash_u64(h, arena_bytes);
+    hash_u64(h, from_gguf ? 1 : 0);
+    hash_stat(h, pack_dir);
+    for (const char* name : {"manifest.json", "index.txt", "native_experts.txt"}) hash_stat(h, pack_dir + "/" + name);
+    for (const auto& f : sources) hash_stat(h, f);
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
+        hash_u64(h, lay.layer_offset(l));
+        hash_u64(h, lay.blob_bytes(l));
+    }
+    for (uint64_t o : lay.gguf_off) hash_u64(h, o);
+    key = h == 0 ? 1 : h;
+    return true;
+}
+
+// [claude] STRATA_ARENA_SHM: `n` experts of the arena compared byte for byte with the files they were loaded from (the
+// first and the last expert, the rest spread over the layers at `seed`-chosen experts).  Returns the number that differ
+// (or could not be read: `err`).
+int arena_verify_sampled(const uint8_t* arena, const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf,
+                         const std::string& experts_path, const std::string& gguf, int n, uint64_t seed, std::string& err) {
+    std::map<std::string, int> fds;
+    auto fd_of = [&fds](const std::string& f) {
+        auto it = fds.find(f);
+        if (it != fds.end()) return it->second;
+        const int fd = ::open(f.c_str(), O_RDONLY | O_CLOEXEC);
+        fds[f] = fd;
+        return fd;
+    };
+    auto read_cmp = [&](const std::string& f, uint64_t off, const uint8_t* want, uint64_t len, std::vector<uint8_t>& buf) {
+        const int fd = fd_of(f);
+        if (fd < 0) { err = "cannot open " + f; return false; }
+        buf.resize((size_t) len);
+        uint64_t got = 0;
+        while (got < len) {
+            const ssize_t r = pread(fd, buf.data() + got, (size_t) (len - got), (off_t) (off + got));
+            if (r <= 0) { err = "short read of " + f; return false; }
+            got += (uint64_t) r;
+        }
+        return std::memcmp(buf.data(), want, (size_t) len) == 0;
+    };
+    std::vector<uint8_t> buf;
+    int bad = 0;
+    uint64_t x = seed;
+    for (int i = 0; i < n; ++i) {
+        x += 0x9e3779b97f4a7c15ull;   // splitmix64
+        uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        z ^= z >> 31;
+        const int64_t l = i == 0 ? 0 : i == n - 1 ? lay.n_layers - 1 : (int64_t) (((uint64_t) i * (uint64_t) lay.n_layers) / (uint64_t) n);
+        const int64_t e = i == 0 ? 0 : i == n - 1 ? lay.n_expert - 1 : (int64_t) (z % (uint64_t) lay.n_expert);
+        const uint8_t* dst = arena + lay.blob_offset(l, e);
+        bool same = true;
+        if (!from_gguf) {
+            same = read_cmp(experts_path, lay.blob_offset(l, e), dst, lay.blob_bytes(l), buf);
+        } else {
+            // the GGUF loader's placement: [gate rows | up rows | down rows] of expert e (load_experts_gguf)
+            const auto& fm = lay.fmt[(size_t) l];
+            const uint64_t blob = lay.bytes[(size_t) l];
+            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+            for (int r = 0; r < 3 && same; ++r)
+                same = read_cmp(expert_gguf_file(gguf, lay, l, r), lay.gguf_off[(size_t) (3 * l + r)] + (uint64_t) e * per[r],
+                                dst + at[r], per[r], buf);
+        }
+        if (!same) ++bad;
+    }
+    for (auto& kv : fds)
+        if (kv.second >= 0) ::close(kv.second);
+    return bad;
+}
+}  // namespace
+#endif
+
 void ExpertSource::record_inputs(const std::string& pack_experts, const std::string& gguf,
                                  const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf) {
     static const char* roles[3] = {"gate", "up", "down"};
@@ -5811,6 +5913,42 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
 #endif
 
+    // [claude] STRATA_ARENA_SHM=<name>: the arena in a shared-memory object that outlives this engine (arena_shm.hpp).  A
+    // complete object of the same key is mapped AS the arena and nothing is read; otherwise one is created and filled
+    // by the load below.  Any failure: a private arena, as without the variable.
+    const auto open_t0 = std::chrono::steady_clock::now();
+    std::vector<std::string> files;   // the files the experts are read from (the load and the shm key)
+    if (from_gguf) {
+        for (int64_t l = 0; l < n_layers; ++l)
+            for (int r = 0; r < 3; ++r) {
+                const std::string f = expert_gguf_file(gguf_, lay, l, r);
+                if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
+            }
+    } else {
+        files.push_back(path);
+    }
+#if defined(__linux__)
+    if (shared_arena_file.empty() && !arena_mmap && !shm_off_ && !ArenaShm::env_name().empty()) {
+        uint64_t key = 0;
+        std::string kerr, note;
+        if (!arena_shm_key(pack_dir, path, gguf_, lay, from_gguf, want + (uint64_t) blob, files, key, kerr)) {
+            std::fprintf(stderr, "strata generate: STRATA_ARENA_SHM: no key (%s); a private arena this start\n", kerr.c_str());
+        } else {
+            shm_ = new ArenaShm();
+            const std::string desc = pack_dir + " | " + (from_gguf ? gguf_ : path);
+            if (!shm_->open(ArenaShm::env_name(), want + (uint64_t) blob, key, desc, note)) {
+                std::fprintf(stderr, "strata generate: STRATA_ARENA_SHM: %s; a private arena this start\n", note.c_str());
+                delete shm_;
+                shm_ = nullptr;
+            } else {
+                std::fprintf(stderr, "strata generate: STRATA_ARENA_SHM: %s (key %016llx)\n", note.c_str(),
+                             (unsigned long long) key);
+            }
+        }
+    }
+#endif
+    const bool shm_attached = shm_ != nullptr && shm_->reused();
+
     // #633: THE RAM BEFORE THE ALLOCATION.  On Linux the arena is an anonymous mapping that succeeds whatever the host
     // has; its pages are committed as the load writes them, so a container whose memory limit is below the arena was
     // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is
@@ -5818,7 +5956,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // engine still exiting) is only a warning - the OS may make room - per the recommend-not-force rule.
     ram_warning_.clear();
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
-    if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
+    if (detail::HostMemory hm; shared_arena_file.empty() && shm_ == nullptr && detail::host_available_memory(hm)) {
         const uint64_t need = want + (uint64_t) blob;
         const double gib = 1073741824.0;
         char buf[512];
@@ -5861,7 +5999,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // writes experts.bin from the arena).  The file offsets (loff) stay packed; only the destination moves.
     padded_ = false;
     pad_ = PadMap{};
-    if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty()) {   // (a shared arena file has one layout for every process: the packed one)
+    if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty() && shm_ == nullptr) {   // (a shared arena file has one layout for every process: the packed one)
         padded_ = true;
         uint64_t at = 0;
         for (int64_t l = 0; l < n_layers; ++l) {
@@ -5918,7 +6056,16 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #else
     const bool deferred = false;
 #endif
-    PinnedArena* a = by_need ? new PinnedArena(arena_bytes + (uint64_t) blob, PinnedArena::ByNeed{}, need_ranges,
+    PinnedArena::Adopt adopt;
+    if (shm_ != nullptr) {
+        adopt.data = shm_->data();
+        adopt.mapping = shm_->mapping();
+        adopt.mapping_bytes = shm_->mapping_bytes();
+        adopt.note = "shared (STRATA_ARENA_SHM: " + shm_->where() + ")";
+        shm_->hand_over_mapping();   // the PinnedArena unmaps it
+    }
+    PinnedArena* a = shm_ != nullptr ? new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes, adopt)
+                   : by_need ? new PinnedArena(arena_bytes + (uint64_t) blob, PinnedArena::ByNeed{}, need_ranges,
                                                max_pinned_bytes, shared_arena_file, pack_hash)
                    : deferred ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Deferred{})
                               : new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
@@ -5929,20 +6076,12 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         err = "ArenaExpertSource: the arena could not be reserved (" +
               std::to_string(want + (uint64_t) blob) + " B)" +
               (why.empty() ? std::string{} : ": " + why);
+        delete shm_;
+        shm_ = nullptr;
         return false;
     }
     // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
     // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
-    std::vector<std::string> files;
-    if (from_gguf) {
-        for (int64_t l = 0; l < n_layers; ++l)
-            for (int r = 0; r < 3; ++r) {
-                const std::string f = expert_gguf_file(gguf_, lay, l, r);
-                if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
-            }
-    } else {
-        files.push_back(path);
-    }
     std::string why;
 #if defined(__linux__)
     // [claude] the registration above made the pinned part of the arena resident: it is out of MemAvailable already
@@ -5950,7 +6089,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #else
     const uint64_t arena_left = want + (uint64_t) blob;
 #endif
-    bool unbuffered = experts_unbuffered(files, arena_left, why);
+    bool unbuffered = shm_attached ? false : experts_unbuffered(files, arena_left, why);
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
     std::atomic<int> ready{0};
@@ -5964,7 +6103,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         });
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
-    if (from_gguf) {
+    if (shm_attached) {   // [claude] STRATA_ARENA_SHM: the arena is the complete shared object: nothing to read
+        st.ok = true;
+        st.bytes = want;
+        why = "attached to the shared arena (STRATA_ARENA_SHM)";
+    } else if (from_gguf) {
         st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp, padded_ ? &pad_ : nullptr);
     } else {
         if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
@@ -5976,18 +6119,57 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp, padded_ ? &pad_ : nullptr);
     }
     if (reg.joinable()) reg.join();
-    std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
-                 why.c_str());
+    if (shm_attached)
+        std::fprintf(stderr, "strata generate: expert arena not read: %s\n", why.c_str());
+    else
+        std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
+                     why.c_str());
     if (!st.ok) {
         delete a;
+        delete shm_;   // a created object that was never filled is deleted
+        shm_ = nullptr;
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
         return false;
     }
     if (st.bytes != want) {
         delete a;
+        delete shm_;
+        shm_ = nullptr;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
     }
+#if defined(__linux__)
+    // [claude] STRATA_ARENA_SHM: sampled experts against the files - on an attach (the key says the files are the same;
+    // this says the bytes are) and after filling a new object, which becomes "complete" (attachable) only then
+    if (shm_ != nullptr) {
+        const auto tv = std::chrono::steady_clock::now();
+        constexpr int kSamples = 32;
+        std::string verr;
+        const uint64_t seed = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+        const int bad = arena_verify_sampled(a->data(), lay, from_gguf, path, gguf_, kSamples, seed, verr);
+        const double vs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tv).count();
+        if (bad != 0) {
+            std::fprintf(stderr, "strata generate: STRATA_ARENA_SHM: %d of %d sampled experts differ from the files%s%s; "
+                                 "the shared arena is %s, loading a private one\n", bad, kSamples, verr.empty() ? "" : ": ",
+                         verr.c_str(), shm_attached ? (shm_->drop_if_unused() ? "deleted" : "left to the engines using it")
+                                                    : "discarded");
+            delete a;
+            delete shm_;
+            shm_ = nullptr;
+            shm_off_ = true;
+            const bool ok = open(pack_dir, n_layers, n_expert, threads, err, max_pinned_bytes, shared_arena_file);
+            shm_off_ = false;
+            return ok;
+        }
+        std::string mnote;
+        if (!shm_attached && !shm_->mark_complete(mnote))
+            std::fprintf(stderr, "strata generate: STRATA_ARENA_SHM: %s\n", mnote.c_str());
+        std::fprintf(stderr, "strata generate: STRATA_ARENA_SHM: %d sampled experts match the files (%.2f s)%s\n", kSamples,
+                     vs, shm_attached ? "" : "; the object is complete: the next start attaches to it");
+        if (shm_attached)   // the load rate below: the bytes over the time to attach, register and check
+            st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - open_t0).count();
+    }
+#endif
     if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
         std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
                      (unsigned long long) fnv1a64(a->data(), want), (double) want / (1ull << 30));
@@ -6083,6 +6265,10 @@ void ArenaExpertSource::close() {
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
+    }
+    if (shm_ != nullptr) {   // after the arena: its mapping is gone, the lock (and the object) stay or go here
+        delete shm_;
+        shm_ = nullptr;
     }
     base_ = nullptr;
     blobs_ = 0;

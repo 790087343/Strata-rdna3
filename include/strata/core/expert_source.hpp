@@ -49,6 +49,7 @@ struct ExpertLayout;
 }
 
 namespace strata::core {
+class ArenaShm;   // [claude] arena_shm.hpp
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
@@ -1316,6 +1317,8 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
+    ArenaShm* shm_ = nullptr;        ///< [claude] STRATA_ARENA_SHM: the shared object backing arena_ (owned; after arena_)
+    bool shm_off_ = false;           ///< [claude] the retry after a failed sampled check loads a private arena
     void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
     uint64_t map_bytes_ = 0;
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)

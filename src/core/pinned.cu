@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cerrno>
 #include <cstdlib>
@@ -415,7 +416,22 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         mapping_base = base;
         mapping_bytes = bytes;
     }
+    register_after_reserve(bytes, bounds, max_pinned_bytes);
+}
 
+// [claude] STRATA_ARENA_SHM: a mapping made elsewhere (ArenaShm) becomes the arena, registered exactly as a reserved one
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes, const Adopt& a)
+    : capacity(bytes) {
+    if (bytes == 0 || a.data == nullptr) return;
+    base = a.data;
+    mapping_base = a.mapping != nullptr ? a.mapping : a.data;
+    mapping_bytes = a.mapping != nullptr ? a.mapping_bytes : bytes;
+    backing = PageBacking::NormalPages;
+    note = a.note;
+    register_after_reserve(bytes, bounds, max_pinned_bytes);
+}
+
+void PinnedArena::register_after_reserve(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes) {
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base && arena_no_register()) {
@@ -444,10 +460,14 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             cap_why = "by STRATA_ARENA_PIN_GIB";
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
+        const auto reg_t0 = std::chrono::steady_clock::now();
         const cudaError_t e = capped ? cudaSuccess :
             pin_register(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
         if (!capped && e == cudaSuccess) {
-            note = "cudaHostRegister PORTABLE ok; " + note;
+            char rs[64];   // [claude] the registration's own time (a start's breakdown: it is not part of the load rate)
+            std::snprintf(rs, sizeof rs, " (%.2f s)",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - reg_t0).count());
+            note = "cudaHostRegister PORTABLE ok" + std::string(rs) + "; " + note;
             registered_bytes = bytes;
         } else if (bounds.size() >= 2 && (capped || clear_error())) {
             // Plan v0.3 P5: the whole range is refused, so pin it slice by slice from the start.  The rest stays
