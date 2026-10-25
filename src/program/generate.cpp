@@ -14237,8 +14237,14 @@ int main(int argc, char** argv) {
                 // STRATA_REFILL_HEAD_MIN=<tokens>: only after a prompt of at least that many tokens (a shorter one's first
                 // windows lose less to the late refill than the head would add to its first token)
                 static const int64_t late_head_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+                // [claude] STRATA_REFILL_HEAD2=<n slots> with STRATA_REFILL_HEAD2_MIN=<tokens>: a second head size for
+                // prompts of at least HEAD2_MIN tokens (the longest prompts' hand-over hides more of it, and their first
+                // windows lose more without it)
+                static const int64_t late_head2 = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1; }();
+                static const int64_t late_head2_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) INT64_MAX; }();
+                const int64_t head_want = late_head2 >= 0 && req_prompt_n >= late_head2_min ? late_head2 : late_head;
                 const size_t head_n = paced && (!late_head_dp || dp_read_req) && req_prompt_n >= late_head_min
-                                          ? std::min(rows.size(), (size_t) late_head) : 0;
+                                          ? std::min(rows.size(), (size_t) head_want) : 0;
                 for (size_t t0 = 0, t = 0, step = head_n > 0 ? head_n : per; t0 < rows.size(); t0 += step, ++t, step = per) {
                     const bool is_head = head_n > 0 && t0 == 0;
                     LateTranche lt;
