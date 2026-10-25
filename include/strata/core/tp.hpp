@@ -95,6 +95,10 @@ private:
 /// stage session that holds layer l.  Every stream of both sides must be idle.
 bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState* const* stage_ss, const int* stage_dev,
                    int n_stages, const int64_t* stage_lb, SessionState* const* tp_ss, const int* tp_dev, int64_t cells,
-                   bool to_tp, std::string& err);
+                   bool to_tp, std::string& err, int64_t host_skip_pages = 0, int64_t host_only_pages = -1);
+// [claude] host_skip_pages: the streamed K/V's host copy is not copied for pages [0, host_skip_pages) (already the same on
+// the destination side: STRATA_TP_PRECOPY's pages, or on the way back the stages' pages the TP windows never wrote).
+// host_only_pages >= 0: ONLY the host copy of pages [0, host_only_pages) moves (no device copy, nothing else) - the
+// precopy beside the prompt's last chunk; only the host copies are touched, so no stream needs to be idle.
 
 }  // namespace strata::core

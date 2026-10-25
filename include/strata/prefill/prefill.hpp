@@ -310,6 +310,12 @@ private:
     std::shared_ptr<DpLink> dp_link_;
     int dp_index_ = 0;
     struct DpChunk { int64_t c0, T, k; int who; };
+  public:
+    /// [claude] the DP read in flight (or the last one): the first position of its last chunk (the second path's); every
+    /// position before it is final once the first path is done (on_dp_done).  -1: no DP read yet
+    int64_t dp_last_start() const { return dp_last_p0_; }
+  private:
+    int64_t dp_last_p0_ = -1;
     std::vector<DpChunk> dp_plan_;      ///< set by run_dp for one prompt: every chunk, and who reads it
     std::vector<int32_t> dp_res_;       ///< this GPU's residency view for one prompt (foreign layers -1)
     bool dp_active_ = false;

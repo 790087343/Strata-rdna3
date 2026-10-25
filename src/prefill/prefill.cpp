@@ -6080,6 +6080,7 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         X.hand_in_ = nullptr;   // a pipeline run leaves the previous stage's hand-off buffer here: DP embeds its tokens
         X.on_stage_chunk = nullptr;
         X.dp_plan_ = plan;
+        X.dp_last_p0_ = pos0 + plan.back().c0;
         X.dp_active_ = true;
     }
     {

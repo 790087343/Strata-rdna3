@@ -9728,18 +9728,43 @@ int main(int argc, char** argv) {
         // where the conversation's state is: the stages' sessions (the prompt path), or the TP sessions (the windows);
         // tp_to moves it when the next step needs it on the other side (tp_state_move)
         bool tp_state_tp = false;
+        // [claude] STRATA_TP_PRECOPY=1: the streamed K/V's host pages before the DP read's last chunk are final once its
+        // first path is done (on_dp_done): CPU threads copy them to the TP sessions beside the second path's last chunk,
+        // and the hand-over copies only the pages from there (255K: ~3.1 GB, ~250 ms of the hand-over).
+        // STRATA_TP_BACK_SKIP=1: the way back copies only the host pages from the hand-over's cell on (the stages' pages
+        // before it are still the prompt's: the TP windows wrote only their own sessions)
+        static const bool tp_precopy_env = [] { const char* v = std::getenv("STRATA_TP_PRECOPY"); return v != nullptr && std::atoi(v) != 0; }();
+        static const bool tp_back_skip_env = [] { const char* v = std::getenv("STRATA_TP_BACK_SKIP"); return v != nullptr && std::atoi(v) != 0; }();
+        std::thread tp_pre_th;
+        bool tp_pre_ok = false;
+        int64_t tp_pre_pages = 0;      // the host pages the precopy moved (valid for the next move to the TP sessions only)
+        int64_t tp_moved_cells = -1;   // the cells of the last move to the TP sessions (the way back skips their pages)
+        std::string tp_pre_err;
+        auto tp_pre_join = [&]() -> int64_t {   // the precopy's pages (0: none, or it failed)
+            if (tp_pre_th.joinable()) tp_pre_th.join();
+            const int64_t p = tp_pre_ok ? tp_pre_pages : 0;
+            if (!tp_pre_ok && !tp_pre_err.empty()) std::fprintf(stderr, "strata tp: the precopy failed (%s): the hand-over copies every page\n", tp_pre_err.c_str());
+            tp_pre_ok = false;
+            tp_pre_pages = 0;
+            tp_pre_err.clear();
+            return p;
+        };
         auto tp_to = [&](bool want_tp, int64_t cells, std::string& e) -> bool {
-            if (!tp_on || tp_state_tp == want_tp) return true;
+            if (!tp_on || tp_state_tp == want_tp) { if (tp_on && !want_tp) tp_pre_join(); return true; }
             strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
             const int sdev[2] = {0, stages[0]->dev};
             const int64_t slb[2] = {0, split_at[0]};
             strata::core::SessionState* tst[2] = {&tp_ss[0], &tp_ss[1]};
             const Clock::time_point h0 = Clock::now();
+            const int64_t pre = tp_pre_join();
             for (int d : {0, stages[0]->dev}) {
                 const strata::core::OnDevice on(d);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "tensor parallel: a device sync failed before the state move"; return false; }
             }
-            if (!strata::core::tp_state_move(g, tp_g, sst, sdev, 2, slb, tst, tp_dev, cells, want_tp, e)) return false;
+            const int64_t PSc = strata::kernels::qsa_real_shapes().page_size;
+            const int64_t skip = want_tp ? pre : (tp_back_skip_env && tp_moved_cells > 0 && PSc > 0 ? tp_moved_cells / PSc : 0);
+            if (!strata::core::tp_state_move(g, tp_g, sst, sdev, 2, slb, tst, tp_dev, cells, want_tp, e, skip)) return false;
+            tp_moved_cells = want_tp ? cells : -1;
             tp_state_tp = want_tp;
             static const bool tp_say = std::getenv("STRATA_TP_TIMING") != nullptr;
             if (tp_say) std::fprintf(stderr, "strata tp: state %s in %.1f ms (%lld cells)\n", want_tp ? "to the TP sessions" : "back to the stages",
@@ -14523,10 +14548,34 @@ int main(int argc, char** argv) {
                         sp.on_dp_done = [&, early](std::string& ee) {
                             return late_w > 0 ? late_issue(*early, ee, false) : refill_issue(*early, ee);
                         };
+                    // [claude] STRATA_TP_PRECOPY (see tp_to): after the first path's own work (and its early refill)
+                    if (tp_on && tp_precopy_env && !tp_state_tp && o.batch == 0) {
+                        auto first = std::move(sp.on_dp_done);
+                        sp.on_dp_done = [&, first](std::string& ee) {
+                            if (first && !first(ee)) return false;
+                            const int64_t PSc = strata::kernels::qsa_real_shapes().page_size;
+                            const int64_t last0 = sp.dp_last_start();
+                            if (PSc <= 0 || last0 <= 0 || tp_pre_th.joinable()) return true;
+                            tp_pre_pages = last0 / PSc;
+                            tp_pre_ok = false;
+                            tp_pre_th = std::thread([&, last0] {
+                                strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
+                                const int sdev[2] = {0, stages[0]->dev};
+                                const int64_t slb[2] = {0, split_at[0]};
+                                strata::core::SessionState* tst[2] = {&tp_ss[0], &tp_ss[1]};
+                                std::string pe;
+                                tp_pre_ok = strata::core::tp_state_move(g, tp_g, sst, sdev, 2, slb, tst, tp_dev, last0, true, pe,
+                                                                        0, tp_pre_pages);
+                                if (!tp_pre_ok) tp_pre_err = pe;
+                            });
+                            return true;
+                        };
+                    }
                     const bool dp_ok = strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head,
                                                                         b0 - a0 - head, a0 + head, o.prefill_chunk,
                                                                         kDpMinLast, de);
                     sp.on_dp_done = nullptr;
+                    if (!dp_ok) tp_pre_join();   // [claude] (a failed read: the precopy's pages are not used)
                     if (dp_ok) dp_read_req = true;
                     if (dp_ok) return true;
                     if (early != nullptr && (early->issued || early->lent.empty())) { e = de; return false; }   // its loan is half given back

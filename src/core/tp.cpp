@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <set>
 #include <thread>
+#include <chrono>
 #include <vector>
 #include <cstdlib>
 
@@ -451,6 +452,7 @@ struct Stager {
     // synchronous copies - 94 ms a hand-over at 2K cells, 150 ms at 32K (2026-10-22)
     bool direct = false;
     bool used[64] = {};
+    double bytes[2][2] = {};   // (STRATA_TP_TIMING) the direct copies' bytes, [source card][destination card] (cards 0 / 1)
     ~Stager() { if (h) cudaFreeHost(h); }
     bool ensure(size_t n) {
         if (n <= cap) return true;
@@ -501,6 +503,7 @@ bool copy2d(Stager& st, int ddev, void* dst, size_t dpitch, int sdev, const void
             err = "tp: a hand-over copy failed to start";
             return false;
         }
+        if (ddev >= 0 && ddev < 2 && sdev >= 0 && sdev < 2) st.bytes[sdev][ddev] += (double) width * (double) height;
         if (ddev >= 0 && ddev < 64) st.used[ddev] = true;
         if (sdev >= 0 && sdev < 64) st.used[sdev] = true;
         return true;
@@ -532,6 +535,25 @@ static int tp_move_threads() {
     static const int v = [] { const char* e = std::getenv("STRATA_TP_MOVE_THREADS"); return e ? std::max(0, std::atoi(e)) : 12; }();
     return v;
 }
+// [claude] STRATA_TP_PRECOPY_THREADS (default 4): the precopy's threads (it runs beside the prompt's last chunk: fewer
+// threads leave the memory bus to it, and the chunk takes far longer than the copy)
+static int tp_precopy_threads() {
+    static const int v = [] { const char* e = std::getenv("STRATA_TP_PRECOPY_THREADS"); return e ? std::max(1, std::atoi(e)) : 4; }();
+    return v;
+}
+// [claude] STRATA_TP_PRECOPY_CHECK=1 (a test): the hand-over compares the precopied pages with the stages' instead of
+// trusting them, and says how many rows differ (0: the precopy was exact)
+static bool tp_precopy_check() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_TP_PRECOPY_CHECK"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+static size_t check_host_jobs(const std::vector<HostJob>& jobs) {
+    size_t bad = 0;
+    for (const HostJob& j : jobs)
+        for (size_t r = 0; r < j.h; ++r)
+            if (std::memcmp(j.dst + r * j.dpitch, j.src + r * j.spitch, j.w) != 0) ++bad;
+    return bad;
+}
 static void run_host_jobs(const std::vector<HostJob>& jobs, int nt) {
     size_t rows = 0;
     for (const HostJob& j : jobs) rows += j.h;
@@ -556,11 +578,15 @@ static void run_host_jobs(const std::vector<HostJob>& jobs, int nt) {
 
 bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState* const* stage_ss, const int* stage_dev,
                    int n_stages, const int64_t* stage_lb, SessionState* const* tp_ss, const int* tp_dev, int64_t cells,
-                   bool to_tp, std::string& err) {
+                   bool to_tp, std::string& err, int64_t host_skip_pages, int64_t host_only_pages) {
+    const bool check_only = host_only_pages <= -2;   // [claude] the precopy check (STRATA_TP_PRECOPY_CHECK)
+    if (check_only) host_only_pages = -2 - host_only_pages;
+    const bool host_only = host_only_pages >= 0;
     using strata::kernels::QsaShapes;
     Stager stg;
     std::vector<HostJob> hjobs;
     const bool host_threads = tp_move_threads() > 0;
+    const auto t_move0 = std::chrono::steady_clock::now();
     const int R = 2;
     {
         static const bool staged = [] { const char* v = std::getenv("STRATA_TP_MOVE_STAGED"); return v != nullptr && v[0] == '1'; }();
@@ -584,7 +610,9 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
         const int st = stage_of(l);
         SessionState& S0 = *stage_ss[st];
         const int d0 = stage_dev[st];
-        if (!is_qsa_layer(g, l)) {
+        if (!is_qsa_layer(g, l) && host_only) {
+            ++gi;
+        } else if (!is_qsa_layer(g, l)) {
             float* full = S0.gdn_state + (size_t) (gi - S0.gdn_ord0) * gfull;
             for (int r = 0; r < R; ++r) {
                 const uint64_t hv = hvr[r];
@@ -633,16 +661,24 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
                 };
                 // the VRAM pools: every slot (streamed) or the used pages (resident)
                 const uint64_t vp = F.kv_mode == 1 ? (uint64_t) F.n_slots : pages_used;
-                if (!pool(F.k_pool, H.k_pool, HD * 2, vp) || !pool(F.v_pool, H.v_pool, HD * 2, vp) ||
-                    !pool(F.k_q, H.k_q, HD, vp) || !pool(F.v_q, H.v_q, HD, vp) || !pool(F.k_scale, H.k_scale, scale_row, vp) ||
-                    !pool(F.v_scale, H.v_scale, scale_row, vp) || !pool(F.k_q4, H.k_q4, q4_row, vp) || !pool(F.v_q4, H.v_q4, q4_row, vp))
+                if (host_only && F.kv_mode != 1) continue;
+                if (!host_only &&
+                    (!pool(F.k_pool, H.k_pool, HD * 2, vp) || !pool(F.v_pool, H.v_pool, HD * 2, vp) ||
+                     !pool(F.k_q, H.k_q, HD, vp) || !pool(F.v_q, H.v_q, HD, vp) || !pool(F.k_scale, H.k_scale, scale_row, vp) ||
+                     !pool(F.v_scale, H.v_scale, scale_row, vp) || !pool(F.k_q4, H.k_q4, q4_row, vp) || !pool(F.v_q4, H.v_q4, q4_row, vp)))
                     return false;
                 if (F.kv_mode == 1) {   // streamed: the host copy (the used pages), the page table, the slot map
                     // [claude] both host copies are pinned RAM: CPU threads (run_host_jobs) unless STRATA_TP_MOVE_THREADS=0
-                    auto hpool = [&](const void* fp, const void* hp, uint64_t per_head, uint64_t pages) -> bool {
-                        if (!host_threads) return pool(fp, hp, per_head, pages);
-                        if (fp == nullptr || hp == nullptr || pages == 0) return true;
+                    // [claude] pages [p0, p1) only: host_skip_pages / host_only_pages
+                    const uint64_t p0 = (uint64_t) std::max<int64_t>(0, host_skip_pages);
+                    const uint64_t p1 = host_only ? std::min<uint64_t>(pages_used, (uint64_t) host_only_pages) : pages_used;
+                    auto hpool = [&](const void* fp0, const void* hp0, uint64_t per_head, uint64_t) -> bool {
+                        if (fp0 == nullptr || hp0 == nullptr || p1 <= p0) return true;
                         const uint64_t fpitch = NKV * PS * per_head, hpitch = nkv * PS * per_head, w = nkv * PS * per_head;
+                        const void* fp = (const uint8_t*) fp0 + p0 * fpitch;
+                        const void* hp = (const uint8_t*) hp0 + p0 * hpitch;
+                        const uint64_t pages = p1 - p0;
+                        if (!host_threads && !check_only) return pool(fp, hp, per_head, pages);
                         uint8_t* f = (uint8_t*) fp + r * w;
                         if (to_tp) hjobs.push_back({(uint8_t*) hp, (size_t) hpitch, f, (size_t) fpitch, (size_t) w, (size_t) pages});
                         else hjobs.push_back({f, (size_t) fpitch, (const uint8_t*) hp, (size_t) hpitch, (size_t) w, (size_t) pages});
@@ -653,6 +689,7 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
                         !hpool(F.host.k_scale, H.host.k_scale, scale_row, pages_used) || !hpool(F.host.v_scale, H.host.v_scale, scale_row, pages_used) ||
                         !hpool(F.host.k_q4, H.host.k_q4, q4_row, pages_used) || !hpool(F.host.v_q4, H.host.v_q4, q4_row, pages_used))
                         return false;
+                    if (host_only) continue;
                     auto words = [&](const int32_t* f, const int32_t* h, uint64_t n) -> bool {
                         if (f == nullptr || h == nullptr || n == 0) return true;
                         if (to_tp) return copy2d(stg, tp_dev[r], (void*) h, n * 4, d0, f, n * 4, n * 4, 1, err);
@@ -664,6 +701,7 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
                         !words(F.map.ctl, H.map.ctl, (uint64_t) strata::kernels::kKvCtlInts))
                         return false;
                 }
+                if (host_only) continue;
                 // the indexer: replicated (both cards select identically)
                 const uint64_t ID = (uint64_t) g.idx_key_dim, TS = (uint64_t) (sf.idx_block - 1) * ID;
                 const uint64_t prow = std::min<uint64_t>((uint64_t) F.idx_pooled_rows, (uint64_t) (cells / sf.idx_block) + 2);
@@ -682,7 +720,7 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
         }
     }
     // the PLE history and token window (stage 0's session holds layer 1), replicated
-    {
+    if (!host_only) {
         SessionState& S0 = *stage_ss[0];
         const uint64_t hb = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4;
         for (int r = 0; r < R; ++r) {
@@ -699,8 +737,33 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
             }
         }
     }
-    run_host_jobs(hjobs, tp_move_threads());   // (the device copies run meanwhile; finish waits for them)
-    return stg.finish(err);
+    const auto t_issue = std::chrono::steady_clock::now();
+    if (!host_only && host_skip_pages > 0 && tp_precopy_check()) {
+        // the skipped pages [0, host_skip_pages) (precopied, or on the way back the stages' own): compared
+        std::string ce;
+        (void) tp_state_move(g, tg, stage_ss, stage_dev, n_stages, stage_lb, tp_ss, tp_dev, cells, to_tp, ce, 0, -2 - host_skip_pages);
+    }
+    if (check_only) {   // (the check pass: compare, copy nothing)
+        const size_t bad = check_host_jobs(hjobs);
+        size_t rows = 0;
+        for (const HostJob& j : hjobs) rows += j.h;
+        std::fprintf(stderr, "strata tp: skipped pages check (%s): %zu of %zu host K/V rows differ\n", to_tp ? "to TP" : "back", bad, rows);
+        return true;
+    }
+    run_host_jobs(hjobs, host_only ? tp_precopy_threads() : tp_move_threads());   // (the device copies run meanwhile; finish waits for them)
+    const auto t_host = std::chrono::steady_clock::now();
+    const bool ok = stg.finish(err);
+    static const bool say = std::getenv("STRATA_TP_TIMING") != nullptr;
+    if (say) {   // [claude] STRATA_TP_TIMING: the hand-over's parts
+        size_t hb = 0;
+        for (const HostJob& j : hjobs) hb += j.w * j.h;
+        const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::fprintf(stderr, "strata tp: %s parts: issue %.1f ms, host K/V %.1f ms (%.0f MiB), device copies' wait %.1f ms; "
+                             "device bytes (src->dst MiB): 0->0 %.0f 0->1 %.0f 1->0 %.0f 1->1 %.0f\n",
+                     host_only ? "precopy" : "hand-over", ms(t_move0, t_issue), ms(t_issue, t_host), hb / 1048576.0, ms(t_host, std::chrono::steady_clock::now()),
+                     stg.bytes[0][0] / 1048576.0, stg.bytes[0][1] / 1048576.0, stg.bytes[1][0] / 1048576.0, stg.bytes[1][1] / 1048576.0);
+    }
+    return ok;
 }
 
 }  // namespace strata::core
